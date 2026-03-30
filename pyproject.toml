@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "max-chronicle"
+version = "0.2.0"
+description = "Canonical local-first chronicle for Maksym Beiev's systems, projects, and durable memory."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.9.4,<2",
+  "openai>=1.0.0,<2",
+]
+
+[project.scripts]
+chronicle = "max_chronicle.cli:main"
+chronicle-mcp = "max_chronicle.mcp_server:main"
+chronicle-mcp-readonly = "max_chronicle.mcp_server:main_readonly"
+chronicle-mcp-chronicler = "max_chronicle.mcp_server:main_chronicler"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["max_chronicle*"]
+
+[tool.setuptools.package-data]
+max_chronicle = ["migrations/*.sql"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+]

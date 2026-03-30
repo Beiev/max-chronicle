@@ -1,0 +1,52 @@
+# Chronicle data (never commit actual databases or artifacts)
+chronicle.db
+chronicle.db-wal
+chronicle.db-shm
+chronicle-artifacts/
+chronicle-snapshots.jsonl
+ssot-ledger.jsonl
+mem0-dump.json
+daybooks/
+backups/
+
+# Status files (user-specific)
+status.md
+priorities.md
+job-search-status.md
+MEMORY_SYSTEM.md
+CHRONICLE_PROTOCOL.md
+ECOSYSTEM.md
+SSOT_MANIFEST.toml
+CHRONICLE_AUTOMATION.toml
+company-intel.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
