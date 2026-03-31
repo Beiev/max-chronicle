@@ -967,6 +967,94 @@ def test_situation_model_prefers_priority_targets_and_rules_over_why_bullets(
     assert any("comfort-zone infra" in item.casefold() for item in situation["constraints"])
 
 
+def test_situation_model_prefers_fresher_status_over_archival_priorities(
+    chronicle_sandbox,
+    loaded_manifest,
+) -> None:
+    priorities_path = chronicle_sandbox.status_root / "priorities.md"
+    priorities_path.write_text(
+        "# Priorities\n\n"
+        "## Priority Stack (ordered)\n\n"
+        "### 🔴 P0 — Portfolio Blocker\n"
+        "- **Target:** Finish portfolio before LinkedIn\n"
+        "- **Rule:** Do not start outreach yet\n",
+        encoding="utf-8",
+    )
+    old_timestamp = datetime.now().timestamp() - (60 * 60 * 24 * 30)
+    os.utime(priorities_path, (old_timestamp, old_timestamp))
+
+    (chronicle_sandbox.status_root / "status.md").write_text(
+        "## Active Projects\n\n"
+        "### Portfolio (`~/Projects/rzmrn-portfolio/`) — V1 SHIPPED\n"
+        "- **Career gate:** cleared. LinkedIn, cover letters, and outreach are now unblocked.\n\n"
+        "## Priorities\n\n"
+        "## Strategic Context\n"
+        "Portfolio is live and no longer the blocker.\n\n"
+        "## Priority Stack (ordered)\n\n"
+        "### 🔴 P0 — LinkedIn Rebuild\n"
+        "- **Target:** Rewrite profile and anchor featured section with rzmrn.com\n\n"
+        "### 🟡 P1 — Cover Letter Framework\n"
+        "- **Target:** Create 3 reusable templates\n",
+        encoding="utf-8",
+    )
+
+    situation = materialize_situation_model(loaded_manifest, domain_id="global")
+
+    assert situation["goals"]
+    assert situation["goals"][0].startswith("LinkedIn Rebuild")
+    assert "Portfolio Blocker" not in situation["goals"][0]
+    assert situation["derived_from"]["strategy_source_ids"][0] == "status"
+
+
+def test_build_activation_prompt_uses_dynamic_situation_focus_instead_of_hardcoded_gate(
+    chronicle_sandbox,
+    loaded_manifest,
+) -> None:
+    (chronicle_sandbox.status_root / "priorities.md").write_text(
+        "# Priorities\n\n"
+        "## Priority Stack (ordered)\n\n"
+        "### 🔴 P0 — LinkedIn Rebuild\n"
+        "- **Target:** Rewrite profile and anchor featured section with rzmrn.com\n",
+        encoding="utf-8",
+    )
+
+    activation = build_activation(
+        loaded_manifest,
+        domain_id="global",
+        agent="pytest",
+        title="Dynamic activation prompt",
+        focus="tests",
+        capture=True,
+    )
+
+    assert "Current focus from Chronicle:" in activation["prompt"]
+    assert "Top priority: LinkedIn Rebuild: Rewrite profile and anchor featured section with rzmrn.com" in activation["prompt"]
+    assert "Portfolio v1.0 is the main gate" not in activation["prompt"]
+
+
+def test_build_startup_bundle_marks_source_freshness_per_source(
+    chronicle_sandbox,
+    loaded_manifest,
+) -> None:
+    priorities_path = chronicle_sandbox.status_root / "priorities.md"
+    priorities_path.write_text("# Priorities\n\nArchive.\n", encoding="utf-8")
+    old_timestamp = datetime.now().timestamp() - (60 * 60 * 24 * 30)
+    os.utime(priorities_path, (old_timestamp, old_timestamp))
+
+    bundle = build_startup_bundle(
+        loaded_manifest,
+        domain_id="global",
+        agent="pytest",
+        capture=False,
+        limit=3,
+        compact=False,
+    )
+    sources = {item["id"]: item for item in bundle["sources"]}
+
+    assert sources["status"]["freshness_status"] in {"live", "recent"}
+    assert sources["priorities"]["freshness_status"] == "archival"
+
+
 def test_record_and_review_scenario_validate_inputs_and_link_outcome(loaded_manifest) -> None:
     outcome = record_event(
         loaded_manifest,

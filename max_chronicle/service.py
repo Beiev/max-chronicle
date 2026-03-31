@@ -89,6 +89,11 @@ FRESHNESS_RANK = {
     "archival": 1,
     "unknown": 0,
 }
+STRATEGY_SOURCE_PREFERENCE = {
+    "priorities": 3,
+    "status": 2,
+    "job_search": 1,
+}
 VALID_TRUST_TIERS = frozenset(TRUST_TIER_RANK)
 CANONICAL_EVENT_CATEGORIES = frozenset(
     {
@@ -1359,32 +1364,25 @@ def build_attach_bundle(
     domain = manifest["domain_map"][domain_id]
     freshness_audit = build_freshness_audit(manifest, domain_id=domain_id)
     source_audit = build_sources_audit(manifest, domain_id=domain_id)
-    situation_model = fetch_latest_situation_model(config, domain=domain_id, snapshot_id=snapshot.get("id"))
-    if situation_model is None:
-        persisted_entities = fetch_normalized_entities(config, limit=200)
-        situation_model = build_situation_model(
-            manifest,
-            domain_id=domain_id,
-            snapshot=snapshot,
-            normalized_entities=persisted_entities or None,
-        )
-    latest_lens_runs = fetch_lens_runs(config, situation_id=situation_model["situation_id"]) if situation_model else []
-    if not latest_lens_runs and situation_model is not None:
-        latest_lens_runs = run_lenses(
-            manifest,
-            domain_id=domain_id,
-            situation_model=situation_model,
-            persist=False,
-        )
+    normalized_entities = build_normalized_entities(
+        manifest,
+        domain_id=domain_id,
+        snapshot=snapshot,
+        event_limit=max(event_limit, 24),
+    )
+    situation_model = build_situation_model(
+        manifest,
+        domain_id=domain_id,
+        snapshot=snapshot,
+        normalized_entities=normalized_entities,
+    )
+    latest_lens_runs = run_lenses(
+        manifest,
+        domain_id=domain_id,
+        situation_model=situation_model,
+        persist=False,
+    )
     latest_scenarios = fetch_scenario_runs(config, situation_id=situation_model["situation_id"], limit=8) if situation_model else []
-    normalized_entities = fetch_normalized_entities(config, limit=200)
-    if not normalized_entities:
-        normalized_entities = build_normalized_entities(
-            manifest,
-            domain_id=domain_id,
-            snapshot=snapshot,
-            event_limit=max(event_limit, 24),
-        )
     attach_sources = _source_catalog(manifest, domain_id)
     return {
         "contract_name": ACTIVATION_CONTRACT_NAME,
@@ -1509,6 +1507,11 @@ def _build_startup_sources(
     for source_id in source_ids:
         source_config = manifest["source_map"][source_id]
         source_data = read_source_content(source_config)
+        freshness_thresholds = _source_freshness_policy(
+            manifest,
+            source_class="ssot_source",
+            source_id=source_id,
+        )
         raw_content = source_data.get("content", "")
         content_truncated = False
         if compact and len(raw_content) > 1200:
@@ -1523,6 +1526,11 @@ def _build_startup_sources(
             "exists": source_data.get("exists", False),
             "mtime": source_data.get("mtime"),
             "size": source_data.get("size", 0),
+            "freshness_status": _freshness_status(
+                source_data.get("mtime"),
+                thresholds=freshness_thresholds,
+            ),
+            "source_priority": source_config.get("priority", 0),
             "content": raw_content,
         }
         if compact:
@@ -1648,40 +1656,27 @@ def build_startup_bundle(
     runtime = _build_startup_runtime_view(snapshot)
 
     # 6. Situation model + lens runs → focus
-    situation_model = fetch_latest_situation_model(
-        config, domain=domain_id, snapshot_id=snapshot.get("id")
+    normalized_entities = build_normalized_entities(
+        manifest,
+        domain_id=domain_id,
+        snapshot=snapshot,
+        event_limit=max(limit, 24),
     )
-    if situation_model is None:
-        persisted_entities = fetch_normalized_entities(config, limit=200)
-        situation_model = build_situation_model(
-            manifest,
-            domain_id=domain_id,
-            snapshot=snapshot,
-            normalized_entities=persisted_entities or None,
-        )
-    latest_lens_runs = (
-        fetch_lens_runs(config, situation_id=situation_model["situation_id"])
-        if situation_model
-        else []
+    situation_model = build_situation_model(
+        manifest,
+        domain_id=domain_id,
+        snapshot=snapshot,
+        normalized_entities=normalized_entities,
     )
-    if not latest_lens_runs and situation_model is not None:
-        latest_lens_runs = run_lenses(
-            manifest,
-            domain_id=domain_id,
-            situation_model=situation_model,
-            persist=False,
-        )
+    latest_lens_runs = run_lenses(
+        manifest,
+        domain_id=domain_id,
+        situation_model=situation_model,
+        persist=False,
+    )
     focus_section = _build_startup_focus(situation_model, latest_lens_runs)
 
     # 7. Normalized entities → compact digest
-    normalized_entities = fetch_normalized_entities(config, limit=200)
-    if not normalized_entities:
-        normalized_entities = build_normalized_entities(
-            manifest,
-            domain_id=domain_id,
-            snapshot=snapshot,
-            event_limit=max(limit, 24),
-        )
     entity_digest = _build_startup_entity_digest(
         normalized_entities, compact=compact
     )
@@ -1787,9 +1782,15 @@ def _extract_priority_goals(text: str, *, limit: int) -> list[str]:
         (section for section in sections if section["normalized"] == normalize_heading("Priority Stack (ordered)")),
         None,
     )
+    if priority_section is None:
+        priority_section = next(
+            (section for section in sections if section["normalized"] == normalize_heading("Priorities")),
+            None,
+        )
     section_text = priority_section["body"] if priority_section else text
 
     goals: list[str] = []
+    numbered_items: list[str] = []
     current_heading: str | None = None
     current_target: str | None = None
 
@@ -1801,6 +1802,11 @@ def _extract_priority_goals(text: str, *, limit: int) -> list[str]:
 
     for raw_line in section_text.splitlines():
         stripped = raw_line.strip()
+        numbered_match = re.match(r"^\d+\.\s+(.+)$", stripped)
+        if numbered_match:
+            numbered_items.append(_clean_markdown_text(numbered_match.group(1)))
+            if len(numbered_items) >= limit:
+                break
         heading_match = re.match(r"^###\s+(.*)$", stripped)
         if heading_match:
             flush()
@@ -1815,6 +1821,8 @@ def _extract_priority_goals(text: str, *, limit: int) -> list[str]:
             current_target = value
 
     flush()
+    if not goals and numbered_items:
+        goals = numbered_items
     return _dedupe_text(goals, limit=limit)
 
 
@@ -1852,6 +1860,66 @@ def _extract_priority_constraints(text: str, *, limit: int) -> list[str]:
         )
     )
     return _dedupe_text(constraints, limit=limit)
+
+
+def _strategy_source_inputs(
+    manifest: dict[str, Any],
+    source_audit: dict[str, Any],
+    *,
+    source_ids: tuple[str, ...] = ("priorities", "status", "job_search"),
+) -> list[dict[str, Any]]:
+    freshness_rows = {
+        row.get("id"): row
+        for row in source_audit.get("freshness_audit", {}).get("attach_sources", [])
+        if row.get("id")
+    }
+    candidates: list[dict[str, Any]] = []
+    for source_id in source_ids:
+        source = manifest.get("source_map", {}).get(source_id)
+        if not source:
+            continue
+        path = expand_path(source["path"])
+        if not path.exists():
+            continue
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not content:
+            continue
+        source_data = file_meta(path)
+        thresholds = _source_freshness_policy(
+            manifest,
+            source_class="ssot_source",
+            source_id=source_id,
+        )
+        freshness_row = freshness_rows.get(source_id, {})
+        freshness_status = freshness_row.get("freshness_status") or _freshness_status(
+            source_data.get("mtime"),
+            thresholds=thresholds,
+        )
+        freshness_rank = freshness_row.get("freshness_rank")
+        if freshness_rank is None:
+            freshness_rank = _freshness_rank(
+                source_data.get("mtime"),
+                thresholds=thresholds,
+            )
+        candidates.append(
+            {
+                "source_id": source_id,
+                "content": content,
+                "freshness_status": freshness_status,
+                "freshness_rank": freshness_rank,
+                "source_priority": int(source.get("priority", 0)),
+                "strategy_preference": STRATEGY_SOURCE_PREFERENCE.get(source_id, 0),
+            }
+        )
+    candidates.sort(
+        key=lambda item: (
+            -item["freshness_rank"],
+            -item["strategy_preference"],
+            -item["source_priority"],
+            item["source_id"],
+        )
+    )
+    return candidates
 
 
 def _normalize_company_candidate(value: str) -> str | None:
@@ -2267,25 +2335,42 @@ def build_situation_model(
         item["id"]: item.get("excerpt", "")
         for item in (resolved_snapshot or {}).get("source_excerpts", [])
     }
-    priorities_content = ""
-    if "priorities" in manifest.get("source_map", {}):
-        priorities_content = read_source_content(manifest["source_map"]["priorities"]).get("content", "")
-    status_content = ""
-    if "status" in manifest.get("source_map", {}):
-        status_content = read_source_content(manifest["source_map"]["status"]).get("content", "")
 
-    goals = _extract_priority_goals(priorities_content, limit=5)
+    strategy_sources = _strategy_source_inputs(manifest, source_audit)
+    strategy_source_ids = [item["source_id"] for item in strategy_sources]
+
+    goals: list[str] = []
+    for item in strategy_sources:
+        goals = _extract_priority_goals(item["content"], limit=5)
+        if goals:
+            break
     if not goals:
-        goals = _summary_lines_from_excerpt(source_excerpt_map.get("priorities", ""), limit=5)
+        for source_id in strategy_source_ids:
+            goals = _summary_lines_from_excerpt(
+                source_excerpt_map.get(source_id, ""),
+                limit=5,
+            )
+            if goals:
+                break
     if not goals:
         goals = [event["text"] for event in recent_events if event.get("category") in {"decision", "milestone"}][:5]
     goals = [shorten(goal, 180) for goal in goals]
 
-    constraints = _extract_priority_constraints(priorities_content, limit=8)
+    constraints: list[str] = []
+    for item in strategy_sources:
+        constraints = _extract_priority_constraints(item["content"], limit=8)
+        if constraints:
+            break
     if not constraints:
-        constraints = _summary_lines_from_excerpt(source_excerpt_map.get("priorities", ""), limit=6)
+        for source_id in strategy_source_ids:
+            constraints = _summary_lines_from_excerpt(
+                source_excerpt_map.get(source_id, ""),
+                limit=6,
+            )
+            if constraints:
+                break
     if not constraints:
-        constraints = _summary_lines_from_excerpt(status_content or source_excerpt_map.get("status", ""), limit=6)
+        constraints = _summary_lines_from_excerpt(source_excerpt_map.get("status", ""), limit=6)
     constraints = [shorten(item, 180) for item in constraints]
 
     pressures: list[dict[str, Any]] = []
@@ -2428,6 +2513,7 @@ def build_situation_model(
             "snapshot_id": snapshot_id,
             "event_ids": [event["id"] for event in recent_events],
             "source_ids": [entry["source_id"] for entry in source_audit["source_catalog"] if entry.get("enabled")],
+            "strategy_source_ids": strategy_source_ids,
             "normalized_entity_ids": [entity["id"] if "id" in entity else entity["entity_id"] for entity in resolved_entities],
         },
     }
@@ -3315,7 +3401,10 @@ def build_activation(
         capture=capture,
     )
     snapshot = attach_bundle["snapshot"]
-    prompt = render_activation_prompt(snapshot)
+    prompt = render_activation_prompt(
+        snapshot,
+        situation_model=attach_bundle.get("situation_model"),
+    )
     warnings = attach_bundle["freshness_audit"].get("warnings", [])
     if warnings:
         warning_lines = ["", "Freshness warnings:"]
@@ -3402,8 +3491,25 @@ def current_state(
     events = fetch_recent_events(config, limit=event_limit, domain=domain)
     with open_connection(config) as connection:
         summary = database_summary(connection)
-    situation = fetch_latest_situation_model(config, domain=domain)
-    lens_runs = fetch_lens_runs(config, situation_id=situation["situation_id"]) if situation else []
+    normalized_entities = build_normalized_entities(
+        manifest,
+        domain_id=domain,
+        snapshot=snapshot,
+        event_limit=max(event_limit, 24),
+    )
+    situation = build_situation_model(
+        manifest,
+        domain_id=domain,
+        snapshot=snapshot,
+        event_limit=max(event_limit, 24),
+        normalized_entities=normalized_entities,
+    )
+    lens_runs = run_lenses(
+        manifest,
+        domain_id=domain,
+        situation_model=situation,
+        persist=False,
+    )
     return {
         "contract_name": ACTIVATION_CONTRACT_NAME,
         "contract_version": ACTIVATION_CONTRACT_VERSION,

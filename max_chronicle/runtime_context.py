@@ -580,7 +580,11 @@ def build_runtime_snapshot(
     }
 
 
-def render_activation_prompt(snapshot: dict[str, Any]) -> str:
+def render_activation_prompt(
+    snapshot: dict[str, Any],
+    *,
+    situation_model: dict[str, Any] | None = None,
+) -> str:
     portfolio = snapshot["portfolio_assets"]
     openclaw = snapshot["openclaw"]
     digest = snapshot["digest"]
@@ -613,6 +617,24 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
     if not missing_assets:
         missing_assets.append("- No missing asset sample captured.")
 
+    focus_lines: list[str] = []
+    if situation_model:
+        goals = situation_model.get("goals") or []
+        constraints = situation_model.get("constraints") or []
+        pressures = situation_model.get("pressures") or []
+        if goals:
+            focus_lines.append(f"- Top priority: {goals[0]}")
+            for item in goals[1:3]:
+                focus_lines.append(f"- Next: {item}")
+        if constraints:
+            focus_lines.append(f"- Constraint: {constraints[0]}")
+        if pressures:
+            detail = pressures[0].get("detail")
+            if detail:
+                focus_lines.append(f"- Pressure: {detail}")
+    if not focus_lines:
+        focus_lines.append("- No fresh situation model available; inspect startup_bundle before inferring priorities.")
+
     lines = [
         "You are connecting to Max Chronicle, the durable operating memory for Maksym Beiev (RZMRN).",
         "",
@@ -638,10 +660,10 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "- Before context switches, handoff, or thread end, capture a timestamped snapshot.",
         "- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later.",
         "",
-        "Current priorities:",
-        "- Portfolio v1.0 is the main gate. LinkedIn depends on it. Job applications depend on LinkedIn.",
-        "- OpenClaw job search is autonomous. Do not tinker with it during portfolio focus.",
-        "- Digest is autonomous. Use it as context, not as a task sink.",
+        "Current focus from Chronicle:",
+        *focus_lines,
+        "- OpenClaw job search remains autonomous execution context.",
+        "- Digest remains context, not a task sink.",
         "",
         "Portfolio asset state:",
         f"- Projects tracked: {portfolio.get('projects_total', 'unknown')}",
