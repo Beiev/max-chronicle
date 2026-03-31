@@ -1,133 +1,106 @@
 # Max Chronicle
 
-Local-first durable memory system for AI agents — SQLite truth store, MCP server, semantic recall, time-travel reconstruction.
+Local-first durable memory for AI agents.
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: 88 passing](https://img.shields.io/badge/tests-88%20passing-brightgreen.svg)]()
-[![Schema: v7](https://img.shields.io/badge/schema-v7-blue.svg)]()
+Max Chronicle is a Python package for multi-agent systems that need context to survive across sessions. It keeps canonical history in local SQLite, exposes that history through a CLI and MCP server, and can attach an optional Mem0 semantic recall layer. It is not a cloud service; the core system runs entirely on your machine.
 
-## Features
+Core capabilities include append-only events, point-in-time snapshots, hybrid local search, normalized entities, situation models, fixed analytical lenses, and what-if scenario analysis.
 
-- **Append-only event store** in SQLite — canonical truth, not LLM-generated summaries
-- **Point-in-time snapshots** with full state reconstruction
-- **MCP server** with two profiles: read-only and full chronicler
-- **Semantic recall** via Qdrant vector search + Kuzu graph DB + BM25/RRF hybrid retrieval
-- **Automated projections** — normalized entities, situation models, evidence-linked lenses
-- **Five analytical lenses** — operator, strategist, risk, market, systems
-- **What-if scenarios** — record assumptions, replay against outcomes
-- **Native macOS launchd automation** — daily capture, backup, audit, canary
-- **Mem0 integration** for semantic replication from truth store
-- **Guided Startup Gate** — MCP sessions require explicit activation before mutations
+## Why
 
-## Architecture
+Agents are good at short-lived reasoning and bad at durable memory. Between sessions, threads, and tool calls, they lose state, repeat work, and blur truth with generated summaries.
 
-```
-┌─────────────────────────────────────────────────┐
-│               MCP Clients (Agents)              │
-├─────────────────────────────────────────────────┤
-│             MCP Server Layer                     │
-│   ┌─────────────┐  ┌─────────────────────────┐  │
-│   │  Read-Only   │  │    Full Chronicler      │  │
-│   └─────────────┘  └─────────────────────────┘  │
-├─────────────────────────────────────────────────┤
-│              Service Layer                       │
-│  activate · startup · query · record · capture   │
-├─────────────────────────────────────────────────┤
-│            Derived Layers                        │
-│  Entities │ Situations │ Lenses │ Scenarios      │
-├─────────────────────────────────────────────────┤
-│         Query Engine (Hybrid Retrieval)          │
-│  Qdrant (vectors) + Kuzu (graph) + BM25 (text)  │
-├─────────────────────────────────────────────────┤
-│              SQLite (Append-Only Truth)          │
-│  Events │ Snapshots │ Artifacts │ Relations      │
-└─────────────────────────────────────────────────┘
-```
-
-### Truth Model
-
-Chronicle follows a strict layered truth model:
-
-1. `chronicle.db` — canonical durable truth (events, snapshots, artifacts)
-2. `status/*.md` — human-readable projections (generated, not hand-edited)
-3. Mem0 / vector recall — derived semantic memory (never the source of truth)
-
-No derived layer writes back into truth.
+Max Chronicle fixes that by separating local truth from derived views: record durable events and snapshots into SQLite, project readable state into Markdown, and let the next agent resume from an explicit startup or activation bundle instead of starting from zero.
 
 ## Quick Start
 
+Requirements:
+
+- Python 3.11+
+- `pip` or `uv`
+
+Install from the repository:
+
 ```bash
-# Clone and install
-git clone https://github.com/rzmrn/max-chronicle.git
+git clone <your-repo-url> max-chronicle
 cd max-chronicle
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
+```
 
-# Initialize a workspace
+Create a workspace and point Chronicle at it:
+
+```bash
 chronicle init --root ~/chronicle-workspace
 export CHRONICLE_ROOT=~/chronicle-workspace
-
-# Verify
 chronicle status
+```
+
+Optional smoke test:
+
+```bash
 chronicle startup --domain global --format json
 ```
 
-## Core Commands
+## Core Concepts
 
-```bash
-# Record a durable event
-chronicle record "Decided to use PostgreSQL for the new service" --why "Better JSON support than SQLite for this use case" --category decision --project my-project
+| Layer | Role |
+| --- | --- |
+| `chronicle.db` | Canonical truth. Local SQLite, schema v7. Stores append-only events, point-in-time snapshots, normalized entities, situation models, analytical lens runs, and scenario runs. |
+| Markdown projections | Readable operator-facing views derived from Chronicle. Useful for inspection, handoff, and versioned docs, but not the source of truth. |
+| Mem0 / Qdrant / Kuzu | Optional semantic recall layer. Useful for retrieval and association, but derived and non-authoritative. |
 
-# Capture runtime state
-chronicle capture-runtime --domain global
+In practice: `chronicle.db` is truth, Markdown is projection, and Mem0 is recall.
 
-# Query chronicle
-chronicle query "current blockers" --domain global --format json
+## CLI Commands
 
-# Time-travel reconstruction
-chronicle timeline --at "2026-03-15T12:55:00+01:00"
+| Command | Purpose |
+| --- | --- |
+| `chronicle init --root <path>` | Create a fresh Chronicle workspace with database, manifest, automation config, and starter files. |
+| `chronicle status` | Report database health, migration state, and table counts. |
+| `chronicle record "text"` | Append a durable event to the truth store. |
+| `chronicle recent` | Show recent durable events. |
+| `chronicle timeline --at <iso-timestamp>` | Reconstruct nearby snapshots and events around a point in time. |
+| `chronicle capture-runtime --domain <id>` | Capture a runtime snapshot and refresh derived state. |
+| `chronicle startup --domain <id>` | Build a compact startup bundle for a new agent session. |
+| `chronicle activate --domain <id>` | Build the activation contract and prompt for an agent session. |
+| `chronicle query "text"` | Search Chronicle, active source docs, and optional Mem0 recall. |
 
-# View recent events
-chronicle recent --limit 10
-
-# Run audit
-chronicle doctor --strict
-```
+Derived analysis commands are also available:
+`normalize-entities`, `build-situation`, `run-lenses`, `record-scenario`, and `review-scenario`.
 
 ## MCP Server
 
-Two access profiles for different agent roles:
+Max Chronicle ships an MCP stdio server for agent integration.
 
-```bash
-# Read-only — for agents that query but never mutate
-chronicle-mcp-readonly
+- `chronicle-mcp-readonly` exposes read-only resources and tools.
+- `chronicle-mcp-chronicler` exposes the full chronicler surface, including writes.
 
-# Full chronicler — record events, capture snapshots, manage derived state
-chronicle-mcp-chronicler
+The generic entrypoint `chronicle-mcp --profile readonly|chronicler` is also available.
+
+## Architecture
+
+```text
+agents / CLI / MCP clients
+          |
+          v
+   Max Chronicle service
+          |
+          +--> chronicle.db
+          |    SQLite truth store, schema v7
+          |    events | snapshots | entities
+          |    situation models | lenses | scenarios
+          |
+          +--> Markdown projections
+          |    readable derived state
+          |
+          +--> Mem0 / Qdrant / Kuzu
+               optional derived semantic recall
 ```
 
-The chronicler profile requires a startup call (`startup_bundle` or `activate_agent`) before any mutations. This prevents accidental writes from misconfigured agents.
-
-## Optional Integrations
-
-These are not required for the core system:
-
-- **Mem0 / Qdrant** — semantic vector recall
-- **Kuzu** — graph-based entity relations
-- **launchd** — scheduled automation (daily capture, backup, audit)
-- **MiniMax / OpenAI** — LLM-powered curation and canary checks
-
-The core `record → query → reconstruct` flow works with SQLite alone.
-
-## Running Tests
-
-```bash
-pip install -e ".[dev]"
-pytest tests/ -v
-```
+Queries combine local Chronicle data, readable source projections, and optional semantic recall. The database remains authoritative; projections and recall layers do not write truth back into Chronicle.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT
