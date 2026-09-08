@@ -73,3 +73,30 @@ def test_cli_uses_manifest_root_without_db_override(tmp_path) -> None:
 
     assert migrate_payload["db_path"] == str(root / "chronicle.db")
     assert db_path.exists()
+
+
+def test_runtime_snapshot_survives_retired_repo_paths(chronicle_sandbox, loaded_manifest) -> None:
+    """Retiring a project = deleting its manifest path; that must not crash capture.
+
+    Dropping render_repo/media_sorter_repo from the manifest broke the
+    daily-capture job with a bare KeyError.
+    """
+    from max_chronicle.runtime_context import build_runtime_snapshot
+
+    manifest = dict(loaded_manifest)
+    manifest["paths"] = {
+        k: v for k, v in loaded_manifest["paths"].items()
+        if k not in {"render_repo", "media_sorter_repo"}
+    }
+
+    snapshot = build_runtime_snapshot(
+        manifest,
+        domain_id="global",
+        agent="pytest",
+        recent_events=[],
+        title="Retired-path snapshot",
+        focus="tests",
+    )
+    assert snapshot["id"]
+    repo_paths = {repo.get("path") for repo in snapshot["repos"]}
+    assert repo_paths, "snapshot should still summarize the repos that remain declared"

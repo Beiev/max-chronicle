@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 from pathlib import Path
+import sqlite3
 import sys
+from typing import Iterator
 from zoneinfo import ZoneInfo
 
 from .bootstrap import bootstrap_legacy
+from .browse import render_browse_help, render_daybook, render_entity_timeline, render_recent_events, render_search_results
 from .config import ChronicleConfig, default_config, ensure_runtime_dirs
 from .db import apply_migrations, connect, database_summary
 from .native_automation import (
@@ -18,10 +22,7 @@ from .native_automation import (
     run_automation_job,
     run_backup,
     run_daybook,
-    run_digest_hook,
     run_git_commit_hook,
-    run_minimax_canary,
-    run_minimax_smoke,
     sync_mem0_outbox,
 )
 from .runtime_context import load_manifest
@@ -31,26 +32,47 @@ from .service import (
     build_sources_audit,
     build_startup_bundle,
     capture_runtime_snapshot,
+    embed_backfill,
     guard_event,
     materialize_normalized_entities,
-    materialize_situation_model,
+    project_state,
     query_context,
-    record_scenario,
+    query_memory,
     reconstruct_timeline,
     record_event,
-    review_scenario,
     render_projections,
     repair_event_categories,
     repair_mem0_state,
-    run_lenses,
+    repair_stale_runs,
 )
 from .scaffold import scaffold_workspace
-from .store import config_from_manifest, fetch_recent_events, parse_when, store_snapshot
+from .store import (
+    DEFAULT_STALE_RUN_TTL_HOURS,
+    config_from_manifest,
+    fetch_project_events,
+    fetch_recent_events,
+    fetch_relations_for_entity,
+    parse_when,
+    store_snapshot,
+)
 
 
-def _connection(config: ChronicleConfig):
+@contextmanager
+def _connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
+    """Scoped connection for commands that drive migrations themselves.
+
+    Deliberately not store.open_connection: that one applies migrations behind
+    a per-process memo, which would make `chronicle migrate` report an empty
+    applied-list. The inner `with connection` keeps the commit/rollback the
+    callers rely on; the finally closes it (sqlite3's own __exit__ does not).
+    """
     ensure_runtime_dirs(config)
-    return connect(config.db_path)
+    connection = connect(config.db_path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 _STRICT_FAILURE_STATUSES = {"warn", "warning", "critical", "issues", "error", "failed", "failed_soft", "skipped"}
@@ -455,52 +477,6 @@ def cmd_normalize_entities(args: argparse.Namespace) -> int:
     return _print_json({"domain": args.domain, "normalized_entities": payload, "count": len(payload)})
 
 
-def cmd_build_situation(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
-    payload = materialize_situation_model(manifest, domain_id=args.domain)
-    return _print_json(payload)
-
-
-def cmd_run_lenses(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
-    payload = run_lenses(manifest, domain_id=args.domain, persist=not args.no_persist)
-    return _print_json({"domain": args.domain, "lens_runs": payload, "count": len(payload)})
-
-
-def cmd_record_scenario(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
-    changed_variables: dict[str, str] = {}
-    for item in args.changed_variable or []:
-        if "=" not in item:
-            raise ValueError(f"Invalid changed variable: {item}. Expected key=value.")
-        key, value = item.split("=", 1)
-        changed_variables[key.strip()] = value.strip()
-    payload = record_scenario(
-        manifest,
-        domain_id=args.domain,
-        scenario_name=args.name,
-        assumptions=args.assumption or [],
-        changed_variables=changed_variables,
-        expected_outcomes=args.expected_outcome or [],
-        failure_modes=args.failure_mode or [],
-        confidence=args.confidence,
-        review_due_at=args.review_due_at,
-    )
-    return _print_json(payload)
-
-
-def cmd_review_scenario(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
-    payload = review_scenario(
-        manifest,
-        scenario_id=args.scenario_id,
-        status=args.status,
-        review_summary=args.summary,
-        outcome_event_id=args.outcome_event_id,
-    )
-    return _print_json(payload)
-
-
 def cmd_render_projections(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     rendered = render_projections(manifest)
@@ -519,24 +495,15 @@ def cmd_repair_mem0(args: argparse.Namespace) -> int:
     return _print_json(payload)
 
 
-def cmd_backfill_mem0(args: argparse.Namespace) -> int:
+def cmd_repair_stale_runs(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    payload = backfill_mem0_queue(manifest, dry_run=(args.dry_run or not args.apply))
+    payload = repair_stale_runs(manifest, dry_run=args.dry_run, ttl_hours=args.ttl_hours)
     return _print_json(payload)
 
 
-def cmd_hook_digest_run(args: argparse.Namespace) -> int:
+def cmd_backfill_mem0(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    automation = load_native_automation(args.automation_config)
-    payload = run_digest_hook(
-        manifest,
-        automation,
-        status_path=Path(args.status_path).expanduser() if args.status_path else None,
-        synthesis_path=Path(args.synthesis_path).expanduser() if args.synthesis_path else None,
-        previous_summary_path=Path(args.previous_summary_path).expanduser() if args.previous_summary_path else None,
-        log_path=Path(args.log_path).expanduser() if args.log_path else None,
-        trigger_source=args.trigger_source,
-    )
+    payload = backfill_mem0_queue(manifest, dry_run=(args.dry_run or not args.apply))
     return _print_json(payload)
 
 
@@ -672,13 +639,13 @@ def cmd_automation_run(args: argparse.Namespace) -> int:
         job_name=args.job,
         trigger_source=args.trigger_source,
     )
-    return _print_json(payload)
-
-
-def cmd_minimax_smoke(args: argparse.Namespace) -> int:
-    automation = load_native_automation(args.automation_config)
-    payload = run_minimax_smoke(automation, prompt=args.prompt)
-    return _print_json(payload)
+    code = _print_json(payload)
+    # Hard failures must surface a non-zero exit so launchd/wrappers see the
+    # failure, not just the chronicle.db run record. failed_soft is an expected
+    # degraded state (e.g. daybook without an LLM) and stays exit 0.
+    if payload.get("status") == "failed":
+        return 1
+    return code
 
 
 def cmd_sync_mem0(args: argparse.Namespace) -> int:
@@ -693,15 +660,99 @@ def cmd_sync_mem0(args: argparse.Namespace) -> int:
     return _print_json(payload)
 
 
-def cmd_minimax_canary(args: argparse.Namespace) -> int:
+def cmd_embed_backfill(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    automation = load_native_automation(args.automation_config)
-    payload = run_minimax_canary(
-        manifest,
-        automation,
-        trigger_source=args.trigger_source,
-    )
+    payload = embed_backfill(manifest, limit=args.limit)
     return _print_json(payload)
+
+
+def cmd_query_memory(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    payload = query_memory(
+        manifest,
+        query=args.query,
+        domain=args.domain,
+        limit=args.limit,
+    )
+    if args.format == "json":
+        return _print_json(payload)
+
+    print(f"# Chronicle Hybrid Recall — {payload['query']}")
+    if payload.get("domain"):
+        print(f"Domain: {payload['domain']}")
+    channels = ", ".join(payload.get("channels_used") or [])
+    degraded = " [DEGRADED: vector skipped]" if payload.get("degraded") else ""
+    print(f"Channels: {channels or 'none'}{degraded}")
+    print()
+    results = payload.get("results") or []
+    if not results:
+        print("No results.")
+        return 0
+    for hit in results:
+        project = hit.get("project") or "n/a"
+        category = hit.get("category") or "n/a"
+        print(
+            f"- {hit.get('occurred_at_local') or hit.get('occurred_at_utc')} "
+            f"| {category} | {project} | rrf={hit.get('rrf_score')}"
+        )
+        print(f"  {hit.get('text') or ''}")
+        channels_detail = hit.get("channels") or {}
+        parts = []
+        if channels_detail.get("fts_rank") is not None:
+            parts.append(f"fts_rank={channels_detail['fts_rank']}")
+        if channels_detail.get("vector_similarity") is not None:
+            parts.append(f"vec_sim={channels_detail['vector_similarity']}")
+        if channels_detail.get("recency_rank") is not None:
+            parts.append(f"recency_rank={channels_detail['recency_rank']}")
+        if parts:
+            print(f"  [{', '.join(parts)}]")
+    return 0
+
+
+def cmd_browse(args: argparse.Namespace) -> int:
+    """Dispatcher for `chronicle browse` subcommands."""
+    sub = getattr(args, "browse_command", None)
+    if sub is None:
+        render_browse_help()
+        return 0
+    return args.browse_handler(args)
+
+
+def cmd_browse_search(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    payload = query_memory(
+        manifest,
+        query=args.query,
+        domain=args.domain,
+        limit=args.limit,
+    )
+    render_search_results(payload)
+    return 0
+
+
+def cmd_browse_recent(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    config = config_from_manifest(manifest)
+    events = fetch_recent_events(config, limit=args.limit, domain=args.domain)
+    render_recent_events(events)
+    return 0
+
+
+def cmd_browse_entity(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    state = project_state(manifest, project=args.name)
+    events = state.get("recent_events") or []
+    relations = state.get("relations") or []
+    render_entity_timeline(args.name, events, relations)
+    return 0
+
+
+def cmd_browse_daybook(args: argparse.Namespace) -> int:
+    from .automation import load_automation_config
+
+    automation = load_automation_config(args.automation_config)
+    daybook_dir = automation.daybook_dir
+    return render_daybook(daybook_dir, getattr(args, "date", None))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -798,33 +849,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_normalize_entities.add_argument("--domain", default="global", help="Domain id from the manifest")
     p_normalize_entities.set_defaults(handler=cmd_normalize_entities)
 
-    p_build_situation = sub.add_parser("build-situation", help="Materialize the latest situation model for a domain")
-    p_build_situation.add_argument("--domain", default="global", help="Domain id from the manifest")
-    p_build_situation.set_defaults(handler=cmd_build_situation)
-
-    p_run_lenses = sub.add_parser("run-lenses", help="Materialize fixed lens runs for the latest situation model")
-    p_run_lenses.add_argument("--domain", default="global", help="Domain id from the manifest")
-    p_run_lenses.add_argument("--no-persist", action="store_true", help="Build lens outputs without storing them")
-    p_run_lenses.set_defaults(handler=cmd_run_lenses)
-
-    p_record_scenario = sub.add_parser("record-scenario", help="Create a scenario run against the latest situation model")
-    p_record_scenario.add_argument("--domain", default="global", help="Domain id from the manifest")
-    p_record_scenario.add_argument("--name", required=True, help="Scenario name")
-    p_record_scenario.add_argument("--assumption", action="append", help="Scenario assumption (repeatable)")
-    p_record_scenario.add_argument("--changed-variable", action="append", help="Changed variable key=value (repeatable)")
-    p_record_scenario.add_argument("--expected-outcome", action="append", help="Expected outcome (repeatable)")
-    p_record_scenario.add_argument("--failure-mode", action="append", help="Failure mode (repeatable)")
-    p_record_scenario.add_argument("--confidence", type=float, default=0.6, help="Scenario confidence 0-1")
-    p_record_scenario.add_argument("--review-due-at", default=None, help="Optional ISO timestamp for review due date")
-    p_record_scenario.set_defaults(handler=cmd_record_scenario)
-
-    p_review_scenario = sub.add_parser("review-scenario", help="Store a replay/eval review for a scenario run")
-    p_review_scenario.add_argument("--scenario-id", required=True, help="Scenario id")
-    p_review_scenario.add_argument("--status", required=True, choices=["matched", "partial", "missed"], help="Review outcome")
-    p_review_scenario.add_argument("--summary", required=True, help="Review summary")
-    p_review_scenario.add_argument("--outcome-event-id", default=None, help="Optional supporting Chronicle event id")
-    p_review_scenario.set_defaults(handler=cmd_review_scenario)
-
     p_record = sub.add_parser("record", help="Write a durable event directly to chronicle.db")
     p_record.add_argument("text", help="Durable fact or decision")
     p_record.add_argument("--id", default=None, help="Optional event id")
@@ -889,6 +913,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair_mem0.add_argument("--apply", action="store_true", help="Apply the reconciliation to chronicle.db")
     p_repair_mem0.set_defaults(handler=cmd_repair_mem0)
 
+    p_repair_stale = sub.add_parser("repair-stale-runs", help="Mark stale running automation and curation rows failed")
+    p_repair_stale.add_argument("--dry-run", action="store_true", help="Report stale running rows without mutating chronicle.db")
+    p_repair_stale.add_argument(
+        "--ttl-hours",
+        type=float,
+        default=DEFAULT_STALE_RUN_TTL_HOURS,
+        help="Running rows older than this many hours are marked stale_failed",
+    )
+    p_repair_stale.set_defaults(handler=cmd_repair_stale_runs)
+
     p_backfill_mem0 = sub.add_parser(
         "backfill-mem0-queue",
         help="Requeue eligible skipped MCP events so high-signal backlog can sync into Mem0",
@@ -909,14 +943,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_hook = sub.add_parser("hook", help="Chronicle hook entrypoints")
     hook_sub = p_hook.add_subparsers(dest="hook_command", required=True)
-
-    p_hook_digest = hook_sub.add_parser("digest-run", help="Archive a Digest pipeline run into Chronicle")
-    p_hook_digest.add_argument("--status-path", default=None, help="Override Digest last_status.json path")
-    p_hook_digest.add_argument("--synthesis-path", default=None, help="Override Digest synthesis.md path")
-    p_hook_digest.add_argument("--previous-summary-path", default=None, help="Override previous_summary.txt path")
-    p_hook_digest.add_argument("--log-path", default=None, help="Override Digest log path")
-    p_hook_digest.add_argument("--trigger-source", default="manual", help="Trigger source label")
-    p_hook_digest.set_defaults(handler=cmd_hook_digest_run)
 
     p_hook_git = hook_sub.add_parser("git-commit", help="Archive a tracked git commit into Chronicle")
     p_hook_git.add_argument("--repo", default=None, help="Tracked repo slug")
@@ -977,7 +1003,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_automation_run.add_argument(
         "--job",
         required=True,
-        choices=["daily-capture", "daybook", "mem0-dump", "company-intel", "minimax-canary", "weekly-audit", "backup"],
+        choices=["daily-capture", "daybook", "mem0-dump", "weekly-audit", "backup"],
         help="Job to execute",
     )
     p_automation_run.add_argument("--trigger-source", default="manual", help="Trigger source label")
@@ -988,13 +1014,56 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_mem0.add_argument("--trigger-source", default="manual", help="Trigger source label")
     p_sync_mem0.set_defaults(handler=cmd_sync_mem0)
 
-    p_canary = sub.add_parser("minimax-canary", help="Run the MiniMax health canary and archive the result")
-    p_canary.add_argument("--trigger-source", default="manual", help="Trigger source label")
-    p_canary.set_defaults(handler=cmd_minimax_canary)
+    p_embed_backfill = sub.add_parser(
+        "embed-backfill",
+        help="Embed all Chronicle events that lack a vector embedding (requires Ollama)",
+    )
+    p_embed_backfill.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum events to embed in this run (default: all missing)",
+    )
+    p_embed_backfill.set_defaults(handler=cmd_embed_backfill)
 
-    p_minimax = sub.add_parser("minimax-smoke", help="Run a live MiniMax API smoke test with the configured endpoint/model")
-    p_minimax.add_argument("--prompt", default="Reply with OK only.", help="Short smoke-test prompt")
-    p_minimax.set_defaults(handler=cmd_minimax_smoke)
+    p_query_memory = sub.add_parser(
+        "query-memory",
+        help="Hybrid recall: RRF-fused FTS + vector + temporal search over Chronicle events",
+    )
+    p_query_memory.add_argument("query", help="Natural-language search string")
+    p_query_memory.add_argument("--domain", default=None, help="Optional Chronicle domain filter")
+    p_query_memory.add_argument("--limit", type=int, default=10, help="Maximum results to return")
+    p_query_memory.add_argument("--format", choices=["text", "json"], default="text")
+    p_query_memory.set_defaults(handler=cmd_query_memory)
+
+    # ------------------------------------------------------------------
+    # browse — human-facing navigation (read-only)
+    # ------------------------------------------------------------------
+    p_browse = sub.add_parser(
+        "browse",
+        help="Human-facing archive navigation (search, recent, entity, daybook)",
+    )
+    p_browse.set_defaults(handler=cmd_browse, browse_command=None)
+    browse_sub = p_browse.add_subparsers(dest="browse_command")
+
+    p_bs = browse_sub.add_parser("search", help="Hybrid recall search with ranked readable output")
+    p_bs.add_argument("query", help="Natural-language search string")
+    p_bs.add_argument("--limit", type=int, default=10, help="Maximum results")
+    p_bs.add_argument("--domain", default=None, help="Optional domain filter")
+    p_bs.set_defaults(browse_handler=cmd_browse_search)
+
+    p_br = browse_sub.add_parser("recent", help="Recent events as a reverse-chron timeline")
+    p_br.add_argument("--limit", type=int, default=10, help="Maximum results")
+    p_br.add_argument("--domain", default=None, help="Optional domain filter")
+    p_br.set_defaults(browse_handler=cmd_browse_recent)
+
+    p_be = browse_sub.add_parser("entity", help="Events + relations touching a named entity")
+    p_be.add_argument("name", help="Entity name (project, system, company, etc.)")
+    p_be.set_defaults(browse_handler=cmd_browse_entity)
+
+    p_bd = browse_sub.add_parser("daybook", help="Print a daybook markdown file")
+    p_bd.add_argument("--date", default=None, help="Date YYYY-MM-DD (default: list recent)")
+    p_bd.set_defaults(browse_handler=cmd_browse_daybook)
 
     return parser
 

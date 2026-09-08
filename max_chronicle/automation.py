@@ -24,17 +24,6 @@ class JobSchedule:
 
 
 @dataclass(frozen=True)
-class MiniMaxSettings:
-    base_url: str
-    model: str
-    temperature: float
-    max_tokens: int
-    timeout_seconds: float
-    max_retries: int
-    retry_base_delay: float
-
-
-@dataclass(frozen=True)
 class GuardSettings:
     daybook_per_day: int
     weekly_audit_per_week: int
@@ -42,7 +31,11 @@ class GuardSettings:
     projection_stale_hours: int
     snapshot_stale_hours: int
     mem0_sync_batch_size: int
-    minimax_canary_stale_hours: int
+    stale_run_ttl_hours: int
+    subprocess_timeout_seconds: float
+    backup_space_margin_mb: float
+    jsonl_rotate_mb: float
+    artifact_store_warn_gb: float
 
 
 @dataclass(frozen=True)
@@ -55,7 +48,8 @@ class AutomationConfig:
     launchd_log_dir: Path
     daybook_dir: Path
     git_hooks_dir: Path
-    minimax: MiniMaxSettings
+    # Installations own their launchd namespace; the package default is generic.
+    launchd_label_prefix: str
     guards: GuardSettings
     repos: tuple[RepoConfig, ...]
     jobs: dict[str, JobSchedule]
@@ -69,7 +63,6 @@ def load_automation_config(path: Path | None = None) -> AutomationConfig:
     config_path = path or default_automation_path()
     raw = _load_toml(config_path)
     paths = raw.get("paths", {})
-    minimax = raw.get("minimax", {})
     guards = raw.get("guards", {})
     jobs = raw.get("jobs", {})
 
@@ -87,15 +80,7 @@ def load_automation_config(path: Path | None = None) -> AutomationConfig:
         launchd_log_dir=Path(paths["launchd_log_dir"]).expanduser(),
         daybook_dir=Path(paths["daybook_dir"]).expanduser(),
         git_hooks_dir=Path(paths["git_hooks_dir"]).expanduser(),
-        minimax=MiniMaxSettings(
-            base_url=minimax["base_url"],
-            model=minimax["model"],
-            temperature=float(minimax.get("temperature", 0.2)),
-            max_tokens=int(minimax.get("max_tokens", 3200)),
-            timeout_seconds=float(minimax.get("timeout_seconds", 45.0)),
-            max_retries=int(minimax.get("max_retries", 3)),
-            retry_base_delay=float(minimax.get("retry_base_delay", 2.0)),
-        ),
+        launchd_label_prefix=str(paths.get("launchd_label_prefix", "com.chronicle")),
         guards=GuardSettings(
             daybook_per_day=int(guards.get("daybook_per_day", 1)),
             weekly_audit_per_week=int(guards.get("weekly_audit_per_week", 1)),
@@ -103,7 +88,11 @@ def load_automation_config(path: Path | None = None) -> AutomationConfig:
             projection_stale_hours=int(guards.get("projection_stale_hours", 36)),
             snapshot_stale_hours=int(guards.get("snapshot_stale_hours", 30)),
             mem0_sync_batch_size=int(guards.get("mem0_sync_batch_size", 25)),
-            minimax_canary_stale_hours=int(guards.get("minimax_canary_stale_hours", 36)),
+            stale_run_ttl_hours=int(guards.get("stale_run_ttl_hours", 6)),
+            subprocess_timeout_seconds=float(guards.get("subprocess_timeout_seconds", 120.0)),
+            backup_space_margin_mb=float(guards.get("backup_space_margin_mb", 512.0)),
+            jsonl_rotate_mb=float(guards.get("jsonl_rotate_mb", 25.0)),
+            artifact_store_warn_gb=float(guards.get("artifact_store_warn_gb", 6.0)),
         ),
         repos=repo_items,
         jobs={

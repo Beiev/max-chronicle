@@ -50,3 +50,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local CI sandbox
+.venv-ci/

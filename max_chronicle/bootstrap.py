@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import sqlite3
 import uuid
-from zoneinfo import ZoneInfo
 
 from .config import ChronicleConfig
 from .db import utc_now
+# Single source of truth for slug/entity/serialization semantics. These used to
+# be copy-pasted here, so a fix to slugging or entity ids had to be made twice.
+from .store import (
+    _ensure_project_entity,
+    _entity_name,
+    _json,
+    _parse_iso,
+    _slugify,
+    to_local_iso as _to_local_iso,
+)
 
 
 def _read_jsonl(path) -> list[dict]:
@@ -27,85 +35,8 @@ def _read_jsonl(path) -> list[dict]:
     return rows
 
 
-def _parse_iso(value: str) -> datetime:
-    normalized = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _to_local_iso(timestamp: str, timezone_name: str) -> str:
-    local_tz = ZoneInfo(timezone_name)
-    return _parse_iso(timestamp).astimezone(local_tz).isoformat(timespec="seconds")
-
-
-def _json(data: object) -> str:
-    return json.dumps(data, ensure_ascii=False, sort_keys=True)
-
-
 def _source_hash(path) -> str:
     return sha256(path.read_bytes()).hexdigest()
-
-
-def _slugify(value: str) -> str:
-    slug = value.strip().casefold()
-    cleaned = []
-    for char in slug:
-        if char.isalnum():
-            cleaned.append(char)
-            continue
-        if char in {" ", "_", "-", "/"}:
-            cleaned.append("-")
-    normalized = "".join(cleaned).strip("-")
-    while "--" in normalized:
-        normalized = normalized.replace("--", "-")
-    return normalized or "unknown"
-
-
-def _entity_name(slug: str) -> str:
-    return slug.replace("-", " ").title()
-
-
-def _ensure_project_entity(
-    connection: sqlite3.Connection,
-    project: str | None,
-    recorded_at_utc: str,
-) -> tuple[str | None, str | None]:
-    if not project:
-        return None, None
-
-    slug = _slugify(project)
-    entity_id = f"project:{slug}"
-    connection.execute(
-        """
-        INSERT INTO entities(
-            id,
-            entity_type,
-            slug,
-            name,
-            status,
-            summary,
-            tags_json,
-            metadata_json,
-            created_at_utc,
-            updated_at_utc
-        )
-        VALUES (?, 'project', ?, ?, 'active', NULL, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            updated_at_utc = excluded.updated_at_utc
-        """,
-        (
-            entity_id,
-            slug,
-            _entity_name(slug),
-            _json([slug]),
-            _json({"project_key": project}),
-            recorded_at_utc,
-            recorded_at_utc,
-        ),
-    )
-    return entity_id, "project"
 
 
 def _snapshot_summary(snapshot: dict) -> str:
@@ -128,27 +59,6 @@ def _snapshot_summary(snapshot: dict) -> str:
             "portfolio_og_needed="
             f"{portfolio.get('og_images_needed', 'unknown')}"
         )
-
-    openclaw = snapshot.get("openclaw") or {}
-    if openclaw:
-        lines.append(
-            "openclaw_jobs_found_today="
-            f"{openclaw.get('jobs_found_today', 'unknown')}"
-        )
-        lines.append(
-            "openclaw_applications_sent_today="
-            f"{openclaw.get('applications_sent_today', 'unknown')}"
-        )
-
-    digest = snapshot.get("digest") or {}
-    status = digest.get("status") or {}
-    if isinstance(status, dict) and status:
-        lines.append(
-            "digest_status="
-            f"{status.get('status', 'unknown')}"
-        )
-    for headline in (digest.get("world_headlines") or [])[:2]:
-        lines.append(headline)
 
     if snapshot.get("focus"):
         lines.append(f"focus={snapshot['focus']}")
@@ -290,11 +200,12 @@ def import_legacy_ledger(
                         created_at_utc,
                         synced_at_utc
                     )
-                    VALUES (?, ?, 'napaarnik_personal', 'add', ?, 0, NULL, NULL, ?, ?, ?)
+                    VALUES (?, ?, ?, 'add', ?, 0, NULL, NULL, ?, ?, ?)
                     """,
                     (
                         str(uuid.uuid4()),
                         event_id,
+                        config.mem0_collection,
                         outbox_status,
                         _json(payload),
                         started_at,

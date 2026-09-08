@@ -16,11 +16,13 @@ Schema v1 is intentionally boring:
 
 Current operational database version:
 
-- `PRAGMA user_version = 7`
-- latest applied migration: `0007_missing_indexes.sql`
-- next migration number to reserve: `0008`
+- `PRAGMA user_version = 9`
+- latest applied migration: `0009_event_embeddings.sql`
+- next migration number to reserve: `0010`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
+Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
+Migration `0009` adds `event_embeddings` (float32 BLOB vectors) backing the hybrid `query_memory` recall.
 
 ## Core Tables
 

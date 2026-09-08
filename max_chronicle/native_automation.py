@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import gzip
 import hashlib
 import json
 import os
@@ -14,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .automation import AutomationConfig, ensure_automation_dirs, load_automation_config, load_env_file, repo_by_slug, repo_slug_for_path
@@ -24,6 +25,7 @@ from .service import backfill_mem0_queue, build_freshness_audit, capture_runtime
 from .store import (
     config_from_manifest,
     count_mem0_outbox,
+    DEFAULT_STALE_RUN_TTL_HOURS,
     ensure_entity,
     fetch_automation_run,
     fetch_curation_run,
@@ -46,6 +48,8 @@ from .store import (
     start_automation_run,
     start_backup_run,
     start_curation_run,
+    _atomic_write_bytes,
+    _atomic_write_text,
     store_artifact_from_path,
     store_artifact_text,
     update_event_mem0_state,
@@ -54,19 +58,129 @@ from .store import (
 )
 
 
-LAUNCHD_LABELS = {
-    "daily_capture": "com.rzmrn.chronicle.daily-capture",
-    "daybook": "com.rzmrn.chronicle.daybook",
-    "mem0_dump": "com.rzmrn.chronicle.mem0-dump",
-    "company_intel": "com.rzmrn.chronicle.company-intel",
-    "minimax_canary": "com.rzmrn.chronicle.minimax-canary",
-    "weekly_audit": "com.rzmrn.chronicle.weekly-audit",
-    "backup": "com.rzmrn.chronicle.backup",
+LAUNCHD_JOB_SUFFIXES = {
+    "daily_capture": "daily-capture",
+    "daybook": "daybook",
+    "mem0_dump": "mem0-dump",
+    "weekly_audit": "weekly-audit",
+    "backup": "backup",
 }
+
+
+def launchd_labels(automation) -> dict[str, str]:
+    """Job -> launchd label for this installation.
+
+    The prefix lives in CHRONICLE_AUTOMATION.toml ([paths] launchd_label_prefix)
+    so an installation keeps its own namespace; the package default is generic.
+    """
+    prefix = getattr(automation, "launchd_label_prefix", "com.chronicle")
+    return {key: f"{prefix}.chronicle.{suffix}" for key, suffix in LAUNCHD_JOB_SUFFIXES.items()}
 
 MEM0_OUTBOX_PRUNE_AFTER_DAYS = 30
 MEM0_OUTBOX_PRUNE_BATCH = 5000
 WAL_CHECKPOINT_THRESHOLD_BYTES = 64 * 1024 * 1024
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
+DEFAULT_BACKUP_SPACE_MARGIN_BYTES = 512 * 1024 * 1024
+
+
+def _stale_run_ttl_hours(automation: AutomationConfig) -> int:
+    return int(getattr(automation.guards, "stale_run_ttl_hours", DEFAULT_STALE_RUN_TTL_HOURS))
+
+
+def _subprocess_timeout_seconds(automation: AutomationConfig | None = None) -> float:
+    if automation is None:
+        return DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+    return max(float(getattr(automation.guards, "subprocess_timeout_seconds", DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)), 0.001)
+
+
+def _backup_space_margin_bytes(automation: AutomationConfig) -> int:
+    margin_mb = float(getattr(automation.guards, "backup_space_margin_mb", 512.0))
+    return max(int(margin_mb * 1024 * 1024), 0)
+
+
+def _timeout_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return value.strip()
+
+
+def _subprocess_timeout_result(
+    *,
+    command: list[str],
+    timeout_seconds: float,
+    exc: subprocess.TimeoutExpired,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "failed_soft",
+        "reason": "subprocess_timeout",
+        "command": command,
+        "timeout_seconds": timeout_seconds,
+        "stdout": _timeout_text(exc.stdout),
+        "stderr": _timeout_text(exc.stderr),
+        "error": f"subprocess_timeout after {timeout_seconds:.3g}s",
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _backup_volume_root(backup_root: Path) -> Path | None:
+    resolved = backup_root.expanduser()
+    parts = resolved.parts
+    if len(parts) >= 3 and parts[0] == os.sep and parts[1] == "Volumes":
+        return Path(os.sep) / "Volumes" / parts[2]
+    return None
+
+
+def _backup_available_bytes(path: Path) -> int | None:
+    try:
+        stat = os.statvfs(path)
+    except (AttributeError, OSError):
+        return None
+    return int(stat.f_bavail) * int(stat.f_frsize)
+
+
+def _exception_summary(exc: Exception) -> str:
+    summary = f"{type(exc).__name__}: {exc}"
+    if len(summary) > 500:
+        return summary[:497] + "..."
+    return summary
+
+
+def _exception_details(exc: Exception) -> dict[str, Any]:
+    message = str(exc)
+    if len(message) > 500:
+        message = message[:497] + "..."
+    return {
+        "error": {
+            "type": type(exc).__name__,
+            "message": message,
+            "summary": _exception_summary(exc),
+        }
+    }
+
+
+def _automation_failure_payload(*, job_name: str, run_key: str, run_id: str, exc: Exception) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "job_name": job_name,
+        "run_key": run_key,
+        "run_id": run_id,
+        "error": _exception_details(exc)["error"],
+    }
+
+
+def _curation_failure_payload(*, curation_type: str, run_key: str, run_id: str, exc: Exception) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "curation_type": curation_type,
+        "run_key": run_key,
+        "run_id": run_id,
+        "error": _exception_details(exc)["error"],
+    }
 
 
 def load_native_automation(path: Path | None = None) -> AutomationConfig:
@@ -100,55 +214,6 @@ def _local_day_bounds(config, target_date: str | None = None) -> tuple[datetime,
 
 def _maybe_load_env(automation: AutomationConfig) -> dict[str, str]:
     return load_env_file(automation.env_file)
-
-
-def _strip_think_tags(text: str) -> str:
-    import re
-
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-
-def _call_minimax(
-    automation: AutomationConfig,
-    *,
-    system_prompt: str,
-    user_content: str,
-    max_tokens: int | None = None,
-) -> str:
-    _maybe_load_env(automation)
-    api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("MINIMAX_API_KEY is not set")
-
-    from openai import OpenAI
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url=automation.minimax.base_url,
-        timeout=automation.minimax.timeout_seconds,
-        max_retries=0,
-    )
-    last_error: Exception | None = None
-    for attempt in range(1, automation.minimax.max_retries + 1):
-        try:
-            response = client.chat.completions.create(
-                model=automation.minimax.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                max_tokens=max_tokens or automation.minimax.max_tokens,
-                temperature=automation.minimax.temperature,
-                extra_body={"reasoning_split": True},
-            )
-            raw = response.choices[0].message.content or ""
-            return _strip_think_tags(raw)
-        except Exception as exc:  # pragma: no cover - exercised with mocks in tests
-            last_error = exc
-            if attempt == automation.minimax.max_retries:
-                break
-            time.sleep(automation.minimax.retry_base_delay * (2 ** (attempt - 1)))
-    raise RuntimeError(f"MiniMax API failed: {last_error}")
 
 
 def _compose_mem0_text(text: str, why: str | None) -> str:
@@ -187,13 +252,23 @@ def _run_mem0_dump(
     dump_path = expand_path(manifest["paths"]["mem0_dump"])
     dump_path.parent.mkdir(parents=True, exist_ok=True)
     command = _mem0_command(manifest) + ["dump", "--output", str(dump_path)]
-    proc = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        env=os.environ.copy(),
-    )
+    timeout_seconds = _subprocess_timeout_seconds(automation)
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=os.environ.copy(),
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _subprocess_timeout_result(
+            command=command,
+            timeout_seconds=timeout_seconds,
+            exc=exc,
+            extra={"dump_path": str(dump_path), "trigger_source": trigger_source},
+        )
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
     if proc.returncode != 0:
@@ -252,115 +327,6 @@ def _run_mem0_dump(
         "artifact_id": artifact["id"] if artifact else None,
         "snapshot_id": latest_snapshot["id"] if latest_snapshot else None,
         "memory_count": memory_count,
-        "trigger_source": trigger_source,
-        "stdout": stdout,
-    }
-
-
-def _company_intel_output_path(manifest: dict[str, Any]) -> Path:
-    explicit = (manifest.get("paths") or {}).get("company_intel_json")
-    if explicit:
-        return expand_path(explicit)
-    return _status_root(manifest) / "company-intel.json"
-
-
-def _run_company_intel_refresh(
-    manifest: dict[str, Any],
-    automation: AutomationConfig,
-    *,
-    trigger_source: str,
-    automation_run_id: str | None = None,
-) -> dict[str, Any]:
-    _maybe_load_env(automation)
-    config = config_from_manifest(manifest)
-    script_path = _status_root(manifest) / "scripts" / "company_intel_bridge.py"
-    output_path = _company_intel_output_path(manifest)
-    if not script_path.exists():
-        return {
-            "status": "failed",
-            "script_path": str(script_path),
-            "company_intel_path": str(output_path),
-            "error": "script_missing",
-            "trigger_source": trigger_source,
-        }
-
-    command = _script_runner(script_path)
-    proc = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        env=os.environ.copy(),
-    )
-    stdout = (proc.stdout or "").strip()
-    stderr = (proc.stderr or "").strip()
-    if proc.returncode != 0:
-        return {
-            "status": "failed",
-            "command": command,
-            "script_path": str(script_path),
-            "company_intel_path": str(output_path),
-            "error": stderr or stdout or f"exit_{proc.returncode}",
-            "trigger_source": trigger_source,
-        }
-    if not output_path.exists():
-        return {
-            "status": "failed",
-            "command": command,
-            "script_path": str(script_path),
-            "company_intel_path": str(output_path),
-            "error": "output_missing",
-            "trigger_source": trigger_source,
-            "stdout": stdout,
-        }
-
-    payload = read_json(output_path) or {}
-    company_count = len(payload.get("companies") or {})
-    industry_event_count = len(payload.get("industry_context") or [])
-    observed_at_utc = utc_now()
-    artifact = store_artifact_from_path(
-        config,
-        source_path=output_path,
-        artifact_type="company-intel",
-        observed_at_utc=observed_at_utc,
-        entity_type="system",
-        entity_name="company-intel",
-        metadata={
-            "job_name": "company-intel",
-            "trigger_source": trigger_source,
-            "company_count": company_count,
-            "industry_event_count": industry_event_count,
-        },
-    )
-    latest_snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
-    if artifact is not None and automation_run_id is not None:
-        link_artifact(
-            config,
-            artifact_id=artifact["id"],
-            target_type="automation_run",
-            target_id=automation_run_id,
-            link_role="documents",
-            metadata={"job_name": "company-intel"},
-        )
-    if artifact is not None and latest_snapshot is not None:
-        link_artifact(
-            config,
-            artifact_id=artifact["id"],
-            target_type="snapshot",
-            target_id=latest_snapshot["id"],
-            link_role="documents",
-            metadata={"job_name": "company-intel"},
-        )
-
-    return {
-        "status": "ok",
-        "command": command,
-        "script_path": str(script_path),
-        "company_intel_path": str(output_path),
-        "artifact_id": artifact["id"] if artifact else None,
-        "snapshot_id": latest_snapshot["id"] if latest_snapshot else None,
-        "company_count": company_count,
-        "industry_event_count": industry_event_count,
         "trigger_source": trigger_source,
         "stdout": stdout,
     }
@@ -429,6 +395,14 @@ def _legacy_surface_findings(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return unique
 
 
+# Live Mem0 sync retry policy (best-effort; mem0_outbox is the real durability
+# net). Preserves the prior behaviour, which was borrowed from the now-removed
+# [minimax] config (max_retries=3, retry_base_delay=2.0, timeout=45s).
+_MEM0_MAX_RETRIES = 3
+_MEM0_RETRY_BASE_DELAY = 2.0
+_MEM0_TIMEOUT_SECONDS = 45.0
+
+
 def _add_to_live_mem0(
     manifest: dict[str, Any],
     automation: AutomationConfig,
@@ -445,9 +419,9 @@ def _add_to_live_mem0(
         command.extend(["--project", project])
 
     env = os.environ.copy()
-    max_retries = max(int(getattr(automation.minimax, "max_retries", 1) or 1), 1)
-    retry_base_delay = float(getattr(automation.minimax, "retry_base_delay", 1.0) or 1.0)
-    timeout_seconds = max(float(getattr(automation.minimax, "timeout_seconds", 45.0) or 45.0), 5.0)
+    max_retries = _MEM0_MAX_RETRIES
+    retry_base_delay = _MEM0_RETRY_BASE_DELAY
+    timeout_seconds = _MEM0_TIMEOUT_SECONDS
     last_error = ""
 
     for attempt in range(1, max_retries + 1):
@@ -503,9 +477,9 @@ def _add_to_live_mem0_batch(
         return {"ok": True, "payload": {"status": "ok", "processed": []}}
 
     _maybe_load_env(automation)
-    max_retries = max(int(getattr(automation.minimax, "max_retries", 1) or 1), 1)
-    retry_base_delay = float(getattr(automation.minimax, "retry_base_delay", 1.0) or 1.0)
-    timeout_seconds = max(float(getattr(automation.minimax, "timeout_seconds", 45.0) or 45.0), 5.0)
+    max_retries = _MEM0_MAX_RETRIES
+    retry_base_delay = _MEM0_RETRY_BASE_DELAY
+    timeout_seconds = _MEM0_TIMEOUT_SECONDS
     batch_timeout_seconds = max(min(timeout_seconds * max(len(items), 1), 120.0), 30.0)
 
     temp_path: str | None = None
@@ -693,19 +667,13 @@ def sync_mem0_outbox(
     }
 
 
-def _latest_digest_log(manifest: dict[str, Any]) -> Path | None:
-    digest_repo = expand_path(manifest["paths"]["intel_digest_repo"])
-    logs_dir = digest_repo / "logs"
-    candidates = sorted(logs_dir.glob("digest_*.log"), key=lambda item: item.stat().st_mtime, reverse=True)
-    return candidates[0] if candidates else None
-
-
 def _git_root(path: Path) -> Path:
     result = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
         capture_output=True,
         text=True,
         check=True,
+        timeout=DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
     )
     return Path(result.stdout.strip()).resolve()
 
@@ -716,6 +684,7 @@ def _changed_files_for_commit(repo_root: Path, commit_sha: str) -> list[str]:
         capture_output=True,
         text=True,
         check=True,
+        timeout=DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
     )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
@@ -816,7 +785,7 @@ def _render_deterministic_daybook(
     decisions = [event for event in events if event.get("why")]
     blockers = [event for event in events if "block" in (event.get("category") or "") or "block" in event.get("text", "").casefold()]
     repos = sorted({event.get("project") for event in events if event.get("project")})
-    world_headlines = ((snapshot or {}).get("digest") or {}).get("world_headlines") or []
+    world_headlines: list[str] = []
 
     lines = [
         f"# Chronicle Daybook — {local_date}",
@@ -880,6 +849,8 @@ def _compose_daybook(
     audit_status: dict[str, Any] | None,
     backup_status: dict[str, Any] | None,
 ) -> tuple[str, str, str | None]:
+    # The deterministic skeleton is the sole daybook output. MiniMax was cut
+    # 2026-05-19; there is no longer an LLM narrative path.
     deterministic = _render_deterministic_daybook(
         local_date=local_date,
         events=events,
@@ -887,184 +858,7 @@ def _compose_daybook(
         audit_status=audit_status,
         backup_status=backup_status,
     )
-    prompt_payload = {
-        "local_date": local_date,
-        "events": events[-20:],
-        "world_headlines": ((snapshot or {}).get("digest") or {}).get("world_headlines") or [],
-        "backup_status": backup_status,
-        "audit_status": audit_status,
-    }
-    prompt_json = json.dumps(prompt_payload, ensure_ascii=False, indent=2)
-    narrative = ""
-    try:
-        narrative = _call_minimax(
-            automation,
-            system_prompt=(
-                "You are a precise historian. Write concise markdown for a personal daybook. "
-                "Do not invent facts. Explain what changed, why it mattered, and what remained blocked."
-            ),
-            user_content=prompt_json,
-            max_tokens=1600,
-        )
-    except Exception as exc:
-        return deterministic, "failed_soft", str(exc)
-
-    lines = [deterministic.rstrip(), "", "## Narrative", "", narrative.strip(), ""]
-    return "\n".join(lines), "ok", None
-
-
-def run_digest_hook(
-    manifest: dict[str, Any],
-    automation: AutomationConfig,
-    *,
-    status_path: Path | None = None,
-    synthesis_path: Path | None = None,
-    previous_summary_path: Path | None = None,
-    log_path: Path | None = None,
-    trigger_source: str = "manual",
-) -> dict[str, Any]:
-    config = config_from_manifest(manifest)
-    status_path = status_path or expand_path(manifest["paths"]["digest_status_json"])
-    synthesis_path = synthesis_path or expand_path(manifest["paths"]["digest_synthesis_md"])
-    previous_summary_path = previous_summary_path or expand_path(manifest["paths"]["digest_previous_summary"])
-    log_path = log_path or _latest_digest_log(manifest)
-
-    status_payload = read_json(status_path) or {}
-    payload = {
-        "status_path": str(status_path),
-        "synthesis_path": str(synthesis_path),
-        "previous_summary_path": str(previous_summary_path),
-        "log_path": str(log_path) if log_path else None,
-        "status": status_payload.get("status"),
-        "deployed": status_payload.get("deployed"),
-        "timestamp": status_payload.get("timestamp"),
-    }
-    dedupe_source = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    dedupe_key = hashlib.sha256(dedupe_source.encode("utf-8")).hexdigest()
-    existing = fetch_hook_event(config, hook_type="digest-run", dedupe_key=dedupe_key)
-    if existing:
-        return {
-            "status": "existing",
-            "hook_event": existing,
-            "event_id": existing.get("event_id"),
-            "snapshot_id": existing.get("snapshot_id"),
-        }
-
-    latest_previous = fetch_latest_hook_event(config, hook_type="digest-run")
-    previous_payload = latest_previous.get("payload") if latest_previous else {}
-    previous_status = previous_payload.get("status")
-    previous_deployed = previous_payload.get("deployed")
-    current_status = status_payload.get("status", "unknown")
-    current_deployed = status_payload.get("deployed")
-    state_changed = previous_status not in {None, current_status} or previous_deployed != current_deployed
-
-    summary = (
-        f"Digest run status={current_status}, sources={status_payload.get('sources_ok', 0)}/"
-        f"{status_payload.get('sources_total', 0)}, items={status_payload.get('items', 0)}, "
-        f"deployed={current_deployed}."
-    )
-    source_files = [str(status_path), str(synthesis_path), str(previous_summary_path)]
-    if log_path:
-        source_files.append(str(log_path))
-
-    stored = record_event(
-        manifest,
-        {
-            "agent": "chronicle",
-            "domain": "global",
-            "category": "digest_run",
-            "project": "intel-digest",
-            "text": summary,
-            "why": "Digest completed a new pipeline run and updated the latest world-context outputs.",
-            "source_files": source_files,
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-            "skip_generic_source_archives": True,
-        },
-        append_compat=True,
-        source_kind="chronicle_hook.digest_run",
-        imported_from=f"chronicle.hook.digest-run:{trigger_source}",
-    )
-    link_event_external_ref(
-        config,
-        event_id=stored["id"],
-        ref_type="digest_run",
-        ref_value=status_payload.get("timestamp") or dedupe_key,
-        metadata={"dedupe_key": dedupe_key},
-    )
-
-    _artifact_for_event(
-        manifest,
-        event_id=stored["id"],
-        source_path=status_path,
-        artifact_type="digest-run-status",
-        observed_at_utc=stored["recorded_at"],
-        entity_type="system",
-        entity_name="digest",
-    )
-    if synthesis_path.exists():
-        _artifact_for_event(
-            manifest,
-            event_id=stored["id"],
-            source_path=synthesis_path,
-            artifact_type="digest-run-synthesis",
-            observed_at_utc=stored["recorded_at"],
-            entity_type="system",
-            entity_name="digest",
-        )
-    if previous_summary_path.exists():
-        _artifact_for_event(
-            manifest,
-            event_id=stored["id"],
-            source_path=previous_summary_path,
-            artifact_type="digest-run-previous-summary",
-            observed_at_utc=stored["recorded_at"],
-            entity_type="system",
-            entity_name="digest",
-        )
-    if log_path and log_path.exists():
-        _artifact_for_event(
-            manifest,
-            event_id=stored["id"],
-            source_path=log_path,
-            artifact_type="digest-run-log",
-            observed_at_utc=stored["recorded_at"],
-            entity_type="system",
-            entity_name="digest",
-        )
-
-    local_date = datetime.now(ZoneInfo(config.timezone)).strftime("%Y-%m-%d")
-    should_capture = state_changed or not has_snapshot_for_local_date(config, domain="global", local_date=local_date)
-    snapshot = None
-    if should_capture:
-        snapshot = capture_runtime_snapshot(
-            manifest,
-            domain_id="global",
-            agent="chronicle-hook",
-            title="Digest state transition",
-            focus="digest automation",
-            append_compat=True,
-            render_generated=True,
-        )
-
-    hook_row = upsert_hook_event(
-        config,
-        hook_type="digest-run",
-        dedupe_key=dedupe_key,
-        source_ref=status_payload.get("timestamp"),
-        status="handled",
-        payload=payload,
-        event_id=stored["id"],
-        snapshot_id=snapshot["id"] if snapshot else None,
-    )
-    return {
-        "status": "stored",
-        "event_id": stored["id"],
-        "snapshot_id": snapshot["id"] if snapshot else None,
-        "state_changed": state_changed,
-        "hook_event": hook_row,
-    }
+    return deterministic, "ok", None
 
 
 def run_git_commit_hook(
@@ -1096,12 +890,14 @@ def run_git_commit_hook(
         capture_output=True,
         text=True,
         check=True,
+        timeout=_subprocess_timeout_seconds(automation),
     )
     message = subprocess.run(
         ["git", "-C", str(git_root), "log", "-1", "--pretty=%s", commit_sha],
         capture_output=True,
         text=True,
         check=True,
+        timeout=_subprocess_timeout_seconds(automation),
     )
     summary = message.stdout.strip() or f"Commit {commit_sha[:12]}"
 
@@ -1197,237 +993,117 @@ def run_daybook(
         config,
         curation_type="daybook",
         run_key=local_date,
-        model_name=automation.minimax.model,
+        model_name=None,
         prompt_sha256=None,
         payload={"trigger_source": trigger_source},
+        stale_ttl_hours=_stale_run_ttl_hours(automation),
     )
     if not created:
         existing = fetch_curation_run(config, curation_type="daybook", run_key=local_date)
         return {"status": "existing", "run": existing}
 
-    events = fetch_events_between(
-        config,
-        start_utc=start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        end_utc=end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        limit=1000,
-    )
-    latest_backup = fetch_latest_backup_run(config, successful_only=True)
-    latest_audit = fetch_latest_curation_run(config, curation_type="weekly_audit")
-    snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
-
-    if not events:
-        finish_curation_run(config, run_id=run_id, status="skipped", notes="No durable delta for this date.")
-        return {"status": "skipped", "run_id": run_id, "reason": "no_events"}
-
-    content, llm_status, llm_error = _compose_daybook(
-        automation,
-        local_date=local_date,
-        events=events,
-        snapshot=snapshot,
-        audit_status=latest_audit,
-        backup_status=latest_backup,
-    )
-
-    daybook_dir = automation.daybook_dir / local_date[:4]
-    daybook_dir.mkdir(parents=True, exist_ok=True)
-    daybook_path = daybook_dir / f"{local_date}.md"
-    daybook_path.write_text(content, encoding="utf-8")
-
-    artifact = _store_text_artifact(
-        manifest,
-        target_type="snapshot" if snapshot else "event",
-        target_id=snapshot["id"] if snapshot else run_id,
-        artifact_type="daybook",
-        content=content,
-        filename=f"{local_date}.md",
-        observed_at_utc=utc_now(),
-        entity_type="system",
-        entity_name="chronicle",
-        link_role="generated",
-    )
-
-    summary_event = record_event(
-        manifest,
-        {
-            "agent": "chronicle",
-            "domain": "global",
-            "category": "daily_summary",
-            "project": "status",
-            "text": f"Chronicle daybook generated for {local_date}.",
-            "why": "Summarize the day's durable changes into a readable historical record.",
-            "source_files": [str(daybook_path)],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-        append_compat=True,
-        source_kind="chronicle_curator.daybook",
-        imported_from=f"chronicle.curate.daybook:{trigger_source}",
-    )
-    link_artifact(
-        config,
-        artifact_id=artifact["id"],
-        target_type="event",
-        target_id=summary_event["id"],
-        link_role="summarizes",
-        metadata={"local_date": local_date},
-    )
-    finish_curation_run(
-        config,
-        run_id=run_id,
-        status="ok" if llm_status == "ok" else "failed_soft",
-        payload={
-            "local_date": local_date,
-            "event_count": len(events),
-            "daybook_path": str(daybook_path),
-            "llm_error": llm_error,
-        },
-        artifact_id=artifact["id"],
-        event_id=summary_event["id"],
-        notes=llm_error or llm_status,
-    )
-    return {
-        "status": "ok" if llm_status == "ok" else "failed_soft",
-        "run_id": run_id,
-        "event_id": summary_event["id"],
-        "artifact_id": artifact["id"],
-        "path": str(daybook_path),
-    }
-
-
-def run_minimax_smoke(
-    automation: AutomationConfig,
-    *,
-    prompt: str = "Reply with OK only.",
-) -> dict[str, Any]:
-    _maybe_load_env(automation)
-    started_at = utc_now()
+    failure_details: dict[str, Any] | None = None
     try:
-        text = _call_minimax(
+        events = fetch_events_between(
+            config,
+            start_utc=start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            end_utc=end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            limit=1000,
+        )
+        latest_backup = fetch_latest_backup_run(config, successful_only=True)
+        latest_audit = fetch_latest_curation_run(config, curation_type="weekly_audit")
+        snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
+
+        if not events:
+            finish_curation_run(config, run_id=run_id, status="skipped", notes="No durable delta for this date.")
+            return {"status": "skipped", "run_id": run_id, "reason": "no_events"}
+
+        content, llm_status, llm_error = _compose_daybook(
             automation,
-            system_prompt="You are a concise healthcheck assistant.",
-            user_content=prompt,
-            max_tokens=256,
+            local_date=local_date,
+            events=events,
+            snapshot=snapshot,
+            audit_status=latest_audit,
+            backup_status=latest_backup,
         )
-        return {
-            "status": "ok",
-            "checked_at_utc": started_at,
-            "base_url": automation.minimax.base_url,
-            "model": automation.minimax.model,
-            "text": text,
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "checked_at_utc": started_at,
-            "base_url": automation.minimax.base_url,
-            "model": automation.minimax.model,
-            "error": str(exc),
-        }
 
+        daybook_dir = automation.daybook_dir / local_date[:4]
+        daybook_dir.mkdir(parents=True, exist_ok=True)
+        daybook_path = daybook_dir / f"{local_date}.md"
+        _atomic_write_text(daybook_path, content)
 
-def run_minimax_canary(
-    manifest: dict[str, Any],
-    automation: AutomationConfig,
-    *,
-    trigger_source: str = "manual",
-    previous_health: str | None = None,
-) -> dict[str, Any]:
-    config = config_from_manifest(manifest)
-    local_now = _local_now(config)
-    run_key = local_now.strftime("%Y-%m-%d")
-    previous = None if previous_health is not None else fetch_latest_automation_run(config, job_name="minimax-canary")
-    latest_snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
-    result = run_minimax_smoke(automation)
-    details = {
-        "health_status": result["status"],
-        "checked_at_utc": result["checked_at_utc"],
-        "base_url": result["base_url"],
-        "model": result["model"],
-        "trigger_source": trigger_source,
-    }
-    if result["status"] == "ok":
-        details["text"] = result.get("text")
-    else:
-        details["error"] = result.get("error")
+        artifact = _store_text_artifact(
+            manifest,
+            target_type="snapshot" if snapshot else "event",
+            target_id=snapshot["id"] if snapshot else run_id,
+            artifact_type="daybook",
+            content=content,
+            filename=f"{local_date}.md",
+            observed_at_utc=utc_now(),
+            entity_type="system",
+            entity_name="chronicle",
+            link_role="generated",
+        )
 
-    artifact = _store_text_artifact(
-        manifest,
-        target_type="snapshot" if latest_snapshot else "automation_run",
-        target_id=latest_snapshot["id"] if latest_snapshot else run_key,
-        artifact_type="minimax-health-check",
-        content=json.dumps(details, ensure_ascii=False, indent=2) + "\n",
-        filename=f"minimax-canary-{run_key}.json",
-        observed_at_utc=utc_now(),
-        entity_type="system",
-        entity_name="chronicle",
-        link_role="generated",
-    )
-
-    resolved_previous_health = previous_health
-    if resolved_previous_health is None and previous:
-        resolved_previous_health = previous.get("details", {}).get("health_status") or previous.get("status")
-
-    event_id = None
-    if result["status"] != "ok":
-        event = record_event(
+        summary_event = record_event(
             manifest,
             {
                 "agent": "chronicle",
-                "domain": "memory",
-                "category": "anomaly",
+                "domain": "global",
+                "category": "daily_summary",
                 "project": "status",
-                "text": "MiniMax canary failed during Chronicle automation.",
-                "why": result.get("error") or "MiniMax completion check returned an error.",
-                "source_files": [],
+                "text": f"Chronicle daybook generated for {local_date}.",
+                "why": "Summarize the day's durable changes into a readable historical record.",
+                "source_files": [str(daybook_path)],
                 "mem0_status": "off",
                 "mem0_error": None,
                 "mem0_raw": None,
             },
             append_compat=True,
-            source_kind="chronicle_canary.minimax",
-            imported_from=f"chronicle.canary.minimax:{trigger_source}",
+            source_kind="chronicle_curator.daybook",
+            imported_from=f"chronicle.curate.daybook:{trigger_source}",
         )
-        event_id = event["id"]
-    elif resolved_previous_health and resolved_previous_health != "ok":
-        event = record_event(
-            manifest,
-            {
-                "agent": "chronicle",
-                "domain": "memory",
-                "category": "maintenance",
-                "project": "status",
-                "text": "MiniMax canary recovered and returned to healthy status.",
-                "why": "The previous recorded MiniMax canary did not complete successfully, and the provider is now reachable again.",
-                "source_files": [],
-                "mem0_status": "off",
-                "mem0_error": None,
-                "mem0_raw": None,
-            },
-            append_compat=True,
-            source_kind="chronicle_canary.minimax",
-            imported_from=f"chronicle.canary.minimax:{trigger_source}",
-        )
-        event_id = event["id"]
-
-    if event_id:
         link_artifact(
             config,
             artifact_id=artifact["id"],
             target_type="event",
-            target_id=event_id,
-            link_role="documents",
-            metadata={"job_name": "minimax-canary"},
+            target_id=summary_event["id"],
+            link_role="summarizes",
+            metadata={"local_date": local_date},
         )
-
-    return {
-        "status": "ok" if result["status"] == "ok" else "failed_soft",
-        "artifact_id": artifact["id"],
-        "event_id": event_id,
-        "snapshot_id": latest_snapshot["id"] if latest_snapshot else None,
-        "health": result,
-        "details": details,
-    }
+        finish_curation_run(
+            config,
+            run_id=run_id,
+            status="ok" if llm_status == "ok" else "failed_soft",
+            payload={
+                "local_date": local_date,
+                "event_count": len(events),
+                "daybook_path": str(daybook_path),
+                "llm_error": llm_error,
+            },
+            artifact_id=artifact["id"],
+            event_id=summary_event["id"],
+            notes=llm_error or llm_status,
+        )
+        return {
+            "status": "ok" if llm_status == "ok" else "failed_soft",
+            "run_id": run_id,
+            "event_id": summary_event["id"],
+            "artifact_id": artifact["id"],
+            "path": str(daybook_path),
+        }
+    except Exception as exc:
+        failure_details = _exception_details(exc)
+        return _curation_failure_payload(curation_type="daybook", run_key=local_date, run_id=run_id, exc=exc)
+    finally:
+        if failure_details is not None:
+            finish_curation_run(
+                config,
+                run_id=run_id,
+                status="failed",
+                payload=failure_details,
+                notes=failure_details["error"]["summary"],
+            )
 
 
 def _copy_tree_incremental(source_root: Path, target_root: Path) -> tuple[int, int, dict[str, int]]:
@@ -1523,6 +1199,79 @@ def _prune_mem0_outbox(config) -> dict[str, Any]:
         "pruned_by_status": dict(pruned_by_status),
         "sample_event_ids": [row["event_id"] for row in rows[:5]],
     }
+
+
+def _rotate_jsonl_if_needed(path: Path, *, cap_bytes: int) -> dict[str, Any]:
+    """Gzip-archive a JSONL file when it exceeds cap_bytes and start fresh.
+
+    Returns a dict with rotation outcome info suitable for embedding in a
+    maintenance report. Uses atomic operations: write compressed to a temp
+    file on the same filesystem, rename to final name, then truncate/replace
+    the live file.
+    """
+    if not path.exists():
+        return {"status": "skipped", "skip_reason": "file_missing", "path": str(path)}
+    size = path.stat().st_size
+    if size <= cap_bytes:
+        return {"status": "skipped", "skip_reason": "below_cap", "path": str(path), "size_bytes": size, "cap_bytes": cap_bytes}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = path.with_name(f"{path.stem}.{stamp}{path.suffix}.gz")
+    tmp_archive = archive_path.with_suffix(".tmp")
+    try:
+        raw = path.read_bytes()
+        with gzip.open(tmp_archive, "wb") as gz_handle:
+            gz_handle.write(raw)
+        tmp_archive.rename(archive_path)
+    except OSError as exc:
+        tmp_archive.unlink(missing_ok=True)
+        return {"status": "error", "error": str(exc), "path": str(path), "size_bytes": size}
+
+    # Atomically truncate the live file by writing an empty replacement.
+    try:
+        _atomic_write_text(path, "")
+    except OSError as exc:
+        return {
+            "status": "partial",
+            "archive_path": str(archive_path),
+            "error": f"truncate_failed: {exc}",
+            "path": str(path),
+            "size_bytes": size,
+        }
+
+    return {
+        "status": "rotated",
+        "path": str(path),
+        "archive_path": str(archive_path),
+        "size_bytes_before": size,
+        "cap_bytes": cap_bytes,
+    }
+
+
+def _vacuum_db(config) -> dict[str, Any]:
+    """Space maintenance on the live DB; never fights the MCP daemon for locks."""
+    try:
+        with open_connection(config) as connection:
+            # Give up fast instead of stalling the backup job behind the live
+            # daemon — a skipped vacuum simply retries on the next run.
+            connection.execute("PRAGMA busy_timeout = 2000")
+            auto_vacuum_mode = connection.execute("PRAGMA auto_vacuum").fetchone()[0]
+            if auto_vacuum_mode == 2:  # INCREMENTAL
+                connection.execute("PRAGMA incremental_vacuum")
+                mode = "incremental_vacuum"
+            else:
+                # Legacy fallback for DBs not yet flipped to INCREMENTAL: full
+                # VACUUM needs an exclusive lock and rewrites the whole file.
+                connection.execute("VACUUM")
+                mode = "vacuum"
+        return {"status": "ok", "mode": mode}
+    except sqlite3.OperationalError as exc:
+        message = str(exc).casefold()
+        if "locked" in message or "busy" in message:
+            return {"status": "skipped_locked", "error": str(exc), "mode": "unknown"}
+        return {"status": "error", "error": str(exc), "mode": "unknown"}
+    except sqlite3.Error as exc:
+        return {"status": "error", "error": str(exc), "mode": "unknown"}
 
 
 def _wal_path(config) -> Path:
@@ -1640,14 +1389,27 @@ def _upsert_backup_manifest_in_db(
     run_id: str,
     manifest_path: Path,
     observed_at_utc: str,
+    payload: str,
 ) -> None:
-    payload = manifest_path.read_text(encoding="utf-8")
+    """Register the manifest as an artifact + run link inside the backup copy.
+
+    Must run BEFORE the backup DB's final checkpoint/hash: these rows have to
+    land in the main database file, and the manifest's `db_sha256` has to cover
+    a database that already contains them.
+
+    `payload` is the manifest body as known at registration time, not the file
+    finally written — the file also carries `db_sha256`, which cannot be known
+    until this write has been checkpointed. That circularity is why the row's
+    hash is scoped as pre-finalization in its metadata; the authoritative
+    content hash of the shipped manifest lives in the manifest itself.
+    """
     sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     metadata_json = json.dumps(
         {
             "source_name": manifest_path.name,
             "source_size": len(payload.encode("utf-8")),
             "run_id": run_id,
+            "content_hash_scope": "pre_finalization",
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1707,7 +1469,7 @@ def _upsert_backup_manifest_in_db(
         )
 
 
-def _restore_check(source_db: Path, *, backup_path: Path | None = None) -> dict[str, Any]:
+def _restore_check(source_db: Path, *, backup_path: Path | None = None, require_manifest: bool = True) -> dict[str, Any]:
     backup_root = backup_path or source_db.parent
     manifest_path = backup_root / "backup-manifest.json"
     artifact_root = backup_root / "chronicle-artifacts"
@@ -1772,12 +1534,10 @@ def _restore_check(source_db: Path, *, backup_path: Path | None = None) -> dict[
             and integrity == "ok"
             and not foreign_key_violations
             and running_backup_runs == 0
-            and backup_manifest_present
-            and backup_manifest_declared
-            and manifest_artifacts > 0
-            and manifest_links > 0
             and artifact_tree_complete
         )
+        if require_manifest:
+            ok = ok and backup_manifest_present and backup_manifest_declared and manifest_artifacts > 0 and manifest_links > 0
         return {
             "quick_check": quick_check,
             "integrity_check": integrity,
@@ -1793,6 +1553,7 @@ def _restore_check(source_db: Path, *, backup_path: Path | None = None) -> dict[
             "backup_manifest_declared": backup_manifest_declared,
             "backup_manifest_artifacts": int(manifest_artifacts),
             "backup_manifest_links": int(manifest_links),
+            "backup_manifest_required": require_manifest,
             "artifact_tree_files": artifact_tree_files,
             "artifact_tree_expected_files": expected_artifact_files,
             "artifact_tree_complete": artifact_tree_complete,
@@ -1809,11 +1570,39 @@ def run_backup(
 ) -> dict[str, Any]:
     config = config_from_manifest(manifest)
     target_root = automation.backup_root
-    if not target_root.exists():
+    volume_root = _backup_volume_root(target_root)
+    if volume_root is not None and not volume_root.is_mount():
+        return {
+            "status": "skipped",
+            "reason": "backup_target_not_mounted",
+            "target_root": str(target_root),
+            "volume_root": str(volume_root),
+            "backup_policy": "opportunistic_external",
+        }
+    if volume_root is None and not target_root.exists():
         return {
             "status": "skipped",
             "reason": "target_unmounted",
             "target_root": str(target_root),
+            "backup_policy": "opportunistic_external",
+        }
+
+    source_db = config.db_path
+    source_db_size = source_db.stat().st_size if source_db.exists() else 0
+    margin_bytes = _backup_space_margin_bytes(automation)
+    stat_target = target_root if target_root.exists() else (volume_root or target_root.parent)
+    available_bytes = _backup_available_bytes(stat_target) if stat_target.exists() else None
+    required_bytes = source_db_size + margin_bytes
+    if available_bytes is not None and available_bytes < required_bytes:
+        return {
+            "status": "skipped",
+            "reason": "insufficient_space",
+            "target_root": str(target_root),
+            "stat_target": str(stat_target),
+            "available_bytes": available_bytes,
+            "required_bytes": required_bytes,
+            "db_size_bytes": source_db_size,
+            "space_margin_bytes": margin_bytes,
             "backup_policy": "opportunistic_external",
         }
 
@@ -1829,6 +1618,24 @@ def run_backup(
 
     maintenance = _prune_mem0_outbox(config)
 
+    # JSONL rotation: archive append-only compat logs when they exceed the cap.
+    rotate_cap_bytes = int(getattr(automation.guards, "jsonl_rotate_mb", 25.0) * 1024 * 1024)
+    status_root = config.db_path.parent
+    maintenance["jsonl_rotation"] = {
+        "snapshots": _rotate_jsonl_if_needed(
+            status_root / "chronicle-snapshots.jsonl", cap_bytes=rotate_cap_bytes
+        ),
+        "ledger": _rotate_jsonl_if_needed(
+            status_root / "ssot-ledger.jsonl", cap_bytes=rotate_cap_bytes
+        ),
+    }
+
+    # DB VACUUM: reclaim space after WAL checkpoint; best-effort.
+    try:
+        maintenance["vacuum"] = _vacuum_db(config)
+    except Exception as exc:
+        maintenance["vacuum"] = {"status": "error", "error": str(exc)}
+
     started_at = datetime.now(timezone.utc)
     stamp = started_at.strftime("%Y-%m-%dT%H-%M-%SZ")
     year_root = target_root / started_at.strftime("%Y")
@@ -1843,7 +1650,6 @@ def run_backup(
             "error": str(exc),
         }
 
-    source_db = config.db_path
     backup_path = year_root / stamp
     backup_path_staging: Path | None = None
     run_id: str | None = None
@@ -1888,7 +1694,6 @@ def run_backup(
                 artifact_target,
             )
             artifact_files = sum(1 for path in artifact_target.rglob("*") if path.is_file())
-            db_sha256 = hashlib.sha256(backup_db.read_bytes()).hexdigest()
             latest_snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
 
             manifest_payload = {
@@ -1897,7 +1702,6 @@ def run_backup(
                 "source_db": str(source_db),
                 "backup_db": str(backup_path / "chronicle.db"),
                 "backup_path": str(backup_path),
-                "db_sha256": db_sha256,
                 "artifact_files": artifact_files,
                 "artifact_files_copied": artifact_files_copied,
                 "artifact_bytes_copied": artifact_bytes_copied,
@@ -1908,7 +1712,6 @@ def run_backup(
             }
             backup_path_staging.rename(backup_path)
             manifest_path = backup_path / "backup-manifest.json"
-            manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except (OSError, sqlite3.Error) as exc:
         if run_id is not None:
             finish_backup_run(
@@ -1935,7 +1738,6 @@ def run_backup(
         latest_snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
 
     backup_db = backup_path / "chronicle.db"
-    db_sha256 = hashlib.sha256(backup_db.read_bytes()).hexdigest()
     finished_at_utc = utc_now()
     _upsert_backup_run_in_db(
         backup_db,
@@ -1946,7 +1748,7 @@ def run_backup(
         status="ok",
         backup_path=str(backup_path),
         manifest_path=str(manifest_path),
-        db_sha256=db_sha256,
+        db_sha256="",
         artifact_files=artifact_files,
         artifact_bytes=artifact_bytes_copied,
         restore_ok=None,
@@ -1954,23 +1756,18 @@ def run_backup(
         restore_details=None,
         error_text=None,
     )
-    _upsert_backup_manifest_in_db(
-        backup_db,
-        run_id=run_id,
-        manifest_path=manifest_path,
-        observed_at_utc=finished_at_utc,
-    )
-    restore_result = _restore_check(backup_db, backup_path=backup_path)
+    restore_result = _restore_check(backup_db, backup_path=backup_path, require_manifest=False)
+    restore_finished_at_utc = utc_now()
     _upsert_backup_run_in_db(
         backup_db,
         run_id=run_id,
-        started_at_utc=started_at_utc or finished_at_utc,
-        finished_at_utc=finished_at_utc,
+        started_at_utc=started_at_utc or restore_finished_at_utc,
+        finished_at_utc=restore_finished_at_utc,
         target_root=str(target_root),
         status="ok" if restore_result["ok"] else "failed",
         backup_path=str(backup_path),
         manifest_path=str(manifest_path),
-        db_sha256=db_sha256,
+        db_sha256="",
         artifact_files=artifact_files,
         artifact_bytes=artifact_bytes_copied,
         restore_ok=restore_result["ok"],
@@ -1978,6 +1775,21 @@ def run_backup(
         restore_details=restore_result,
         error_text=None if restore_result["ok"] else "restore_check_failed",
     )
+
+    # Register the manifest inside the backup copy BEFORE the checkpoint below,
+    # so the rows land in the main database file and are covered by the hash the
+    # manifest will advertise. The weekly restore drill asserts both rows exist.
+    try:
+        _upsert_backup_manifest_in_db(
+            backup_db,
+            run_id=run_id,
+            manifest_path=manifest_path,
+            observed_at_utc=utc_now(),
+            payload=json.dumps(manifest_payload, ensure_ascii=False, indent=2, sort_keys=True),
+        )
+        maintenance["backup_manifest_registration"] = {"status": "ok"}
+    except (OSError, sqlite3.Error) as exc:
+        maintenance["backup_manifest_registration"] = {"status": "error", "error": str(exc)}
 
     # Checkpoint backup DB WAL so all metadata is flushed into the main file.
     # Without this, copying only chronicle.db would lose backup_run/manifest data.
@@ -1990,6 +1802,7 @@ def run_backup(
     # Recompute SHA after checkpoint to reflect the complete backup state.
     db_sha256 = hashlib.sha256(backup_db.read_bytes()).hexdigest()
 
+    source_finished_at_utc = utc_now()
     finish_backup_run(
         config,
         run_id=run_id,
@@ -2009,13 +1822,53 @@ def run_backup(
         "skip_reason": "backup_failed",
         "reason": "post_backup",
     }
+    manifest_payload.update(
+        {
+            "finalized_at_utc": source_finished_at_utc,
+            "status": "ok" if restore_result["ok"] else "failed",
+            "db_sha256": db_sha256,
+            "restore_check": restore_result,
+            "maintenance": maintenance,
+            "space_margin_bytes": _backup_space_margin_bytes(automation),
+        }
+    )
+    manifest_text = json.dumps(manifest_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    try:
+        _atomic_write_text(manifest_path, manifest_text)
+    except OSError as exc:
+        finish_backup_run(
+            config,
+            run_id=run_id,
+            status="failed",
+            backup_path=str(backup_path),
+            manifest_path=str(manifest_path),
+            db_sha256=db_sha256,
+            artifact_files=artifact_files,
+            artifact_bytes=artifact_bytes_copied,
+            restore_ok=restore_result["ok"],
+            snapshot_id=latest_snapshot.get("id") if latest_snapshot else None,
+            restore_details=restore_result,
+            error_text=f"manifest_write_failed: {exc}",
+        )
+        return {
+            "status": "failed",
+            "reason": "manifest_write_failed",
+            "run_id": run_id,
+            "backup_path": str(backup_path),
+            "manifest_path": str(manifest_path),
+            "restore_check": restore_result,
+            "target_root": str(target_root),
+            "backup_policy": "opportunistic_external",
+            "maintenance": maintenance,
+            "error": str(exc),
+        }
 
     artifact = _store_text_artifact(
         manifest,
         target_type="snapshot" if latest_snapshot else "event",
         target_id=latest_snapshot["id"] if latest_snapshot else run_id,
         artifact_type="backup-manifest",
-        content=json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n",
+        content=manifest_text,
         filename="backup-manifest.json",
         observed_at_utc=utc_now(),
         entity_type="system",
@@ -2056,7 +1909,6 @@ def _evaluate_audit(
     latest_projection = fetch_latest_projection_run(config)
     latest_backup = fetch_latest_backup_run(config, successful_only=True)
     backup_target_available = automation.backup_root.exists()
-    latest_canary = fetch_latest_automation_run(config, job_name="minimax-canary")
     pending_mem0 = count_mem0_outbox(config, status="pending")
     failed_mem0 = count_mem0_outbox(config, status="failed")
     freshness_audit = build_freshness_audit(manifest, domain_id="memory" if "memory" in manifest["domain_map"] else "global")
@@ -2087,16 +1939,6 @@ def _evaluate_audit(
             issues.append({"severity": "warn", "kind": "backup_stale", "detail": f"Latest backup is {backup_age} old."})
         if latest_backup.get("restore_ok") == 0:
             issues.append({"severity": "critical", "kind": "restore_failed", "detail": "Latest backup restore check failed."})
-
-    if not latest_canary:
-        issues.append({"severity": "warn", "kind": "minimax_canary_missing", "detail": "No MiniMax canary run recorded."})
-    else:
-        canary_age = datetime.now(timezone.utc) - datetime.fromisoformat(latest_canary["started_at_utc"].replace("Z", "+00:00"))
-        health_status = latest_canary.get("details", {}).get("health_status") or latest_canary.get("status")
-        if canary_age > timedelta(hours=automation.guards.minimax_canary_stale_hours):
-            issues.append({"severity": "warn", "kind": "minimax_canary_stale", "detail": f"Latest MiniMax canary is {canary_age} old."})
-        if health_status != "ok":
-            issues.append({"severity": "warn", "kind": "minimax_unhealthy", "detail": f"Latest MiniMax canary status is {health_status}."})
 
     if pending_mem0 or failed_mem0:
         issues.append(
@@ -2166,6 +2008,30 @@ def _evaluate_audit(
     }
     wal_checkpoint = _maybe_checkpoint_wal(config, reason="weekly_audit") if weekly else None
 
+    # Artifact-store size guard (warn only — no deletion).
+    artifact_store_warn_bytes = int(getattr(automation.guards, "artifact_store_warn_gb", 6.0) * 1024 ** 3)
+    artifact_dir = config.artifact_dir
+    artifact_store_bytes: int | None = None
+    if artifact_dir.exists():
+        try:
+            artifact_store_bytes = sum(
+                p.stat().st_size for p in artifact_dir.rglob("*") if p.is_file()
+            )
+        except OSError:
+            artifact_store_bytes = None
+    if artifact_store_bytes is not None and artifact_store_bytes > artifact_store_warn_bytes:
+        issues.append(
+            {
+                "severity": "warn",
+                "kind": "artifact_store_large",
+                "detail": (
+                    f"chronicle-artifacts/ is {artifact_store_bytes / 1024**3:.2f} GB, "
+                    f"exceeding the {getattr(automation.guards, 'artifact_store_warn_gb', 6.0):.1f} GB warning threshold. "
+                    "Manual review or opt-in pruning required."
+                ),
+            }
+        )
+
     report = {
         "generated_at_utc": utc_now(),
         "weekly": weekly,
@@ -2179,12 +2045,13 @@ def _evaluate_audit(
         "latest_backup": latest_backup.get("started_at_utc") if latest_backup else None,
         "backup_target_root": str(automation.backup_root),
         "backup_target_available": backup_target_available,
-        "latest_minimax_canary": latest_canary.get("started_at_utc") if latest_canary else None,
         "mem0_state_drift_count": mem0_state_drift["repaired_count"],
         "mem0_state_drift_sample": mem0_state_drift["repaired"][:10],
         "mem0_outbox_retention": retention_status,
         "wal_checkpoint": wal_checkpoint,
         "legacy_surface_findings": legacy_surface_findings,
+        "artifact_store_bytes": artifact_store_bytes,
+        "artifact_store_warn_gb": getattr(automation.guards, "artifact_store_warn_gb", 6.0),
     }
 
     if weekly and latest_backup and latest_backup.get("backup_path"):
@@ -2220,8 +2087,9 @@ def run_audit(
             config,
             curation_type=curation_type,
             run_key=run_key,
-            model_name=automation.minimax.model if weekly else None,
+            model_name=None,
             payload={"trigger_source": trigger_source, "forced": force, "base_run_key": base_run_key},
+            stale_ttl_hours=_stale_run_ttl_hours(automation),
         )
         if not created:
             existing = fetch_curation_run(config, curation_type=curation_type, run_key=run_key)
@@ -2229,89 +2097,141 @@ def run_audit(
     else:
         run_id = None
 
-    report, issues, latest_snapshot = _evaluate_audit(
-        manifest,
-        automation,
-        weekly=weekly,
-        trigger_source=trigger_source,
-        local_now=local_now,
-        run_key=run_key,
-        base_run_key=base_run_key,
-        forced=force,
-    )
+    failure_details: dict[str, Any] | None = None
+    try:
+        report, issues, latest_snapshot = _evaluate_audit(
+            manifest,
+            automation,
+            weekly=weekly,
+            trigger_source=trigger_source,
+            local_now=local_now,
+            run_key=run_key,
+            base_run_key=base_run_key,
+            forced=force,
+        )
 
-    if not persist:
+        if not persist:
+            return {
+                "status": "ok" if not issues else "issues",
+                "run_id": None,
+                "artifact_id": None,
+                "event_id": None,
+                "issue_count": len(issues),
+                "issues": issues,
+                "report": report,
+            }
+
+        artifact = _store_text_artifact(
+            manifest,
+            target_type="snapshot" if latest_snapshot else "event",
+            target_id=latest_snapshot["id"] if latest_snapshot else run_id,
+            artifact_type="audit-report",
+            content=json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            filename=f"{curation_type}-{run_key.replace(':', '-')}.json",
+            observed_at_utc=utc_now(),
+            entity_type="system",
+            entity_name="chronicle",
+        )
+
+        event_id = None
+        if issues:
+            counts = Counter(issue["severity"] for issue in issues)
+            event = record_event(
+                manifest,
+                {
+                    "agent": "chronicle",
+                    "domain": "memory",
+                    "category": "maintenance" if counts["critical"] == 0 else "anomaly",
+                    "project": "status",
+                    "text": f"Chronicle audit {base_run_key}{' (forced)' if force else ''}: {len(issues)} issues detected.",
+                    "why": json.dumps(counts, ensure_ascii=False),
+                    "source_files": [],
+                    "mem0_status": "off",
+                    "mem0_error": None,
+                    "mem0_raw": None,
+                },
+                append_compat=True,
+                source_kind="chronicle_audit",
+                imported_from=f"chronicle.audit:{trigger_source}",
+            )
+            event_id = event["id"]
+            link_artifact(
+                config,
+                artifact_id=artifact["id"],
+                target_type="event",
+                target_id=event_id,
+                link_role="documents",
+                metadata={"curation_type": curation_type},
+            )
+
+        finish_curation_run(
+            config,
+            run_id=run_id,
+            status="ok" if not issues else ("failed_soft" if all(issue["severity"] != "critical" for issue in issues) else "failed"),
+            payload=report,
+            artifact_id=artifact["id"],
+            event_id=event_id,
+            notes=f"{len(issues)} issues",
+        )
         return {
             "status": "ok" if not issues else "issues",
-            "run_id": None,
-            "artifact_id": None,
-            "event_id": None,
+            "run_id": run_id,
+            "artifact_id": artifact["id"],
+            "event_id": event_id,
             "issue_count": len(issues),
             "issues": issues,
             "report": report,
         }
+    except Exception as exc:
+        failure_details = _exception_details(exc)
+        return _curation_failure_payload(curation_type=curation_type, run_key=run_key, run_id=run_id or "", exc=exc)
+    finally:
+        if failure_details is not None and run_id is not None:
+            finish_curation_run(
+                config,
+                run_id=run_id,
+                status="failed",
+                payload=failure_details,
+                notes=failure_details["error"]["summary"],
+            )
 
-    artifact = _store_text_artifact(
-        manifest,
-        target_type="snapshot" if latest_snapshot else "event",
-        target_id=latest_snapshot["id"] if latest_snapshot else run_id,
-        artifact_type="audit-report",
-        content=json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        filename=f"{curation_type}-{run_key.replace(':', '-')}.json",
-        observed_at_utc=utc_now(),
-        entity_type="system",
-        entity_name="chronicle",
-    )
 
-    event_id = None
-    if issues:
-        counts = Counter(issue["severity"] for issue in issues)
-        event = record_event(
-            manifest,
-            {
-                "agent": "chronicle",
-                "domain": "memory",
-                "category": "maintenance" if counts["critical"] == 0 else "anomaly",
-                "project": "status",
-                "text": f"Chronicle audit {base_run_key}{' (forced)' if force else ''}: {len(issues)} issues detected.",
-                "why": json.dumps(counts, ensure_ascii=False),
-                "source_files": [],
-                "mem0_status": "off",
-                "mem0_error": None,
-                "mem0_raw": None,
-            },
-            append_compat=True,
-            source_kind="chronicle_audit",
-            imported_from=f"chronicle.audit:{trigger_source}",
-        )
-        event_id = event["id"]
-        link_artifact(
-            config,
-            artifact_id=artifact["id"],
-            target_type="event",
-            target_id=event_id,
-            link_role="documents",
-            metadata={"curation_type": curation_type},
-        )
+def _run_with_automation_bookkeeping(
+    config,
+    *,
+    job_name: str,
+    run_key: str,
+    trigger_source: str,
+    ttl_hours: float,
+    body: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Claim the run lease, run *body*, and record failures.
 
-    finish_curation_run(
+    Every job branch below repeated this same start/skip-if-existing/
+    except/finally block verbatim, so a fix to failure bookkeeping had to be
+    applied five times. `body` receives the run_id and is responsible for its
+    own success-path finish_automation_run call (each job reports a different
+    status/details/event shape).
+    """
+    run_id, created = start_automation_run(
         config,
-        run_id=run_id,
-        status="ok" if not issues else ("failed_soft" if all(issue["severity"] != "critical" for issue in issues) else "failed"),
-        payload=report,
-        artifact_id=artifact["id"],
-        event_id=event_id,
-        notes=f"{len(issues)} issues",
+        job_name=job_name,
+        trigger_source=trigger_source,
+        run_key=run_key,
+        retry_failed=True,
+        stale_ttl_hours=ttl_hours,
     )
-    return {
-        "status": "ok" if not issues else "issues",
-        "run_id": run_id,
-        "artifact_id": artifact["id"],
-        "event_id": event_id,
-        "issue_count": len(issues),
-        "issues": issues,
-        "report": report,
-    }
+    if not created:
+        return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
+    failure_details: dict[str, Any] | None = None
+    try:
+        return body(run_id)
+    except Exception as exc:
+        failure_details = _exception_details(exc)
+        return _automation_failure_payload(job_name=job_name, run_key=run_key, run_id=run_id, exc=exc)
+    finally:
+        if failure_details is not None:
+            finish_automation_run(config, run_id=run_id, status="failed", details=failure_details)
 
 
 def run_automation_job(
@@ -2323,18 +2243,21 @@ def run_automation_job(
 ) -> dict[str, Any]:
     config = config_from_manifest(manifest)
     local_now = _local_now(config)
-    if job_name == "daily-capture":
-        run_key = local_now.strftime("%Y-%m-%d")
-        run_id, created = start_automation_run(
+    ttl_hours = _stale_run_ttl_hours(automation)
+    daily_key = local_now.strftime("%Y-%m-%d")
+
+    def _dispatch(run_key: str, body: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
+        return _run_with_automation_bookkeeping(
             config,
             job_name=job_name,
-            trigger_source=trigger_source,
             run_key=run_key,
-            retry_failed=True,
+            trigger_source=trigger_source,
+            ttl_hours=ttl_hours,
+            body=body,
         )
-        if not created:
-            return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
-        try:
+
+    if job_name == "daily-capture":
+        def _daily_capture(run_id: str) -> dict[str, Any]:
             snapshot = capture_runtime_snapshot(
                 manifest,
                 domain_id="global",
@@ -2358,43 +2281,25 @@ def run_automation_job(
                 snapshot_id=snapshot["id"],
             )
             return {"status": "ok", "run_id": run_id, "snapshot_id": snapshot["id"], "sync": sync}
-        except Exception as exc:
-            finish_automation_run(config, run_id=run_id, status="failed", details={"error": str(exc)})
-            raise
+
+        return _dispatch(daily_key, _daily_capture)
 
     if job_name == "daybook":
-        run_key = local_now.strftime("%Y-%m-%d")
-        run_id, created = start_automation_run(
-            config,
-            job_name=job_name,
-            trigger_source=trigger_source,
-            run_key=run_key,
-            retry_failed=True,
-        )
-        if not created:
-            return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
-        result = run_daybook(manifest, automation, trigger_source=trigger_source)
-        finish_automation_run(
-            config,
-            run_id=run_id,
-            status=result["status"] if result["status"] != "existing" else "ok",
-            details=result,
-            event_id=result.get("event_id"),
-        )
-        return result | {"run_id": run_id}
+        def _daybook(run_id: str) -> dict[str, Any]:
+            result = run_daybook(manifest, automation, trigger_source=trigger_source)
+            finish_automation_run(
+                config,
+                run_id=run_id,
+                status=result["status"] if result["status"] != "existing" else "ok",
+                details=result,
+                event_id=result.get("event_id"),
+            )
+            return result | {"run_id": run_id}
+
+        return _dispatch(daily_key, _daybook)
 
     if job_name == "mem0-dump":
-        run_key = local_now.strftime("%Y-%m-%d")
-        run_id, created = start_automation_run(
-            config,
-            job_name=job_name,
-            trigger_source=trigger_source,
-            run_key=run_key,
-            retry_failed=True,
-        )
-        if not created:
-            return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
-        try:
+        def _mem0_dump(run_id: str) -> dict[str, Any]:
             result = _run_mem0_dump(
                 manifest,
                 automation,
@@ -2409,28 +2314,26 @@ def run_automation_job(
                 snapshot_id=result.get("snapshot_id"),
             )
             return result | {"run_id": run_id}
-        except Exception as exc:
-            finish_automation_run(config, run_id=run_id, status="failed", details={"error": str(exc)})
-            raise
 
-    if job_name == "company-intel":
-        run_key = local_now.strftime("%Y-%m-%d")
-        run_id, created = start_automation_run(
-            config,
-            job_name=job_name,
-            trigger_source=trigger_source,
-            run_key=run_key,
-            retry_failed=True,
-        )
-        if not created:
-            return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
-        try:
-            result = _run_company_intel_refresh(
-                manifest,
-                automation,
-                trigger_source=trigger_source,
-                automation_run_id=run_id,
+        return _dispatch(daily_key, _mem0_dump)
+
+    if job_name == "weekly-audit":
+        def _weekly_audit(run_id: str) -> dict[str, Any]:
+            result = run_audit(manifest, automation, weekly=True, trigger_source=trigger_source)
+            finish_automation_run(
+                config,
+                run_id=run_id,
+                status="ok" if result["status"] == "ok" else result["status"],
+                details=result,
+                event_id=result.get("event_id"),
             )
+            return result | {"run_id": run_id}
+
+        return _dispatch(local_now.strftime("%G-W%V"), _weekly_audit)
+
+    if job_name == "backup":
+        def _backup(run_id: str) -> dict[str, Any]:
+            result = run_backup(manifest, automation, trigger_source=trigger_source)
             finish_automation_run(
                 config,
                 run_id=run_id,
@@ -2439,80 +2342,8 @@ def run_automation_job(
                 snapshot_id=result.get("snapshot_id"),
             )
             return result | {"run_id": run_id}
-        except Exception as exc:
-            finish_automation_run(config, run_id=run_id, status="failed", details={"error": str(exc)})
-            raise
 
-    if job_name == "minimax-canary":
-        run_key = local_now.strftime("%Y-%m-%d")
-        previous = fetch_latest_automation_run(config, job_name=job_name)
-        previous_health = None if not previous else (previous.get("details", {}).get("health_status") or previous.get("status"))
-        run_id, created = start_automation_run(
-            config,
-            job_name=job_name,
-            trigger_source=trigger_source,
-            run_key=run_key,
-            retry_failed=True,
-        )
-        if not created:
-            return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
-        result = run_minimax_canary(
-            manifest,
-            automation,
-            trigger_source=trigger_source,
-            previous_health=previous_health,
-        )
-        finish_automation_run(
-            config,
-            run_id=run_id,
-            status=result["status"] if result["status"] != "existing" else "ok",
-            details=result.get("details") or result,
-            event_id=result.get("event_id"),
-            snapshot_id=result.get("snapshot_id"),
-        )
-        return result | {"run_id": run_id}
-
-    if job_name == "weekly-audit":
-        run_key = local_now.strftime("%G-W%V")
-        run_id, created = start_automation_run(
-            config,
-            job_name=job_name,
-            trigger_source=trigger_source,
-            run_key=run_key,
-            retry_failed=True,
-        )
-        if not created:
-            return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
-        result = run_audit(manifest, automation, weekly=True, trigger_source=trigger_source)
-        finish_automation_run(
-            config,
-            run_id=run_id,
-            status="ok" if result["status"] == "ok" else result["status"],
-            details=result,
-            event_id=result.get("event_id"),
-        )
-        return result | {"run_id": run_id}
-
-    if job_name == "backup":
-        run_key = local_now.strftime("%Y-%m-%d")
-        run_id, created = start_automation_run(
-            config,
-            job_name=job_name,
-            trigger_source=trigger_source,
-            run_key=run_key,
-            retry_failed=True,
-        )
-        if not created:
-            return {"status": "existing", "run": fetch_automation_run(config, job_name=job_name, run_key=run_key)}
-        result = run_backup(manifest, automation, trigger_source=trigger_source)
-        finish_automation_run(
-            config,
-            run_id=run_id,
-            status=result["status"],
-            details=result,
-            snapshot_id=result.get("snapshot_id"),
-        )
-        return result | {"run_id": run_id}
+        return _dispatch(daily_key, _backup)
 
     raise ValueError(f"Unknown automation job: {job_name}")
 
@@ -2566,10 +2397,7 @@ def _launchd_wrapper(manifest: dict[str, Any], automation: AutomationConfig, job
 
 def _write_executable_script(path: Path, content: str) -> None:
     """Atomically write an executable shell script."""
-    temp_path = path.with_name(f".{path.name}.tmp")
-    temp_path.write_text(content, encoding="utf-8")
-    temp_path.chmod(0o755)
-    temp_path.replace(path)
+    _atomic_write_text(path, content, mode=0o755)
 
 
 def _launchd_job_health(
@@ -2617,13 +2445,14 @@ def install_launchd(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     installed: list[dict[str, Any]] = []
-    for key, label in LAUNCHD_LABELS.items():
+    for key, label in launchd_labels(automation).items():
         wrapper_path = runtime_dir / f"{key}.sh"
         _write_executable_script(wrapper_path, _launchd_wrapper(manifest, automation, key.replace("_", "-")))
 
         schedule = automation.jobs[key]
         plist_path = agent_dir / f"{label}.plist"
-        plist_path.write_bytes(
+        _atomic_write_bytes(
+            plist_path,
             _launchd_plist(
                 label=label,
                 wrapper_path=wrapper_path,
@@ -2641,9 +2470,28 @@ def install_launchd(
 
         if load_jobs:
             uid = str(os.getuid())
-            subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist_path)], check=False, capture_output=True, text=True)
-            subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)], check=True, capture_output=True, text=True)
-            subprocess.run(["launchctl", "enable", f"gui/{uid}/{label}"], check=False, capture_output=True, text=True)
+            timeout_seconds = _subprocess_timeout_seconds(automation)
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            subprocess.run(
+                ["launchctl", "enable", f"gui/{uid}/{label}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
 
     return {
         "status": "ok",
@@ -2653,6 +2501,25 @@ def install_launchd(
         "installed": installed,
         "loaded": load_jobs,
     }
+
+
+def _probe_command(args: list[str], *, timeout_seconds: float):
+    """Run a macOS-only inspection command, tolerating its absence.
+
+    `check=False` suppresses a non-zero exit but not a missing executable, so
+    on any non-macOS host `plutil`/`launchctl` raised FileNotFoundError and took
+    the whole doctor run down. Returns None when the tool is unavailable.
+    """
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return None
 
 
 def doctor_launchd(
@@ -2667,13 +2534,22 @@ def doctor_launchd(
     agent_dir = (agent_dir or automation.launch_agent_dir).expanduser()
     runtime_dir = (runtime_dir or automation.launchd_runtime_dir).expanduser()
     uid = str(os.getuid())
+    timeout_seconds = _subprocess_timeout_seconds(automation)
     jobs: list[dict[str, Any]] = []
     issue_count = 0
-    for key, label in LAUNCHD_LABELS.items():
+    for key, label in launchd_labels(automation).items():
         plist_path = agent_dir / f"{label}.plist"
         wrapper_path = runtime_dir / f"{key}.sh"
-        lint = subprocess.run(["plutil", "-lint", str(plist_path)], capture_output=True, text=True, check=False) if plist_path.exists() else None
-        loaded_probe = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"], capture_output=True, text=True, check=False) if plist_path.exists() else None
+        lint = (
+            _probe_command(["plutil", "-lint", str(plist_path)], timeout_seconds=timeout_seconds)
+            if plist_path.exists()
+            else None
+        )
+        loaded_probe = (
+            _probe_command(["launchctl", "print", f"gui/{uid}/{label}"], timeout_seconds=timeout_seconds)
+            if plist_path.exists()
+            else None
+        )
         loaded = bool(loaded_probe and loaded_probe.returncode == 0)
         if loaded and scoped_paths and loaded_probe is not None:
             loaded_output = "\n".join(part for part in [loaded_probe.stdout, loaded_probe.stderr] if part)
@@ -2735,6 +2611,7 @@ def install_git_hooks(
             check=True,
             capture_output=True,
             text=True,
+            timeout=_subprocess_timeout_seconds(automation),
         )
         seen_roots.add(root_key)
         updated.append({"repo": slug, "hooks_path": str(hook_path), "git_root": root_key, "status": "configured"})

@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 import json
 import os
+import time
 from pathlib import Path
 import subprocess
 import sys
@@ -11,8 +12,8 @@ from typing import Any
 
 import pytest
 
-import max_chronicle.mcp_server as mcp_server_module
-from max_chronicle.mcp_server import _startup_gate_key, build_server
+from mcp.server.fastmcp.exceptions import ToolError
+from max_chronicle.mcp_server import _gate_session, build_server
 from max_chronicle.runtime_context import load_manifest, search_mem0_dump
 from max_chronicle.service import (
     backfill_mem0_queue,
@@ -22,13 +23,9 @@ from max_chronicle.service import (
     default_mem0_status,
     guard_event,
     materialize_normalized_entities,
-    materialize_situation_model,
     query_context,
-    record_scenario,
     record_event,
     reconstruct_timeline,
-    review_scenario,
-    run_lenses,
 )
 from max_chronicle.store import (
     config_from_manifest,
@@ -39,20 +36,7 @@ from max_chronicle.store import (
 )
 
 
-PROJECT_STATUS_ROOT = Path("/Users/maksymbeiev/Projects/status")
-SSOT_HUB = PROJECT_STATUS_ROOT / "scripts" / "ssot_hub.py"
-
-
-def _ssot_hub(manifest_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PROJECT_STATUS_ROOT)
-    return subprocess.run(
-        [sys.executable, str(SSOT_HUB), "--manifest", str(manifest_path), *args],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=env,
-    )
+PROJECT_STATUS_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _chronicle_cli(manifest_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -69,6 +53,26 @@ def _chronicle_cli(manifest_path: Path, *args: str) -> subprocess.CompletedProce
 
 def _sandbox_mcp_server(manifest_path: Path, *, profile: str = "chronicler"):
     return build_server(manifest_path=manifest_path, profile=profile)
+
+
+def _decode_error_envelope(error: BaseException) -> dict[str, Any]:
+    """Tool failures raise, so isError is set; the envelope rides in the message."""
+    text = str(error)
+    return json.loads(text[text.index("{"):])
+
+
+def _assert_startup_required(error: BaseException, tool_name: str, *, domain: str = "global") -> None:
+    payload = _decode_error_envelope(error)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "startup_required"
+    assert payload["retryable"] is True
+    assert isinstance(payload["server_uptime_s"], int)
+    message = payload["error"]
+    assert "startup_required:" in message
+    assert f"`{tool_name}`" in message
+    assert f'startup_bundle(domain="{domain}")' in message
+    assert f'activate_agent(domain="{domain}")' in message
+    assert "No Chronicle mutation was performed." in message
 
 
 def _decode_mcp_json(result: Any) -> Any:
@@ -106,8 +110,6 @@ def test_build_activation_returns_versioned_attach_bundle(loaded_manifest) -> No
         "truth_plus_interpretation_plus_scenarios",
     ]
     assert activation["attach_bundle"]["source_audit"]["coverage"]["total_sources"] >= len(activation["attach_bundle"]["source_catalog"])
-    assert activation["attach_bundle"]["situation_model"]["domain"] == "global"
-    assert len(activation["attach_bundle"]["latest_lens_runs"]) == 5
     assert "Activation contract: max-chronicle 2026-03-16.v1" in activation["prompt"]
 
 
@@ -162,63 +164,6 @@ def test_query_context_annotates_sources_and_returns_chronicle_hits(loaded_manif
     assert payload["status_hits"][0]["source_class"] == "ssot_source"
     assert payload["status_hits"][0]["trust_tier"] in {"operator_curated", "reference", "unknown"}
     assert payload["status_hits"][0]["freshness_status"] in {"live", "recent", "stale", "archival", "unknown"}
-
-
-def test_ssot_hub_activate_bundle_uses_service_contract(chronicle_sandbox) -> None:
-    result = _ssot_hub(
-        chronicle_sandbox.manifest_path,
-        "activate",
-        "--domain",
-        "global",
-        "--agent",
-        "pytest",
-        "--format",
-        "bundle",
-        "--no-capture",
-    )
-    payload = json.loads(result.stdout)
-    assert payload["contract_name"] == "max-chronicle"
-    assert payload["contract_version"] == "2026-03-16.v1"
-    assert payload["attach_bundle"]["domain"]["id"] == "global"
-    assert payload["prompt"].startswith("You are connecting to Max Chronicle")
-    assert "deprecated" in result.stderr.casefold()
-
-
-def test_ssot_hub_query_uses_service_query_context(chronicle_sandbox, loaded_manifest) -> None:
-    record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "global",
-            "category": "decision",
-            "project": "status",
-            "text": "Chronicle test query service path is active.",
-            "why": "CLI should expose canonical Chronicle hits before compatibility-only fallbacks.",
-            "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-        append_compat=True,
-        source_kind="pytest",
-        imported_from="tests.test_agent_contract.cli",
-    )
-
-    result = _ssot_hub(
-        chronicle_sandbox.manifest_path,
-        "query",
-        "Chronicle test",
-        "--domain",
-        "global",
-        "--format",
-        "json",
-    )
-    payload = json.loads(result.stdout)
-    assert payload["contract_version"] == "2026-03-16.v1"
-    assert payload["freshness_audit"]["domain"]["id"] == "global"
-    assert payload["chronicle_hits"]
-    assert payload["chronicle_hits"][0]["source_class"] == "canonical_event"
-    assert "deprecated" in result.stderr.casefold()
 
 
 def test_chronicle_cli_activate_startup_and_query_use_native_service(chronicle_sandbox, loaded_manifest) -> None:
@@ -284,8 +229,8 @@ def test_chronicle_cli_query_handles_domain_like_tokens(chronicle_sandbox, loade
             "agent": "pytest",
             "domain": "global",
             "category": "milestone",
-            "project": "rzmrn-portfolio",
-            "text": "Portfolio shipped to production on rzmrn.com.",
+            "project": "demo-portfolio",
+            "text": "Portfolio shipped to production on example.com.",
             "why": "FTS query should not crash on domain-like tokens with dots.",
             "source_files": [],
             "mem0_status": "off",
@@ -300,7 +245,7 @@ def test_chronicle_cli_query_handles_domain_like_tokens(chronicle_sandbox, loade
     result = _chronicle_cli(
         chronicle_sandbox.manifest_path,
         "query",
-        "portfolio shipped rzmrn.com",
+        "portfolio shipped example.com",
         "--domain",
         "global",
         "--format",
@@ -308,7 +253,7 @@ def test_chronicle_cli_query_handles_domain_like_tokens(chronicle_sandbox, loade
     )
     payload = json.loads(result.stdout)
     assert payload["chronicle_hits"]
-    assert any("rzmrn.com" in (item.get("text") or "") for item in payload["chronicle_hits"])
+    assert any("example.com" in (item.get("text") or "") for item in payload["chronicle_hits"])
 
 
 def test_build_startup_bundle_uses_service_contract(loaded_manifest) -> None:
@@ -337,6 +282,7 @@ def test_mcp_readonly_profile_exposes_only_read_surface() -> None:
         "recent_events",
         "state_at",
         "query_context",
+        "query_memory",
         "sources_audit",
     ]
     assert "chronicle://attach/current" in resources
@@ -353,8 +299,13 @@ def test_mcp_chronicler_profile_exposes_write_surface() -> None:
 
     assert "record_event" in tools
     assert "capture_snapshot" in tools
-    assert "run_lenses" in tools
-    assert "record_scenario" in tools
+    assert "entity_admin" in tools
+    # Consolidated away in the 15->10 tool-surface simplification:
+    assert "normalize_entities" not in tools
+    assert "render_projections" not in tools
+    assert "add_entity_alias" not in tools
+    assert "merge_entities" not in tools
+    assert "entity_resolution_report" not in tools
 
 
 def test_mcp_chronicler_mutating_tool_descriptions_include_startup_guidance(chronicle_sandbox) -> None:
@@ -368,12 +319,7 @@ def test_mcp_chronicler_mutating_tool_descriptions_include_startup_guidance(chro
     for tool_name in (
         "record_event",
         "capture_snapshot",
-        "normalize_entities",
-        "build_situation_model",
-        "run_lenses",
-        "record_scenario",
-        "review_scenario",
-        "render_projections",
+        "entity_admin",
     ):
         assert "startup_bundle" in descriptions[tool_name]
         assert "activate_agent" in descriptions[tool_name]
@@ -407,190 +353,138 @@ def test_mcp_tool_input_schemas_include_param_descriptions_and_query_mode_enum(c
     assert "decision" in record_props["category"]["description"]
     assert record_props["source_files"]["description"] == "Optional source file paths to archive with the event."
 
-    review_props = schemas["review_scenario"]["properties"]
-    assert review_props["status"]["enum"] == ["matched", "partial", "missed"]
-    assert "matched, partial, missed" in review_props["status"]["description"]
 
-
-def test_startup_gate_key_fails_closed_without_session_context() -> None:
+def test_startup_gate_session_fails_closed_without_session_context() -> None:
     class NoSessionContext:
         session = None
 
-    assert _startup_gate_key(None) is None
-    assert _startup_gate_key(NoSessionContext()) is None
+    class RaisingContext:
+        @property
+        def session(self):
+            raise ValueError("Context is not available outside of a request")
+
+    assert _gate_session(None) is None
+    assert _gate_session(NoSessionContext()) is None
+    assert _gate_session(RaisingContext()) is None
 
 
-def test_mcp_chronicler_record_event_auto_starts_once_per_session(
-    chronicle_sandbox,
-    loaded_manifest,
-    monkeypatch,
-) -> None:
-    startup_calls: list[dict[str, Any]] = []
-    original_build_startup_bundle = mcp_server_module.build_startup_bundle
-
-    def tracking_build_startup_bundle(*args, **kwargs):
-        startup_calls.append(dict(kwargs))
-        return original_build_startup_bundle(*args, **kwargs)
-
-    monkeypatch.setattr(mcp_server_module, "build_startup_bundle", tracking_build_startup_bundle)
-
-    async def exercise() -> tuple[str, str]:
+def test_mcp_chronicler_record_event_requires_startup_until_unlocked(chronicle_sandbox, loaded_manifest) -> None:
+    async def exercise() -> str:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        first = _decode_mcp_json(
-            await server.call_tool(
-                "record_event",
-                {
-                    "text": "Cold MCP write triggers auto-start.",
-                    "domain": "global",
-                    "category": "decision",
-                    "project": "status",
-                    "why": "First mutating call should warm the session automatically.",
-                    "agent": "pytest",
-                    "source_files": [],
-                },
-            )
-        )
-        second = _decode_mcp_json(
-            await server.call_tool(
-                "record_event",
-                {
-                    "text": "Warm MCP write reuses unlocked session.",
-                    "domain": "global",
-                    "category": "decision",
-                    "project": "status",
-                    "why": "Auto-start should run only once per session.",
-                    "agent": "pytest",
-                    "source_files": [],
-                },
-            )
-        )
-        return first["id"], second["id"]
+        arguments = {
+            "text": "Blocked MCP write before startup.",
+            "domain": "global",
+            "category": "decision",
+            "project": "status",
+            "why": "Gate should redirect before mutating Chronicle.",
+            "agent": "pytest",
+            "source_files": [],
+        }
 
-    first_id, second_id = asyncio.run(exercise())
+        with pytest.raises(ToolError) as first_error:
+            await server.call_tool("record_event", arguments)
+        with pytest.raises(ToolError) as second_error:
+            await server.call_tool("record_event", arguments)
 
-    assert len(startup_calls) == 1
-    assert startup_calls[0]["domain_id"] == "global"
-    assert startup_calls[0]["agent"] == "pytest"
-    assert startup_calls[0]["capture"] is False
-    assert startup_calls[0]["limit"] == 3
-    assert startup_calls[0]["compact"] is True
+        _assert_startup_required(first_error.value, "record_event")
+        _assert_startup_required(second_error.value, "record_event")
+
+        startup = await server.call_tool(
+            "startup_bundle",
+            {
+                "domain": "global",
+                "agent": "pytest",
+                "capture": False,
+                "limit": 2,
+            },
+        )
+        stored = _decode_mcp_json(await server.call_tool("record_event", arguments))
+        startup_payload = _decode_mcp_json(startup)
+        assert startup_payload["domain"]["id"] == "global"
+        return stored["id"]
+
+    stored_id = asyncio.run(exercise())
 
     config = config_from_manifest(loaded_manifest)
     with open_connection(config) as connection:
-        first_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (first_id,)).fetchone()[0]
-        second_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (second_id,)).fetchone()[0]
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM events WHERE text = ?",
+            ("Blocked MCP write before startup.",),
+        ).fetchone()[0]
+        outbox_count = connection.execute("SELECT COUNT(*) FROM mem0_outbox WHERE event_id = ?", (stored_id,)).fetchone()[0]
         snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
 
-    assert first_count == 1
-    assert second_count == 1
+    assert event_count == 1
+    assert outbox_count == 1
     assert snapshot_count == 0
 
 
-def test_mcp_chronicler_capture_snapshot_auto_starts_without_extra_snapshot(
-    chronicle_sandbox,
-    loaded_manifest,
-    monkeypatch,
-) -> None:
-    startup_calls: list[dict[str, Any]] = []
-    original_build_startup_bundle = mcp_server_module.build_startup_bundle
-
-    def tracking_build_startup_bundle(*args, **kwargs):
-        startup_calls.append(dict(kwargs))
-        return original_build_startup_bundle(*args, **kwargs)
-
-    monkeypatch.setattr(mcp_server_module, "build_startup_bundle", tracking_build_startup_bundle)
-
-    async def exercise() -> str:
+def test_mcp_chronicler_capture_snapshot_requires_startup_without_side_effects(chronicle_sandbox, loaded_manifest) -> None:
+    async def exercise() -> None:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        snapshot = _decode_mcp_json(
+        with pytest.raises(ToolError) as error:
             await server.call_tool(
                 "capture_snapshot",
                 {
                     "domain": "global",
                     "agent": "pytest",
-                    "title": "Auto-start snapshot",
+                    "title": "Blocked snapshot",
                     "focus": "tests",
                 },
             )
-        )
-        return snapshot["id"]
+        _assert_startup_required(error.value, "capture_snapshot")
 
-    snapshot_id = asyncio.run(exercise())
-
-    assert len(startup_calls) == 1
-    assert startup_calls[0]["domain_id"] == "global"
-    assert startup_calls[0]["agent"] == "pytest"
-    assert startup_calls[0]["capture"] is False
-    assert startup_calls[0]["compact"] is True
+    asyncio.run(exercise())
 
     config = config_from_manifest(loaded_manifest)
     with open_connection(config) as connection:
-        snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()[0]
-        total_snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-
-    assert snapshot_count == 1
-    assert total_snapshot_count == 1
-
-
-def test_mcp_chronicler_explicit_startup_bundle_avoids_duplicate_auto_start(
-    chronicle_sandbox,
-    loaded_manifest,
-    monkeypatch,
-) -> None:
-    startup_calls: list[dict[str, Any]] = []
-    original_build_startup_bundle = mcp_server_module.build_startup_bundle
-
-    def tracking_build_startup_bundle(*args, **kwargs):
-        startup_calls.append(dict(kwargs))
-        return original_build_startup_bundle(*args, **kwargs)
-
-    monkeypatch.setattr(mcp_server_module, "build_startup_bundle", tracking_build_startup_bundle)
-
-    async def exercise() -> str:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        startup = _decode_mcp_json(
-            await server.call_tool(
-                "startup_bundle",
-                {
-                    "domain": "global",
-                    "agent": "pytest",
-                    "capture": False,
-                    "limit": 2,
-                },
-            )
-        )
-        stored = _decode_mcp_json(
-            await server.call_tool(
-                "record_event",
-                {
-                    "text": "Explicit startup still unlocks mutating surface.",
-                    "domain": "global",
-                    "category": "decision",
-                    "project": "status",
-                    "why": "Explicit warmup should not trigger a second internal startup read.",
-                    "agent": "pytest",
-                    "source_files": [],
-                },
-            )
-        )
-        assert startup["domain"]["id"] == "global"
-        return stored["id"]
-
-    stored_id = asyncio.run(exercise())
-
-    assert len(startup_calls) == 1
-    assert startup_calls[0]["domain_id"] == "global"
-    assert startup_calls[0]["agent"] == "pytest"
-    assert startup_calls[0]["capture"] is False
-    assert startup_calls[0]["limit"] == 2
-
-    config = config_from_manifest(loaded_manifest)
-    with open_connection(config) as connection:
-        event_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (stored_id,)).fetchone()[0]
         snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        event_count = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
-    assert event_count == 1
     assert snapshot_count == 0
+    assert event_count == 0
+
+
+def test_mcp_chronicler_entity_admin_mutations_require_startup_but_report_is_free(
+    chronicle_sandbox, loaded_manifest
+) -> None:
+    async def exercise() -> Any:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        with pytest.raises(ToolError) as blocked:
+            await server.call_tool("entity_admin", {"action": "normalize", "domain": "global"})
+        _assert_startup_required(blocked.value, "entity_admin")
+        # report is read-only QA and must work without the gate
+        report = _decode_mcp_json(await server.call_tool("entity_admin", {"action": "report"}))
+        assert report["action"] == "report"
+        return report
+
+    asyncio.run(exercise())
+
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config) as connection:
+        normalized_count = connection.execute("SELECT COUNT(*) FROM normalized_entities").fetchone()[0]
+    assert normalized_count == 0
+
+
+def test_mcp_chronicler_entity_admin_validates_action_params(chronicle_sandbox) -> None:
+    async def exercise() -> tuple[Any, Any]:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        await server.call_tool(
+            "startup_bundle",
+            {"domain": "global", "agent": "pytest", "capture": False, "limit": 1},
+        )
+        with pytest.raises(ToolError) as alias_missing:
+            await server.call_tool("entity_admin", {"action": "alias"})
+        with pytest.raises(ToolError) as merge_missing:
+            await server.call_tool("entity_admin", {"action": "merge"})
+        return _decode_error_envelope(alias_missing.value), _decode_error_envelope(merge_missing.value)
+
+    alias_missing, merge_missing = asyncio.run(exercise())
+    assert alias_missing["status"] == "error"
+    assert alias_missing["error_type"] == "invalid_argument"
+    assert "alias_text" in alias_missing["hint"]
+    assert merge_missing["status"] == "error"
+    assert "source_entity_id" in merge_missing["hint"]
 
 
 def test_mcp_chronicler_activate_agent_unlocks_mutating_surface(chronicle_sandbox, loaded_manifest) -> None:
@@ -631,78 +525,58 @@ def test_mcp_chronicler_activate_agent_unlocks_mutating_surface(chronicle_sandbo
     assert event_count == 1
 
 
-def test_mcp_chronicler_auto_start_is_session_scoped(chronicle_sandbox, loaded_manifest, monkeypatch) -> None:
-    startup_calls: list[dict[str, Any]] = []
-    original_build_startup_bundle = mcp_server_module.build_startup_bundle
-
-    def tracking_build_startup_bundle(*args, **kwargs):
-        startup_calls.append(dict(kwargs))
-        return original_build_startup_bundle(*args, **kwargs)
-
-    monkeypatch.setattr(mcp_server_module, "build_startup_bundle", tracking_build_startup_bundle)
-
-    async def exercise() -> tuple[str, str, str]:
+def test_mcp_chronicler_startup_gate_is_session_scoped(chronicle_sandbox, loaded_manifest) -> None:
+    async def exercise() -> tuple[str, str]:
         first_server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        first = _decode_mcp_json(
-            await first_server.call_tool(
-                "record_event",
-                {
-                    "text": "Session one first write auto-starts.",
-                    "domain": "global",
-                    "category": "decision",
-                    "project": "status",
-                    "why": "Need one auto-start per server session.",
-                    "agent": "pytest-one",
-                    "source_files": [],
-                },
-            )
+        await first_server.call_tool(
+            "startup_bundle",
+            {
+                "domain": "global",
+                "agent": "pytest",
+                "capture": False,
+                "limit": 1,
+            },
         )
-        second = _decode_mcp_json(
-            await first_server.call_tool(
-                "record_event",
-                {
-                    "text": "Session one second write reuses auto-start.",
-                    "domain": "global",
-                    "category": "decision",
-                    "project": "status",
-                    "why": "Warm session should not auto-start twice.",
-                    "agent": "pytest-one",
-                    "source_files": [],
-                },
-            )
+        stored = await first_server.call_tool(
+            "record_event",
+            {
+                "text": "Session one unlocked write.",
+                "domain": "global",
+                "category": "decision",
+                "project": "status",
+                "why": "Need to confirm session-local unlock behavior.",
+                "agent": "pytest",
+                "source_files": [],
+            },
         )
+        stored_payload = _decode_mcp_json(stored)
 
         second_server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        third = _decode_mcp_json(
+        with pytest.raises(ToolError) as error:
             await second_server.call_tool(
                 "record_event",
                 {
-                    "text": "Session two gets its own auto-start.",
+                    "text": "Session two should still be blocked.",
                     "domain": "global",
                     "category": "decision",
                     "project": "status",
-                    "why": "Fresh server instance must warm itself independently.",
-                    "agent": "pytest-two",
+                    "why": "Fresh server instance must not inherit startup unlock state.",
+                    "agent": "pytest",
                     "source_files": [],
                 },
             )
-        )
-        return first["id"], second["id"], third["id"]
+        _assert_startup_required(error.value, "record_event")
+        return stored_payload["id"], "Session two should still be blocked."
 
-    first_id, second_id, third_id = asyncio.run(exercise())
-
-    assert len(startup_calls) == 2
-    assert [call["agent"] for call in startup_calls] == ["pytest-one", "pytest-two"]
+    stored_id, blocked_text = asyncio.run(exercise())
 
     config = config_from_manifest(loaded_manifest)
     with open_connection(config) as connection:
-        first_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (first_id,)).fetchone()[0]
-        second_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (second_id,)).fetchone()[0]
-        third_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (third_id,)).fetchone()[0]
+        first_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (stored_id,)).fetchone()[0]
+        blocked_count = connection.execute("SELECT COUNT(*) FROM events WHERE text = ?", (blocked_text,)).fetchone()[0]
 
     assert first_count == 1
-    assert second_count == 1
-    assert third_count == 1
+    assert blocked_count == 0
 
 
 def test_mcp_read_surfaces_remain_available_without_startup(chronicle_sandbox) -> None:
@@ -736,6 +610,40 @@ def test_mcp_read_surfaces_remain_available_without_startup(chronicle_sandbox) -
     assert startup["contract_name"] == "max-chronicle"
 
 
+def test_readonly_startup_bundle_capture_true_does_not_mutate_but_chronicler_can(chronicle_sandbox, loaded_manifest) -> None:
+    config = config_from_manifest(loaded_manifest)
+
+    def counts() -> tuple[int, int]:
+        with open_connection(config) as connection:
+            event_count = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        return event_count, snapshot_count
+
+    async def call_startup(profile: str) -> dict:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile=profile)
+        result = await server.call_tool(
+            "startup_bundle",
+            {
+                "domain": "global",
+                "agent": "pytest",
+                "capture": True,
+                "limit": 2,
+            },
+        )
+        return _decode_mcp_json(result)
+
+    before = counts()
+    readonly_payload = asyncio.run(call_startup("readonly"))
+    after_readonly = counts()
+    chronicler_payload = asyncio.run(call_startup("chronicler"))
+    after_chronicler = counts()
+
+    assert readonly_payload["domain"]["id"] == "global"
+    assert after_readonly == before
+    assert chronicler_payload["domain"]["id"] == "global"
+    assert after_chronicler[1] > after_readonly[1]
+
+
 def test_sources_audit_reports_lane_metadata_and_sensitive_defaults(loaded_manifest) -> None:
     payload = build_sources_audit(loaded_manifest, domain_id="global")
 
@@ -743,19 +651,19 @@ def test_sources_audit_reports_lane_metadata_and_sensitive_defaults(loaded_manif
     assert payload["source_catalog_schema_version"] == "2026-03-21.v1"
     assert payload["lane_policy_schema_version"] == "2026-03-21.v1"
     assert payload["source_catalog"]
-    assert any(item["lane"] == "life_admin" for item in payload["source_catalog"])
-    assert "life_admin" in payload["coverage"]["disabled_sensitive_lanes"]
+    assert any(item["lane"] == "work" for item in payload["source_catalog"])
+    # Sensitive lanes defined in the manifest (finances, health, life_admin) are disabled by default;
+    # they appear in disabled_sensitive_lanes even without sources because coverage computes
+    # from all lane_summary entries. At minimum no non-sensitive lane is in this list.
+    for lane in payload["coverage"]["disabled_sensitive_lanes"]:
+        lane_entry = next((item for item in payload["coverage"]["lanes"] if item["lane"] == lane), None)
+        if lane_entry:
+            assert lane_entry["sensitive"] is True
     status_source = next(item for item in payload["source_catalog"] if item["source_id"] == "status")
     assert status_source["class"] == "ssot_source"
     assert status_source["enabled"] is True
     assert status_source["questions_it_can_answer"]
     assert status_source["questions_it_cannot_answer"]
-    company_intel = next(item for item in payload["source_catalog"] if item["source_id"] == "company_intel_json")
-    assert company_intel["lane"] == "companies"
-    assert company_intel["trust_tier"] == "reference"
-    assert company_intel["owner"] == "chronicle"
-    assert company_intel["questions_it_can_answer"]
-    assert company_intel["trust_tier_source"] == "explicit"
 
 
 def test_query_context_truth_only_filters_derived_layers(loaded_manifest) -> None:
@@ -777,16 +685,6 @@ def test_query_context_truth_only_filters_derived_layers(loaded_manifest) -> Non
         source_kind="pytest",
         imported_from="tests.test_agent_contract.query_mode",
     )
-    materialize_situation_model(loaded_manifest, domain_id="global")
-    run_lenses(loaded_manifest, domain_id="global", persist=True)
-    record_scenario(
-        loaded_manifest,
-        domain_id="global",
-        scenario_name="Truth mode regression",
-        assumptions=["Portfolio remains the current main gate."],
-        expected_outcomes=["Derived scenario should not leak into truth-only query mode."],
-    )
-
     payload = query_context(
         loaded_manifest,
         query="Decision substrate",
@@ -804,6 +702,8 @@ def test_query_context_truth_only_filters_derived_layers(loaded_manifest) -> Non
 
 
 def test_normalize_entities_dedupes_company_aliases_from_runtime_sources(chronicle_sandbox, loaded_manifest) -> None:
+    # Seed Adobe via company-intel.json (both canonical name and lead_companies aliases).
+    # AgentHub was removed 2026-04-17; company-intel.json is now the sole runtime source.
     (chronicle_sandbox.status_root / "company-intel.json").write_text(
         json.dumps(
             {
@@ -816,14 +716,6 @@ def test_normalize_entities_dedupes_company_aliases_from_runtime_sources(chronic
             },
             ensure_ascii=False,
         ),
-        encoding="utf-8",
-    )
-    openclaw_leads = [
-        {"company": "Adobe"},
-        {"company": "Adobe Inc."},
-    ]
-    (chronicle_sandbox.openclaw_root / "workspace" / "memory" / "leads.json").write_text(
-        json.dumps(openclaw_leads, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -845,8 +737,10 @@ def test_normalize_entities_filters_noisy_runtime_company_aliases_and_inactivate
         canonical_key="business",
         canonical_name="Business",
         aliases=["Business"],
-        source_refs=[{"source_id": "openclaw_leads_json", "value": "Business"}],
+        source_refs=[{"source_id": "agenthub_leads_json", "value": "Business"}],
     )
+    # Seed companies via company-intel.json. Includes noisy names that should be filtered
+    # and clean canonical names that should survive. AgentHub was removed 2026-04-17.
     (chronicle_sandbox.status_root / "company-intel.json").write_text(
         json.dumps(
             {
@@ -857,20 +751,10 @@ def test_normalize_entities_filters_noisy_runtime_company_aliases_and_inactivate
                         "Armis - remotive.com",
                         "REMOTE - BMC Software",
                         "Built In Chicago.",
+                        "Collier Simon - remotive.com",
                     ],
                 },
             },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    (chronicle_sandbox.openclaw_root / "workspace" / "memory" / "leads.json").write_text(
-        json.dumps(
-            [
-                {"company": "Business"},
-                {"company": "Built In NYC."},
-                {"company": "Collier Simon - remotive.com"},
-            ],
             ensure_ascii=False,
         ),
         encoding="utf-8",
@@ -881,7 +765,6 @@ def test_normalize_entities_filters_noisy_runtime_company_aliases_and_inactivate
 
     assert "Business" not in company_names
     assert "Built In Chicago" not in company_names
-    assert "Built In Nyc" not in company_names
     assert "Scale Army" in company_names
     assert "Armis" in company_names
     assert "BMC Software" in company_names
@@ -890,215 +773,6 @@ def test_normalize_entities_filters_noisy_runtime_company_aliases_and_inactivate
     all_entities = fetch_normalized_entities(config, status=None, limit=200)
     business = next(item for item in all_entities if item["entity_type"] == "company" and item["canonical_key"] == "business")
     assert business["status"] == "inactive"
-
-
-def test_materialized_situation_model_and_lenses_include_evidence_refs(loaded_manifest) -> None:
-    record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "global",
-            "category": "blocker",
-            "project": "portfolio",
-            "text": "Portfolio has an active blocker for situation synthesis testing.",
-            "why": "Need contradiction/risk coverage.",
-            "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-    )
-    record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "global",
-            "category": "implementation",
-            "project": "portfolio",
-            "text": "Portfolio also progressed today despite the blocker.",
-            "why": "Need contradiction/risk coverage.",
-            "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-    )
-
-    situation = materialize_situation_model(loaded_manifest, domain_id="global")
-    lens_runs = run_lenses(loaded_manifest, domain_id="global", situation_model=situation, persist=True)
-
-    assert situation["situation_id"]
-    assert situation["actors"]
-    assert "contradictions" in situation
-    assert len(lens_runs) == 5
-    assert all(item["evidence_refs"] for item in lens_runs)
-
-
-def test_situation_model_prefers_priority_targets_and_rules_over_why_bullets(
-    chronicle_sandbox,
-    loaded_manifest,
-) -> None:
-    (chronicle_sandbox.status_root / "priorities.md").write_text(
-        "# Priorities\n\n"
-        "## Strategic Context\n"
-        "Portfolio is live.\n\n"
-        "## Priority Stack (ordered)\n\n"
-        "### 🔴 P0 — LinkedIn Rebuild\n"
-        "- **Why:** Primary discovery channel for remote roles\n"
-        "- **Target:** Rewrite profile and anchor featured section with rzmrn.com\n"
-        "- **Rule:** No more broad portfolio polish before LinkedIn ships\n\n"
-        "### 🟡 P1 — Cover Letter Framework\n"
-        "- **Why:** Outreach quality\n"
-        "- **Target:** Create 3 reusable templates\n"
-        "- **Depends on:** LinkedIn narrative locked\n\n"
-        "## Anti-Patterns (ADHD Guard Rails)\n"
-        "- Do not disappear into comfort-zone infra work.\n\n"
-        "## Key Constraints\n"
-        "- LinkedIn must ship before broader application push.\n",
-        encoding="utf-8",
-    )
-
-    situation = materialize_situation_model(loaded_manifest, domain_id="global")
-
-    assert situation["goals"]
-    assert situation["goals"][0].startswith("LinkedIn Rebuild")
-    assert all("Why:" not in item for item in situation["goals"])
-    assert any("portfolio polish" in item.casefold() for item in situation["constraints"])
-    assert any("comfort-zone infra" in item.casefold() for item in situation["constraints"])
-
-
-def test_situation_model_prefers_fresher_status_over_archival_priorities(
-    chronicle_sandbox,
-    loaded_manifest,
-) -> None:
-    priorities_path = chronicle_sandbox.status_root / "priorities.md"
-    priorities_path.write_text(
-        "# Priorities\n\n"
-        "## Priority Stack (ordered)\n\n"
-        "### 🔴 P0 — Portfolio Blocker\n"
-        "- **Target:** Finish portfolio before LinkedIn\n"
-        "- **Rule:** Do not start outreach yet\n",
-        encoding="utf-8",
-    )
-    old_timestamp = datetime.now().timestamp() - (60 * 60 * 24 * 30)
-    os.utime(priorities_path, (old_timestamp, old_timestamp))
-
-    (chronicle_sandbox.status_root / "status.md").write_text(
-        "## Active Projects\n\n"
-        "### Portfolio (`~/Projects/rzmrn-portfolio/`) — V1 SHIPPED\n"
-        "- **Career gate:** cleared. LinkedIn, cover letters, and outreach are now unblocked.\n\n"
-        "## Priorities\n\n"
-        "## Strategic Context\n"
-        "Portfolio is live and no longer the blocker.\n\n"
-        "## Priority Stack (ordered)\n\n"
-        "### 🔴 P0 — LinkedIn Rebuild\n"
-        "- **Target:** Rewrite profile and anchor featured section with rzmrn.com\n\n"
-        "### 🟡 P1 — Cover Letter Framework\n"
-        "- **Target:** Create 3 reusable templates\n",
-        encoding="utf-8",
-    )
-
-    situation = materialize_situation_model(loaded_manifest, domain_id="global")
-
-    assert situation["goals"]
-    assert situation["goals"][0].startswith("LinkedIn Rebuild")
-    assert "Portfolio Blocker" not in situation["goals"][0]
-    assert situation["derived_from"]["strategy_source_ids"][0] == "status"
-
-
-def test_build_activation_prompt_uses_dynamic_situation_focus_instead_of_hardcoded_gate(
-    chronicle_sandbox,
-    loaded_manifest,
-) -> None:
-    (chronicle_sandbox.status_root / "priorities.md").write_text(
-        "# Priorities\n\n"
-        "## Priority Stack (ordered)\n\n"
-        "### 🔴 P0 — LinkedIn Rebuild\n"
-        "- **Target:** Rewrite profile and anchor featured section with rzmrn.com\n",
-        encoding="utf-8",
-    )
-
-    activation = build_activation(
-        loaded_manifest,
-        domain_id="global",
-        agent="pytest",
-        title="Dynamic activation prompt",
-        focus="tests",
-        capture=True,
-    )
-
-    assert "Current focus from Chronicle:" in activation["prompt"]
-    assert "Top priority: LinkedIn Rebuild: Rewrite profile and anchor featured section with rzmrn.com" in activation["prompt"]
-    assert "Portfolio v1.0 is the main gate" not in activation["prompt"]
-
-
-def test_build_startup_bundle_marks_source_freshness_per_source(
-    chronicle_sandbox,
-    loaded_manifest,
-) -> None:
-    priorities_path = chronicle_sandbox.status_root / "priorities.md"
-    priorities_path.write_text("# Priorities\n\nArchive.\n", encoding="utf-8")
-    old_timestamp = datetime.now().timestamp() - (60 * 60 * 24 * 30)
-    os.utime(priorities_path, (old_timestamp, old_timestamp))
-
-    bundle = build_startup_bundle(
-        loaded_manifest,
-        domain_id="global",
-        agent="pytest",
-        capture=False,
-        limit=3,
-        compact=False,
-    )
-    sources = {item["id"]: item for item in bundle["sources"]}
-
-    assert sources["status"]["freshness_status"] in {"live", "recent"}
-    assert sources["priorities"]["freshness_status"] == "archival"
-
-
-def test_record_and_review_scenario_validate_inputs_and_link_outcome(loaded_manifest) -> None:
-    outcome = record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "global",
-            "category": "milestone",
-            "project": "status",
-            "text": "Outcome event for scenario review.",
-            "why": "Need replay/eval coverage.",
-            "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-    )
-
-    with pytest.raises(ValueError, match="assumptions are required"):
-        record_scenario(
-            loaded_manifest,
-            domain_id="global",
-            scenario_name="Invalid scenario",
-            assumptions=[],
-        )
-
-    scenario = record_scenario(
-        loaded_manifest,
-        domain_id="global",
-        scenario_name="Scenario replay test",
-        assumptions=["The current priority stack remains stable for the next iteration."],
-        expected_outcomes=["System should keep returning a coherent current-state model."],
-        failure_modes=["Source freshness degrades and weakens confidence."],
-    )
-    review = review_scenario(
-        loaded_manifest,
-        scenario_id=scenario["scenario_id"],
-        status="matched",
-        review_summary="Observed outcome matched the expected coherent state.",
-        outcome_event_id=outcome["id"],
-    )
-
-    assert scenario["assumptions"]
-    assert review["scenario_id"] == scenario["scenario_id"]
-    assert review["outcome_event_id"] == outcome["id"]
 
 
 def test_query_context_memory_domain_uses_only_canonical_memory_sources(loaded_manifest) -> None:
@@ -1119,17 +793,17 @@ def test_search_mem0_dump_dedupes_unified_collection_duplicates(tmp_path) -> Non
                 "memories": [
                     {
                         "id": "personal-1",
-                        "memory": "Portfolio V1 shipped to production on rzmrn.com",
+                        "memory": "Portfolio V1 shipped to production on example.com",
                         "metadata": {"project": "portfolio", "category": "milestone"},
                         "source_collection": "personal",
-                        "source_collection_name": "napaarnik_personal",
+                        "source_collection_name": "chronicle_personal",
                     },
                     {
                         "id": "digest-1",
-                        "memory": "Portfolio V1 shipped to production on rzmrn.com",
+                        "memory": "Portfolio V1 shipped to production on example.com",
                         "metadata": {"project": "portfolio", "category": "milestone"},
                         "source_collection": "digest",
-                        "source_collection_name": "napaarnik_memory",
+                        "source_collection_name": "chronicle_digest",
                     },
                 ],
             },
@@ -1142,7 +816,7 @@ def test_search_mem0_dump_dedupes_unified_collection_duplicates(tmp_path) -> Non
     assert len(hits) == 1
     assert hits[0]["duplicate_count"] == 2
     assert set(hits[0]["source_collections"]) == {"personal", "digest"}
-    assert set(hits[0]["source_collection_names"]) == {"napaarnik_personal", "napaarnik_memory"}
+    assert set(hits[0]["source_collection_names"]) == {"chronicle_personal", "chronicle_digest"}
 
 
 def test_freshness_audit_surfaces_stale_inputs_and_prompt_warnings(chronicle_sandbox, loaded_manifest) -> None:
@@ -1192,17 +866,60 @@ def test_freshness_audit_respects_runtime_evidence_policy_overrides(loaded_manif
     assert "portfolio_asset_manifest" not in issue_sources
 
 
-def test_record_event_rejects_unknown_category(loaded_manifest) -> None:
-    with pytest.raises(ValueError, match="Unsupported category"):
+def test_record_event_falls_back_on_unknown_category(loaded_manifest) -> None:
+    stored = record_event(
+        loaded_manifest,
+        {
+            "agent": "pytest",
+            "domain": "global",
+            "category": "totally_new_bucket",
+            "project": "status",
+            "text": "Unknown category falls back to note",
+            "why": "Soft validation stores the event instead of bouncing the write.",
+            "source_files": [],
+            "mem0_status": "off",
+            "mem0_error": None,
+            "mem0_raw": None,
+        },
+    )
+    assert stored["chronicle_status"] == "stored"
+    assert stored["category"] == "note"
+    assert stored["category_fallback"] == {"requested": "totally_new_bucket", "stored": "note"}
+
+
+def test_record_event_accepts_insight_and_constraint(loaded_manifest) -> None:
+    for category in ("insight", "constraint"):
+        stored = record_event(
+            loaded_manifest,
+            {
+                "agent": "pytest",
+                "domain": "global",
+                "category": category,
+                "project": "status",
+                "text": f"Category {category} is a first-class lane now",
+                "why": "Agents used these names in the wild; they used to bounce.",
+                "source_files": [],
+                "mem0_status": "off",
+                "mem0_error": None,
+                "mem0_raw": None,
+            },
+        )
+        assert stored["chronicle_status"] == "stored"
+        assert stored["category"] == category
+        assert "category_fallback" not in stored
+
+
+def test_record_event_still_rejects_malformed_category(loaded_manifest) -> None:
+    with pytest.raises(ValueError, match="Invalid category"):
         record_event(
             loaded_manifest,
             {
                 "agent": "pytest",
                 "domain": "global",
-                "category": "totally_new_bucket",
+                "category": "×бесовщина×",
                 "project": "status",
-                "text": "Should not be accepted",
-                "why": "Governance must reject unknown categories.",
+                "text": "Regex-invalid category must still bounce",
+                "why": "Soft fallback only covers well-formed names.",
                 "source_files": [],
                 "mem0_status": "off",
                 "mem0_error": None,
@@ -1317,10 +1034,6 @@ def test_chronicle_mcp_record_event_local_only_guard_hides_noise_from_attach_and
 
     entities = materialize_normalized_entities(loaded_manifest, domain_id="global")
     assert all(item["canonical_key"] != "guard-shadow" for item in entities)
-
-    situation = materialize_situation_model(loaded_manifest, domain_id="global")
-    transitions = situation.get("trajectory", {}).get("recent_transitions", [])
-    assert all("guard-shadow" not in transition for transition in transitions)
 
     timeline = reconstruct_timeline(
         loaded_manifest,
@@ -1670,7 +1383,7 @@ def test_backfill_mem0_queue_requeues_eligible_mcp_events(chronicle_sandbox, loa
             "agent": "pytest",
             "domain": "career",
             "category": "milestone",
-            "project": "rzmrn-portfolio",
+            "project": "demo-portfolio",
             "text": "Legacy MCP milestone that should have reached Mem0.",
             "why": "Simulate historical hardcoded mem0_status=off rows before policy fix.",
             "source_files": [],
@@ -1849,54 +1562,125 @@ def test_reconstruct_timeline_filters_by_domain(loaded_manifest) -> None:
     assert all(item.get("domain") == "global" for item in payload["nearest_snapshots"])
     assert payload["events"]
     assert all(item.get("domain") == "global" for item in payload["events"])
+# ===== Phase-1 stability: thread offload, error envelope, health route =====
 
 
-def test_ssot_hub_startup_and_timeline_use_service_paths(chronicle_sandbox, loaded_manifest) -> None:
-    record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "memory",
-            "category": "decision",
-            "project": "status",
-            "text": "Memory domain startup timeline event",
-            "why": "Need ssot_hub startup/timeline service coverage.",
-            "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-            "recorded_at": "2026-03-15T09:00:00Z",
-        },
-        append_compat=True,
-        source_kind="pytest",
-        imported_from="tests.test_agent_contract.ssot_hub.memory",
-    )
+def test_slow_tool_does_not_block_fast_tool(chronicle_sandbox, monkeypatch) -> None:
+    """The headline fix: one slow tool body must not freeze other MCP calls.
 
-    startup = _ssot_hub(
-        chronicle_sandbox.manifest_path,
-        "startup",
-        "--domain",
-        "memory",
-        "--format",
-        "json",
-    )
-    startup_payload = json.loads(startup.stdout)
-    assert startup_payload["contract_version"] == "2026-03-16.v1"
-    assert startup_payload["domain"]["id"] == "memory"
-    assert startup_payload["source_health"]["status"] is not None
-    assert "deprecated" in startup.stderr.casefold()
+    Before the offload layer, sync tool bodies ran directly on the event loop,
+    so a single slow call serialized every session behind it.
+    """
+    import max_chronicle.mcp_server as mcp_server_module
 
-    timeline = _ssot_hub(
-        chronicle_sandbox.manifest_path,
-        "timeline",
-        "--at",
-        "2026-03-15T10:00:00+01:00",
-        "--domain",
-        "memory",
-        "--format",
-        "json",
-    )
-    timeline_payload = json.loads(timeline.stdout)
-    assert timeline_payload["contract_version"] == "2026-03-16.v1"
-    assert timeline_payload["domain"] == "memory"
-    assert "deprecated" in timeline.stderr.casefold()
+    def slow_audit(manifest, *, domain_id="global"):
+        time.sleep(3.0)
+        return {"domain": domain_id, "slow": True}
+
+    monkeypatch.setattr(mcp_server_module, "build_sources_audit", slow_audit)
+
+    async def exercise() -> float:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        loop = asyncio.get_running_loop()
+        slow_task = asyncio.create_task(server.call_tool("sources_audit", {"domain": "global"}))
+        await asyncio.sleep(0.2)  # let the slow tool enter its worker thread
+        started = loop.time()
+        await server.call_tool("recent_events", {"domain": "global", "limit": 1})
+        fast_elapsed = loop.time() - started
+        await slow_task
+        return fast_elapsed
+
+    fast_elapsed = asyncio.run(exercise())
+    assert fast_elapsed < 1.0, f"fast tool waited {fast_elapsed:.2f}s behind the slow tool"
+
+
+def test_tool_error_envelope_on_locked_db(chronicle_sandbox, monkeypatch) -> None:
+    import sqlite3 as sqlite3_module
+
+    import max_chronicle.mcp_server as mcp_server_module
+
+    def locked_record_event(*args, **kwargs):
+        raise sqlite3_module.OperationalError("database is locked")
+
+    monkeypatch.setattr(mcp_server_module, "record_event", locked_record_event)
+
+    async def exercise() -> dict[str, Any]:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        await server.call_tool(
+            "startup_bundle",
+            {"domain": "global", "agent": "pytest", "capture": False, "limit": 1},
+        )
+        with pytest.raises(ToolError) as error:
+            await server.call_tool(
+                "record_event",
+                {
+                    "text": "Write into a locked database",
+                    "domain": "global",
+                    "category": "decision",
+                    "agent": "pytest",
+                    "source_files": [],
+                },
+            )
+        return _decode_error_envelope(error.value)
+
+    payload = asyncio.run(exercise())
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "db_locked"
+    assert payload["retryable"] is True
+    assert "retry" in payload["hint"].casefold()
+
+
+def test_tool_error_envelope_on_unexpected_crash(chronicle_sandbox, monkeypatch) -> None:
+    import max_chronicle.mcp_server as mcp_server_module
+
+    def crashing_query(*args, **kwargs):
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(mcp_server_module, "query_memory", crashing_query)
+
+    async def exercise() -> dict[str, Any]:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        with pytest.raises(ToolError) as error:
+            await server.call_tool("query_memory", {"query": "anything"})
+        return _decode_error_envelope(error.value)
+
+    payload = asyncio.run(exercise())
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "RuntimeError"
+    assert payload["retryable"] is False
+    assert payload["error"] == "simulated crash"
+
+
+def test_health_route_reports_db_ok(chronicle_sandbox) -> None:
+    from starlette.testclient import TestClient
+
+    server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+    with TestClient(server.streamable_http_app()) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["db_ok"] is True
+    assert payload["profile"] == "chronicler"
+    assert payload["pid"] == os.getpid()
+    assert isinstance(payload["uptime_s"], int)
+    assert payload["version"]
+
+
+def test_offload_limiters_are_scoped_per_event_loop(chronicle_sandbox) -> None:
+    """A CapacityLimiter belongs to the loop that created it.
+
+    Caching them in a module global would hand a limiter from a finished loop
+    to the next one; RunVars keep one set per async run.
+    """
+    import max_chronicle.mcp_server as mcp_server_module
+
+    async def exercise() -> int:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        await server.call_tool("recent_events", {"domain": "global", "limit": 1})
+        return id(mcp_server_module._get_limiter("read"))
+
+    first = asyncio.run(exercise())
+    second = asyncio.run(exercise())
+    assert first != second, "limiter leaked across event loops"

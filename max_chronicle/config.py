@@ -18,6 +18,24 @@ ENV_CHRONICLE_MANIFEST = "CHRONICLE_MANIFEST"
 ENV_CHRONICLE_AUTOMATION = "CHRONICLE_AUTOMATION_CONFIG"
 ENV_CHRONICLE_DB = "CHRONICLE_DB"
 ENV_CHRONICLE_TIMEZONE = "CHRONICLE_TIMEZONE"
+
+# v8 feature flags — toggle Phase 1 surfaces without editing code.
+ENV_FEATURE_ENTITY_ALIASES = "CHRONICLE_ENABLE_ENTITY_ALIASES"
+ENV_FEATURE_EVENT_HASH_DEDUP = "CHRONICLE_ENABLE_EVENT_HASH_DEDUP"
+ENV_FEATURE_MEM0_LIVE_SEARCH = "CHRONICLE_ENABLE_MEM0_LIVE_SEARCH"
+ENV_MEM0_LIVE_TIMEOUT_S = "CHRONICLE_MEM0_LIVE_TIMEOUT_S"
+ENV_EVENT_DEDUP_WINDOW_HOURS = "CHRONICLE_EVENT_DEDUP_WINDOW_HOURS"
+
+# 15s: a cold `uv run` of the mem0 bridge can resolve/sync an environment and
+# blow far past 5s. Since the MCP tool bodies moved off the event loop, a slow
+# bridge call no longer blocks other sessions, so a generous budget is safe.
+DEFAULT_MEM0_LIVE_TIMEOUT_S = 15.0
+# Mem0 collection the outbox targets, and the operator label used in agent
+# prompts. Both are per-installation identity, so they live in the manifest
+# ([settings] mem0_collection / operator) instead of being baked into code.
+DEFAULT_MEM0_COLLECTION = "chronicle_personal"
+DEFAULT_OPERATOR_LABEL = "the operator"
+DEFAULT_EVENT_DEDUP_WINDOW_HOURS = 24
 DEFAULT_ARTIFACT_MAX_COPY_BYTES = 25 * 1024 * 1024
 DEFAULT_ARTIFACT_ALLOWED_EXTENSIONS = (
     "csv",
@@ -57,10 +75,50 @@ class ChronicleConfig:
     artifact_allowed_extensions: tuple[str, ...]
     artifact_pointer_only_enabled: bool
     artifact_follow_symlinks: bool
+    mem0_collection: str
+    operator_label: str
 
 
 def _expand(path: str | Path) -> Path:
     return Path(path).expanduser()
+
+
+def feature_enabled(env_name: str, *, default: bool = True) -> bool:
+    """Read a feature flag from the environment.
+
+    Anything in {"1","true","yes","on"} (case-insensitive) means on.
+    Anything in {"0","false","no","off"} means off. Unset or garbage
+    falls back to `default`.
+    """
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def env_float(env_name: str, *, default: float) -> float:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def env_int(env_name: str, *, default: int) -> int:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def resolve_status_root(
@@ -156,6 +214,8 @@ def default_config(
         artifact_allowed_extensions=DEFAULT_ARTIFACT_ALLOWED_EXTENSIONS,
         artifact_pointer_only_enabled=True,
         artifact_follow_symlinks=False,
+        mem0_collection=DEFAULT_MEM0_COLLECTION,
+        operator_label=DEFAULT_OPERATOR_LABEL,
     )
 
 

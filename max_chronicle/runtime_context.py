@@ -5,16 +5,14 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import threading
 import tomllib
 from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
 from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+from .db import utc_now  # re-exported: one timestamp format for the whole package
 
 
 def read_toml(path: Path) -> dict[str, Any]:
@@ -108,6 +106,36 @@ def load_manifest(path: Path) -> dict[str, Any]:
     raw["source_map"] = {source["id"]: source for source in raw.get("sources", [])}
     raw["domain_map"] = {domain["id"]: domain for domain in raw.get("domains", [])}
     return raw
+
+
+_manifest_cache: dict[Path, tuple[tuple[int, int], dict[str, Any]]] = {}
+_manifest_cache_lock = threading.Lock()
+
+
+def load_manifest_cached(path: Path) -> dict[str, Any]:
+    """load_manifest with an mtime+size guard.
+
+    The long-lived MCP daemon re-parsed SSOT_MANIFEST.toml on every tool call,
+    resource read and prompt render. Callers treat the result as read-only
+    except for the copy-then-assign idiom on top-level keys (see cli.py), so
+    each caller gets its own shallow copy while the parsed body is shared.
+    """
+    resolved = Path(path)
+    try:
+        stat = resolved.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return load_manifest(resolved)
+
+    with _manifest_cache_lock:
+        cached = _manifest_cache.get(resolved)
+        if cached is not None and cached[0] == stamp:
+            return dict(cached[1])
+
+    loaded = load_manifest(resolved)
+    with _manifest_cache_lock:
+        _manifest_cache[resolved] = (stamp, loaded)
+    return dict(loaded)
 
 
 def file_meta(path: Path) -> dict[str, Any]:
@@ -400,95 +428,6 @@ def summarize_asset_manifest(path: Path) -> dict[str, Any]:
     }
 
 
-def extract_digest_headlines(path: Path, limit: int = 4) -> list[str]:
-    text = read_text(path)
-    if not text:
-        return []
-
-    headlines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if re.match(r"^\*\*\d+\.", stripped):
-            headlines.append(stripped.strip("*"))
-        if len(headlines) >= limit:
-            break
-    return headlines
-
-
-def summarize_openclaw(manifest: dict[str, Any]) -> dict[str, Any]:
-    paths = manifest["paths"]
-    state = read_json(expand_path(paths["openclaw_state_json"])) or {}
-    morning_brief = read_json(expand_path(paths["openclaw_brief_json"])) or {}
-    leads = read_json(expand_path(paths["openclaw_leads_json"])) or []
-
-    status_counts = Counter()
-    if isinstance(leads, list):
-        status_counts = Counter(item.get("status", "unknown") for item in leads if isinstance(item, dict))
-
-    daily_dir = expand_path(paths["openclaw_memory_dir"])
-    daily_log = daily_dir / f"{now_local(manifest).date().isoformat()}.md"
-    daily_text = read_text(daily_log)
-    daily_lines: list[str] = []
-    for line in daily_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(("##", "###", "- ")):
-            daily_lines.append(stripped)
-        if len(daily_lines) >= 8:
-            break
-
-    top_leads = state.get("top_leads") or []
-    if not top_leads and isinstance(morning_brief, dict):
-        entries = morning_brief.get("entries") or []
-        for entry in entries:
-            if entry.get("group") in {"ready", "new"}:
-                top_leads.append(
-                    {
-                        "company": entry.get("company"),
-                        "role": entry.get("title"),
-                        "status": entry.get("status"),
-                    }
-                )
-            if len(top_leads) >= 5:
-                break
-
-    return {
-        "state_path": str(expand_path(paths["openclaw_state_json"])),
-        "brief_path": str(expand_path(paths["openclaw_brief_json"])),
-        "leads_path": str(expand_path(paths["openclaw_leads_json"])),
-        "daily_log_path": str(daily_log),
-        "last_scout": state.get("last_scout"),
-        "last_nightly": state.get("last_nightly"),
-        "last_backup": state.get("last_backup"),
-        "jobs_found_today": state.get("jobs_found_today"),
-        "applications_sent_today": state.get("applications_sent_today"),
-        "gpt_calls_today": state.get("gpt_calls_today"),
-        "gpt_limit_warning": state.get("gpt_limit_warning"),
-        "pipeline_counts": dict(status_counts),
-        "top_leads": top_leads[:5],
-        "daily_log_excerpt": daily_lines,
-        "morning_brief_generated_at": morning_brief.get("generated_at") if isinstance(morning_brief, dict) else None,
-        "lead_count": len(leads) if isinstance(leads, list) else 0,
-    }
-
-
-def summarize_digest(manifest: dict[str, Any]) -> dict[str, Any]:
-    paths = manifest["paths"]
-    status_path = expand_path(paths["digest_status_json"])
-    synthesis_path = expand_path(paths["digest_synthesis_md"])
-    previous_summary_path = expand_path(paths["digest_previous_summary"])
-
-    status = read_json(status_path) or {}
-    headlines = extract_digest_headlines(synthesis_path)
-    previous_summary = read_text(previous_summary_path)
-
-    return {
-        "status_path": str(status_path),
-        "synthesis_path": str(synthesis_path),
-        "previous_summary_path": str(previous_summary_path),
-        "status": status,
-        "world_headlines": headlines,
-        "previous_summary_excerpt": shorten(previous_summary, 1000),
-    }
 
 
 def source_freshness(manifest: dict[str, Any], source_ids: list[str]) -> list[dict[str, Any]]:
@@ -550,12 +489,14 @@ def build_runtime_snapshot(
     for query in domain.get("mem0_queries", []):
         mem0_hits[query] = search_mem0_dump(mem0_dump_path, query, 2)
 
+    # Repo paths are optional: retiring a project means deleting its entry from
+    # the manifest, and a snapshot must not hard-fail on a key that is simply
+    # gone (dropping render_repo/media_sorter_repo broke daily-capture with a
+    # bare KeyError until this became a lookup over whatever is declared).
     repos = [
-        git_repo_summary(expand_path(paths["workspace_root"])),
-        git_repo_summary(expand_path(paths["portfolio_repo"])),
-        git_repo_summary(expand_path(paths["remotion_repo"])),
-        git_repo_summary(expand_path(paths["fcp_sorter_repo"])),
-        git_repo_summary(expand_path(paths["intel_digest_repo"])),
+        git_repo_summary(expand_path(paths[key]))
+        for key in ("workspace_root", "portfolio_repo", "render_repo", "media_sorter_repo")
+        if paths.get(key)
     ]
 
     return {
@@ -563,6 +504,8 @@ def build_runtime_snapshot(
         "captured_at_utc": utc_now(),
         "captured_at_local": local_dt.isoformat(timespec="seconds"),
         "timezone": tz_name(manifest),
+        # Per-installation identity for agent-facing prompts; generic by default.
+        "operator": manifest.get("settings", {}).get("operator") or "the operator",
         "agent": agent,
         "domain": domain_id,
         "label": domain["label"],
@@ -574,29 +517,13 @@ def build_runtime_snapshot(
         "mem0_dump": mem0_meta(manifest),
         "mem0_snapshot_hits": mem0_hits,
         "portfolio_assets": summarize_asset_manifest(expand_path(paths["portfolio_asset_manifest"])),
-        "openclaw": summarize_openclaw(manifest),
-        "digest": summarize_digest(manifest),
         "repos": repos,
     }
 
 
-def render_activation_prompt(
-    snapshot: dict[str, Any],
-    *,
-    situation_model: dict[str, Any] | None = None,
-) -> str:
+def render_activation_prompt(snapshot: dict[str, Any]) -> str:
     portfolio = snapshot["portfolio_assets"]
-    openclaw = snapshot["openclaw"]
-    digest = snapshot["digest"]
     recent_ledger = snapshot["recent_ledger"][:5]
-    world_headlines = digest.get("world_headlines") or []
-
-    top_leads: list[str] = []
-    for lead in openclaw.get("top_leads", [])[:3]:
-        company = lead.get("company") or "Unknown"
-        role = lead.get("role") or lead.get("title") or "Unknown role"
-        status = lead.get("status") or "unknown"
-        top_leads.append(f"- {company}: {role} [{status}]")
 
     ledger_lines: list[str] = []
     for entry in recent_ledger:
@@ -606,10 +533,6 @@ def render_activation_prompt(
         text = entry.get("text") or ""
         ledger_lines.append(f"- {timestamp} | {category} | {project} | {text}")
 
-    world_lines = [f"- {headline}" for headline in world_headlines[:4]]
-    if not world_lines:
-        world_lines.append("- No digest world headlines captured in the latest local synthesis file.")
-
     missing_assets: list[str] = []
     for item in portfolio.get("missing_assets_sample", [])[:8]:
         asset_status = f" ({item['status']})" if item.get("status") else ""
@@ -617,26 +540,8 @@ def render_activation_prompt(
     if not missing_assets:
         missing_assets.append("- No missing asset sample captured.")
 
-    focus_lines: list[str] = []
-    if situation_model:
-        goals = situation_model.get("goals") or []
-        constraints = situation_model.get("constraints") or []
-        pressures = situation_model.get("pressures") or []
-        if goals:
-            focus_lines.append(f"- Top priority: {goals[0]}")
-            for item in goals[1:3]:
-                focus_lines.append(f"- Next: {item}")
-        if constraints:
-            focus_lines.append(f"- Constraint: {constraints[0]}")
-        if pressures:
-            detail = pressures[0].get("detail")
-            if detail:
-                focus_lines.append(f"- Pressure: {detail}")
-    if not focus_lines:
-        focus_lines.append("- No fresh situation model available; inspect startup_bundle before inferring priorities.")
-
     lines = [
-        "You are connecting to Max Chronicle, the durable operating memory for Maksym Beiev (RZMRN).",
+        f"You are connecting to Max Chronicle, the durable operating memory for {snapshot.get('operator') or 'the operator'}.",
         "",
         f"Activation contract: {ACTIVATION_CONTRACT_NAME} {ACTIVATION_CONTRACT_VERSION}",
         f"Current local time: {snapshot['captured_at_local']} ({snapshot['timezone']})",
@@ -649,7 +554,6 @@ def render_activation_prompt(
         "- Treat `Mem0` and `mem0-dump.json` as derived semantic recall layers, not as truth.",
         "- Treat `ssot-ledger.jsonl` and `chronicle-snapshots.jsonl` as compatibility logs; write through tools, not by hand.",
         "- Communicate in Russian. Write code and commits in English.",
-        "- Do not touch OpenClaw or Digest without explicit request.",
         "- Prefer incremental shipping over rebuilding systems.",
         "- Do not rewrite history; record a new event or snapshot when reality changes.",
         "",
@@ -660,29 +564,15 @@ def render_activation_prompt(
         "- Before context switches, handoff, or thread end, capture a timestamped snapshot.",
         "- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later.",
         "",
-        "Current focus from Chronicle:",
-        *focus_lines,
-        "- OpenClaw job search remains autonomous execution context.",
-        "- Digest remains context, not a task sink.",
+        "Current priorities:",
+        "- Portfolio v1.0 is the main gate. LinkedIn depends on it.",
+        "- Chronicle hardening → production is the active P2 track.",
         "",
         "Portfolio asset state:",
         f"- Projects tracked: {portfolio.get('projects_total', 'unknown')}",
         f"- Missing asset slots: {portfolio.get('missing_assets_total', 'unknown')}",
         f"- OG images still needed: {portfolio.get('og_images_needed', 'unknown')}",
         *missing_assets,
-        "",
-        "OpenClaw runtime:",
-        f"- last_scout={openclaw.get('last_scout')}",
-        f"- last_nightly={openclaw.get('last_nightly')}",
-        f"- jobs_found_today={openclaw.get('jobs_found_today')}",
-        f"- applications_sent_today={openclaw.get('applications_sent_today')}",
-        f"- gpt_calls_today={openclaw.get('gpt_calls_today')}",
-        f"- pipeline_counts={json.dumps(openclaw.get('pipeline_counts', {}), ensure_ascii=False)}",
-        "Top leads:",
-        *(top_leads or ["- No top leads captured."]),
-        "",
-        "World context from the latest local digest synthesis:",
-        *world_lines,
         "",
         "Recent durable events:",
         *(ledger_lines or ["- No durable events captured yet."]),

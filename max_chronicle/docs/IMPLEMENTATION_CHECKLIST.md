@@ -64,7 +64,7 @@ Status: closed for finished scope
 Status: closed for finished scope
 
 - [x] Create content-addressed artifact storage in `chronicle-artifacts/`
-- [x] Capture raw source evidence from OpenClaw, Digest, SSOT sources, and portfolio manifests
+- [x] Capture raw source evidence from the agent hub, Digest, SSOT sources, and portfolio manifests
 - [x] Hash and register archived artifacts in the database
 - [x] Link artifacts to events and snapshots
 

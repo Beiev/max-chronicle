@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import importlib.util
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,21 +12,21 @@ import sqlite3
 import subprocess
 import sys
 from typing import Any
+
+import pytest
 from zoneinfo import ZoneInfo
 
 import max_chronicle.native_automation as native_automation_module
 from max_chronicle.db import database_summary
 from max_chronicle.native_automation import (
     doctor_launchd,
+    launchd_labels,
     install_git_hooks,
     install_launchd,
     run_audit,
-    run_minimax_canary,
-    run_minimax_smoke,
     run_automation_job,
     run_backup,
     run_daybook,
-    run_digest_hook,
     run_git_commit_hook,
     sync_mem0_outbox,
 )
@@ -34,7 +35,7 @@ from max_chronicle.service import capture_runtime_snapshot, record_event
 from max_chronicle.store import config_from_manifest, open_connection
 
 
-PROJECT_STATUS_ROOT = Path("/Users/maksymbeiev/Projects/status")
+PROJECT_STATUS_ROOT = Path(__file__).resolve().parents[1]
 MEM0_BRIDGE = PROJECT_STATUS_ROOT / "scripts" / "mem0_bridge.py"
 
 
@@ -50,6 +51,22 @@ def _cli(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+# The Mem0 bridge is operator tooling that ships outside the package, so a
+# clean checkout (and CI) will not have it. Those tests skip instead of failing.
+# doctor_launchd inspects real launchd state through macOS-only tooling; the
+# code degrades gracefully elsewhere, but these assertions only mean something
+# on darwin.
+requires_darwin = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="launchd inspection is macOS-only",
+)
+
+requires_mem0_bridge = pytest.mark.skipif(
+    not MEM0_BRIDGE.exists(),
+    reason="scripts/mem0_bridge.py is operator tooling, not part of the package",
+)
+
+
 def _load_mem0_bridge_module():
     spec = importlib.util.spec_from_file_location("mem0_bridge_test_module", MEM0_BRIDGE)
     assert spec is not None and spec.loader is not None
@@ -58,14 +75,12 @@ def _load_mem0_bridge_module():
     return module
 
 
-def _local_date_from_hook(result: dict[str, object], timezone_name: str) -> str:
-    hook_event = result["hook_event"]
-    if not isinstance(hook_event, dict):
-        raise AssertionError("Expected hook_event payload in automation result")
-    triggered_at = hook_event.get("triggered_at_utc")
-    if not isinstance(triggered_at, str):
-        raise AssertionError("Expected hook_event.triggered_at_utc")
-    return datetime.fromisoformat(triggered_at.replace("Z", "+00:00")).astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
+def _local_date(timezone_name: str) -> str:
+    return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
+
+
+def _utc_stamp(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_migrate_is_idempotent(chronicle_sandbox) -> None:
@@ -89,25 +104,123 @@ def test_migrate_is_idempotent(chronicle_sandbox) -> None:
     )
     first_payload = json.loads(first.stdout)
     second_payload = json.loads(second.stdout)
-    assert len(first_payload["applied"]) == 7
+    assert len(first_payload["applied"]) == 9
     assert second_payload["applied"] == []
-    assert first_payload["summary"]["user_version"] == 7
-    assert second_payload["summary"]["user_version"] == 7
+    assert first_payload["summary"]["user_version"] == 9
+    assert second_payload["summary"]["user_version"] == 9
 
 
-def test_digest_hook_is_idempotent(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
-    first = run_digest_hook(loaded_manifest, loaded_automation, trigger_source="pytest")
-    second = run_digest_hook(loaded_manifest, loaded_automation, trigger_source="pytest")
-    assert first["status"] == "stored"
-    assert first["snapshot_id"] is not None
-    assert second["status"] == "existing"
-
+def test_repair_stale_runs_cli_reports_and_marks_both_run_tables(chronicle_sandbox, loaded_manifest) -> None:
     config = config_from_manifest(loaded_manifest)
+    now = datetime.now(timezone.utc)
+    stale_started = _utc_stamp(now - timedelta(hours=8))
+    fresh_started = _utc_stamp(now - timedelta(hours=1))
+
+    with open_connection(config) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO automation_runs(id, job_name, run_key, trigger_source, started_at_utc, status, details_json)
+            VALUES ('repair-auto-stale', 'backup', '2026-04-22', 'pytest', ?, 'running', ?)
+            """,
+            (stale_started, json.dumps({"before": "automation"})),
+        )
+        connection.execute(
+            """
+            INSERT INTO automation_runs(id, job_name, run_key, trigger_source, started_at_utc, status)
+            VALUES ('repair-auto-fresh', 'backup', 'fresh', 'pytest', ?, 'running')
+            """,
+            (fresh_started,),
+        )
+        connection.execute(
+            """
+            INSERT INTO curation_runs(id, curation_type, run_key, started_at_utc, status, payload_json)
+            VALUES ('repair-curation-stale', 'daybook', '2026-04-22', ?, 'running', ?)
+            """,
+            (stale_started, json.dumps({"before": "curation"})),
+        )
+        connection.execute(
+            """
+            INSERT INTO curation_runs(id, curation_type, run_key, started_at_utc, status)
+            VALUES ('repair-curation-fresh', 'daybook', 'fresh', ?, 'running')
+            """,
+            (fresh_started,),
+        )
+
+    dry_run = _cli(
+        "--db",
+        str(chronicle_sandbox.chronicle_db),
+        "--manifest",
+        str(chronicle_sandbox.manifest_path),
+        "--automation-config",
+        str(chronicle_sandbox.automation_path),
+        "repair-stale-runs",
+        "--dry-run",
+        "--ttl-hours",
+        "6",
+    )
+    dry_payload = json.loads(dry_run.stdout)
+
+    assert dry_payload["status"] == "dry_run"
+    assert dry_payload["stale_count"] == 2
+    assert dry_payload["updated_count"] == 0
+    assert dry_payload["automation_runs"]["stale_count"] == 1
+    assert dry_payload["curation_runs"]["stale_count"] == 1
+
     with open_connection(config) as connection:
-        hook_count = connection.execute("SELECT COUNT(*) FROM hook_events WHERE hook_type = 'digest-run'").fetchone()[0]
-        event_ref_count = connection.execute("SELECT COUNT(*) FROM event_external_refs WHERE ref_type = 'digest_run'").fetchone()[0]
-    assert hook_count == 1
-    assert event_ref_count == 1
+        dry_statuses = {
+            row["id"]: row["status"]
+            for row in connection.execute(
+                """
+                SELECT id, status FROM automation_runs
+                WHERE id IN ('repair-auto-stale', 'repair-auto-fresh')
+                UNION ALL
+                SELECT id, status FROM curation_runs
+                WHERE id IN ('repair-curation-stale', 'repair-curation-fresh')
+                """
+            ).fetchall()
+        }
+    assert set(dry_statuses.values()) == {"running"}
+
+    apply_run = _cli(
+        "--db",
+        str(chronicle_sandbox.chronicle_db),
+        "--manifest",
+        str(chronicle_sandbox.manifest_path),
+        "--automation-config",
+        str(chronicle_sandbox.automation_path),
+        "repair-stale-runs",
+        "--ttl-hours",
+        "6",
+    )
+    apply_payload = json.loads(apply_run.stdout)
+
+    assert apply_payload["status"] == "ok"
+    assert apply_payload["stale_count"] == 2
+    assert apply_payload["updated_count"] == 2
+
+    with open_connection(config) as connection:
+        stale_auto = connection.execute(
+            "SELECT status, details_json FROM automation_runs WHERE id = 'repair-auto-stale'"
+        ).fetchone()
+        fresh_auto = connection.execute(
+            "SELECT status FROM automation_runs WHERE id = 'repair-auto-fresh'"
+        ).fetchone()
+        stale_curation = connection.execute(
+            "SELECT status, payload_json, notes FROM curation_runs WHERE id = 'repair-curation-stale'"
+        ).fetchone()
+        fresh_curation = connection.execute(
+            "SELECT status FROM curation_runs WHERE id = 'repair-curation-fresh'"
+        ).fetchone()
+
+    assert stale_auto["status"] == "stale_failed"
+    assert fresh_auto["status"] == "running"
+    auto_details = json.loads(stale_auto["details_json"])
+    assert auto_details["stale_run_recovery"]["reason"] == "repaired stale running row"
+    assert stale_curation["status"] == "stale_failed"
+    assert stale_curation["notes"] == "repaired stale running row"
+    curation_payload = json.loads(stale_curation["payload_json"])
+    assert curation_payload["stale_run_recovery"]["reason"] == "repaired stale running row"
+    assert fresh_curation["status"] == "running"
 
 
 def test_git_commit_hook_dedupes_by_commit(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
@@ -127,7 +240,7 @@ def test_git_commit_hook_dedupes_by_commit(chronicle_sandbox, loaded_manifest, l
     first = run_git_commit_hook(
         loaded_manifest,
         loaded_automation,
-        repo_slug="rzmrn-portfolio",
+        repo_slug="demo-portfolio",
         commit_sha=commit_sha,
         repo_root=repo,
         trigger_source="pytest",
@@ -135,7 +248,7 @@ def test_git_commit_hook_dedupes_by_commit(chronicle_sandbox, loaded_manifest, l
     second = run_git_commit_hook(
         loaded_manifest,
         loaded_automation,
-        repo_slug="rzmrn-portfolio",
+        repo_slug="demo-portfolio",
         commit_sha=commit_sha,
         repo_root=repo,
         trigger_source="pytest",
@@ -151,44 +264,32 @@ def test_git_commit_hook_dedupes_by_commit(chronicle_sandbox, loaded_manifest, l
     assert relations >= 1
 
 
-def test_daybook_uses_deterministic_fallback(monkeypatch, chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
-    digest_result = run_digest_hook(loaded_manifest, loaded_automation, trigger_source="pytest")
-    local_date = _local_date_from_hook(digest_result, loaded_manifest["settings"]["timezone"])
-    monkeypatch.setattr("max_chronicle.native_automation._call_minimax", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
-    result = run_daybook(loaded_manifest, loaded_automation, target_date=local_date, trigger_source="pytest")
-    assert result["status"] == "failed_soft"
-    daybook_path = chronicle_sandbox.status_root / "daybooks" / local_date[:4] / f"{local_date}.md"
-    assert daybook_path.exists()
-    assert "## Key Events" in daybook_path.read_text(encoding="utf-8")
-
-
-def test_daybook_uses_mocked_minimax(monkeypatch, chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
-    digest_result = run_digest_hook(loaded_manifest, loaded_automation, trigger_source="pytest")
-    local_date = _local_date_from_hook(digest_result, loaded_manifest["settings"]["timezone"])
-    monkeypatch.setattr("max_chronicle.native_automation._call_minimax", lambda *args, **kwargs: "Narrative from MiniMax.")
+def test_daybook_is_deterministic_ok_by_default(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+    # The daybook always uses the deterministic skeleton — there is no LLM path any more
+    # (MiniMax was cut 2026-05-19). The run must succeed with status "ok".
+    # Seed at least one event so the daybook has a durable delta to render.
+    record_event(
+        loaded_manifest,
+        {
+            "agent": "pytest",
+            "domain": "global",
+            "category": "note",
+            "project": "status",
+            "text": "Daybook determinism seed event.",
+            "source_files": [],
+            "mem0_status": "off",
+            "mem0_error": None,
+            "mem0_raw": None,
+        },
+        append_compat=False,
+        source_kind="pytest",
+    )
+    local_date = _local_date(loaded_manifest["settings"]["timezone"])
     result = run_daybook(loaded_manifest, loaded_automation, target_date=local_date, trigger_source="pytest")
     assert result["status"] == "ok"
     daybook_path = chronicle_sandbox.status_root / "daybooks" / local_date[:4] / f"{local_date}.md"
-    assert "## Narrative" in daybook_path.read_text(encoding="utf-8")
-
-
-def test_minimax_smoke_uses_high_enough_token_budget(monkeypatch, loaded_automation) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_call(automation, *, system_prompt: str, user_content: str, max_tokens: int | None = None) -> str:
-        captured["model"] = automation.minimax.model
-        captured["system_prompt"] = system_prompt
-        captured["user_content"] = user_content
-        captured["max_tokens"] = max_tokens
-        return "OK"
-
-    monkeypatch.setattr("max_chronicle.native_automation._call_minimax", fake_call)
-    payload = run_minimax_smoke(loaded_automation)
-
-    assert payload["status"] == "ok"
-    assert payload["text"] == "OK"
-    assert captured["model"] == "MiniMax-M2.7"
-    assert captured["max_tokens"] == 256
+    assert daybook_path.exists()
+    assert "## Key Events" in daybook_path.read_text(encoding="utf-8")
 
 
 def test_capture_runtime_renders_projections(loaded_manifest) -> None:
@@ -215,6 +316,50 @@ def test_backup_skips_when_target_is_unmounted(chronicle_sandbox, loaded_manifes
     assert result["backup_policy"] == "opportunistic_external"
 
 
+def test_backup_skips_when_volume_root_is_not_mounted(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    automation = replace(loaded_automation, backup_root=Path("/Volumes/BackupDrive/Chronicle-Backups"))
+    checked: list[Path] = []
+
+    def fake_is_mount(path: Path) -> bool:
+        checked.append(path)
+        return False
+
+    monkeypatch.setattr(Path, "is_mount", fake_is_mount)
+
+    result = run_backup(loaded_manifest, automation, trigger_source="pytest", force=True)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "backup_target_not_mounted"
+    assert result["volume_root"] == "/Volumes/BackupDrive"
+    assert checked == [Path("/Volumes/BackupDrive")]
+
+
+def test_backup_skips_when_target_free_space_is_insufficient(
+    monkeypatch,
+    chronicle_sandbox,
+    loaded_manifest,
+    loaded_automation,
+) -> None:
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config):
+        pass
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+
+    class TinyStatvfs:
+        f_bavail = 1
+        f_frsize = 1
+
+    monkeypatch.setattr(native_automation_module.os, "statvfs", lambda path: TinyStatvfs())
+
+    result = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "insufficient_space"
+    assert result["available_bytes"] == 1
+    assert result["required_bytes"] > result["db_size_bytes"]
+    assert list(chronicle_sandbox.backup_root.iterdir()) == []
+
+
 def test_backup_copies_db_and_restores(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
     chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
     capture_runtime_snapshot(
@@ -232,34 +377,46 @@ def test_backup_copies_db_and_restores(chronicle_sandbox, loaded_manifest, loade
     assert result["restore_check"]["ok"] is True
     assert result["restore_check"]["quick_check"] == "ok"
     assert result["restore_check"]["backup_runs_running"] == 0
-    assert result["restore_check"]["backup_manifest_present"] is True
-    assert result["restore_check"]["backup_manifest_links"] == 1
+    assert result["restore_check"]["backup_manifest_required"] is False
     assert result["restore_check"]["artifact_tree_complete"] is True
     assert result["backup_policy"] == "opportunistic_external"
     assert result["maintenance"]["reason"] in {"nothing_to_prune", "pruned_retained_rows"}
     assert result["maintenance"]["wal_checkpoint"]["reason"] == "post_backup"
 
     backup_db = Path(result["backup_path"]) / "chronicle.db"
+    manifest_payload = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest_payload["restore_check"]["ok"] is True
+    assert manifest_payload["db_sha256"] == hashlib.sha256(backup_db.read_bytes()).hexdigest()
     with sqlite3.connect(backup_db) as connection:
         connection.row_factory = sqlite3.Row
         run_row = connection.execute(
             "SELECT status, manifest_path, restore_ok FROM backup_runs WHERE id = ?",
             (result["run_id"],),
         ).fetchone()
-        link_count = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM artifact_links
-            WHERE target_type = 'backup_run'
-              AND target_id = ?
-              AND link_role = 'generated'
-            """,
-            (result["run_id"],),
-        ).fetchone()[0]
     assert run_row["status"] == "ok"
     assert run_row["manifest_path"] == result["manifest_path"]
     assert run_row["restore_ok"] == 1
-    assert link_count == 1
+
+
+def test_backup_manifest_hash_matches_post_maintenance_db_hash(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    capture_runtime_snapshot(
+        loaded_manifest,
+        domain_id="global",
+        agent="pytest",
+        title="Backup manifest hash seed",
+        focus="tests",
+        append_compat=True,
+        render_generated=True,
+    )
+
+    result = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+
+    backup_db = Path(result["backup_path"]) / "chronicle.db"
+    manifest_payload = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert result["status"] == "ok"
+    assert manifest_payload["db_sha256"] == hashlib.sha256(backup_db.read_bytes()).hexdigest()
+    assert manifest_payload["restore_check"] == result["restore_check"]
 
 
 def test_backup_uses_hardlinks_for_artifacts(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
@@ -379,12 +536,12 @@ def test_mem0_dump_automation_refreshes_dump_and_archives_artifact(chronicle_san
         "        'total_memories': 2,\n"
         "        'collection_totals': {'personal': 1, 'digest': 1},\n"
         "        'collections': {\n"
-        "            'personal': {'collection_name': 'napaarnik_personal', 'total_memories': 1},\n"
-        "            'digest': {'collection_name': 'napaarnik_memory', 'total_memories': 1},\n"
+        "            'personal': {'collection_name': 'chronicle_personal', 'total_memories': 1},\n"
+        "            'digest': {'collection_name': 'chronicle_digest', 'total_memories': 1},\n"
         "        },\n"
         "        'memories': [\n"
-        "            {'id': 'personal-memory', 'memory': 'Chronicle sandbox memory', 'metadata': {'project': 'status'}, 'source_collection': 'personal', 'source_collection_name': 'napaarnik_personal'},\n"
-        "            {'id': 'digest-memory', 'memory': 'Digest sandbox memory', 'metadata': {'category': 'intel_digest'}, 'source_collection': 'digest', 'source_collection_name': 'napaarnik_memory'},\n"
+        "            {'id': 'personal-memory', 'memory': 'Chronicle sandbox memory', 'metadata': {'project': 'status'}, 'source_collection': 'personal', 'source_collection_name': 'chronicle_personal'},\n"
+        "            {'id': 'digest-memory', 'memory': 'Digest sandbox memory', 'metadata': {'category': 'news_digest'}, 'source_collection': 'digest', 'source_collection_name': 'chronicle_digest'},\n"
         "        ],\n"
         "    }\n"
         "    with open(output, 'w', encoding='utf-8') as handle:\n"
@@ -404,8 +561,8 @@ def test_mem0_dump_automation_refreshes_dump_and_archives_artifact(chronicle_san
     assert payload["snapshot_type"] == "unified"
     assert payload["total_memories"] == 2
     assert payload["collection_totals"] == {"personal": 1, "digest": 1}
-    assert payload["collections"]["personal"]["collection_name"] == "napaarnik_personal"
-    assert payload["collections"]["digest"]["collection_name"] == "napaarnik_memory"
+    assert payload["collections"]["personal"]["collection_name"] == "chronicle_personal"
+    assert payload["collections"]["digest"]["collection_name"] == "chronicle_digest"
     assert {item["source_collection"] for item in payload["memories"]} == {"personal", "digest"}
 
     config = config_from_manifest(loaded_manifest)
@@ -443,12 +600,12 @@ def test_mem0_dump_automation_retries_failed_run_same_day(chronicle_sandbox, loa
         "        'total_memories': 2,\n"
         "        'collection_totals': {'personal': 1, 'digest': 1},\n"
         "        'collections': {\n"
-        "            'personal': {'collection_name': 'napaarnik_personal', 'total_memories': 1},\n"
-        "            'digest': {'collection_name': 'napaarnik_memory', 'total_memories': 1},\n"
+        "            'personal': {'collection_name': 'chronicle_personal', 'total_memories': 1},\n"
+        "            'digest': {'collection_name': 'chronicle_digest', 'total_memories': 1},\n"
         "        },\n"
         "        'memories': [\n"
-        "            {'id': 'retry-personal', 'memory': 'Recovered personal', 'metadata': {'project': 'status'}, 'source_collection': 'personal', 'source_collection_name': 'napaarnik_personal'},\n"
-        "            {'id': 'retry-digest', 'memory': 'Recovered digest', 'metadata': {'category': 'intel_digest'}, 'source_collection': 'digest', 'source_collection_name': 'napaarnik_memory'},\n"
+        "            {'id': 'retry-personal', 'memory': 'Recovered personal', 'metadata': {'project': 'status'}, 'source_collection': 'personal', 'source_collection_name': 'chronicle_personal'},\n"
+        "            {'id': 'retry-digest', 'memory': 'Recovered digest', 'metadata': {'category': 'news_digest'}, 'source_collection': 'digest', 'source_collection_name': 'chronicle_digest'},\n"
         "        ],\n"
         "    }\n"
         "    with open(output, 'w', encoding='utf-8') as handle:\n"
@@ -481,50 +638,39 @@ def test_mem0_dump_automation_retries_failed_run_same_day(chronicle_sandbox, loa
     assert run_rows[0]["status"] == "ok"
 
 
-def test_company_intel_automation_refreshes_output_and_archives_artifact(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
-    script_path = chronicle_sandbox.status_root / "scripts" / "company_intel_bridge.py"
-    script_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path = chronicle_sandbox.status_root / "company-intel.json"
-    script_path.write_text(
+def test_mem0_dump_timeout_finishes_failed_soft(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+    bridge_path = chronicle_sandbox.status_root / "scripts" / "mem0_bridge.py"
+    bridge_path.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, os\n"
-        "from pathlib import Path\n"
-        "if not os.environ.get('GOOGLE_API_KEY'):\n"
-        "    raise SystemExit(3)\n"
-        f"output = Path({str(output_path)!r})\n"
-        "payload = {\n"
-        "    'last_updated': '2026-03-21T22:00:00',\n"
-        "    'days_covered': 14,\n"
-        "    'companies': {'adobe': {'name': 'Adobe', 'mentions': 2, 'latest': '2026-03-21', 'events': ['Adobe expands hiring (2026-03-21)']}},\n"
-        "    'industry_context': [{'date': '2026-03-21', 'domain': 'AI + JOBS', 'headline': 'Hiring signal', 'impact': 'Positive'}],\n"
-        "    'lead_companies': {'with_intel': ['Adobe'], 'without_intel': []},\n"
-        "}\n"
-        "output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\\n', encoding='utf-8')\n"
-        "print(json.dumps({'status': 'ok', 'output': str(output)}))\n",
+        "import sys, time\n"
+        "sys.stderr.write('started blocking dump\\n')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(5)\n",
         encoding="utf-8",
     )
+    automation = replace(
+        loaded_automation,
+        guards=replace(loaded_automation.guards, subprocess_timeout_seconds=0.05),
+    )
 
-    result = run_automation_job(loaded_manifest, loaded_automation, job_name="company-intel", trigger_source="pytest")
-    assert result["status"] == "ok"
-    assert result["artifact_id"] is not None
-    payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["companies"]["adobe"]["name"] == "Adobe"
-    assert result["company_count"] == 1
-    assert result["industry_event_count"] == 1
+    result = run_automation_job(loaded_manifest, automation, job_name="mem0-dump", trigger_source="pytest")
+
+    assert result["status"] == "failed_soft"
+    assert result["reason"] == "subprocess_timeout"
+    assert result["timeout_seconds"] == 0.05
+    assert "started blocking dump" in result["stderr"]
 
     config = config_from_manifest(loaded_manifest)
     with open_connection(config) as connection:
         run_row = connection.execute(
-            "SELECT status FROM automation_runs WHERE job_name = 'company-intel'"
+            "SELECT status, details_json FROM automation_runs WHERE job_name = 'mem0-dump'"
         ).fetchone()
-        artifact_row = connection.execute(
-            "SELECT artifact_type FROM artifacts WHERE id = ?",
-            (result["artifact_id"],),
-        ).fetchone()
-    assert run_row["status"] == "ok"
-    assert artifact_row["artifact_type"] == "company-intel"
+    details = json.loads(run_row["details_json"])
+    assert run_row["status"] == "failed_soft"
+    assert details["reason"] == "subprocess_timeout"
 
 
+@requires_mem0_bridge
 def test_mem0_bridge_dump_exports_unified_snapshot_with_provenance(tmp_path, monkeypatch) -> None:
     module = _load_mem0_bridge_module()
 
@@ -533,14 +679,14 @@ def test_mem0_bridge_dump_exports_unified_snapshot_with_provenance(tmp_path, mon
             self._memories = memories
 
         def get_all(self, user_id: str) -> dict[str, object]:
-            assert user_id == "rzmrn"
+            assert user_id == module.USER_ID
             return {"results": list(self._memories)}
 
     personal_memories = [
         {"id": "personal-1", "memory": "Personal memory", "metadata": {"project": "status"}},
     ]
     digest_memories = [
-        {"id": "digest-1", "memory": "Digest memory", "metadata": {"category": "intel_digest"}},
+        {"id": "digest-1", "memory": "Digest memory", "metadata": {"category": "news_digest"}},
     ]
 
     monkeypatch.setattr(module, "_get_client", lambda collection: FakeMem(personal_memories if collection == "personal" else digest_memories))
@@ -552,12 +698,16 @@ def test_mem0_bridge_dump_exports_unified_snapshot_with_provenance(tmp_path, mon
     assert payload["snapshot_type"] == "unified"
     assert payload["total_memories"] == 2
     assert payload["collection_totals"] == {"personal": 1, "digest": 1}
-    assert payload["collections"]["personal"]["collection_name"] == "napaarnik_personal"
-    assert payload["collections"]["digest"]["collection_name"] == "napaarnik_memory"
+    assert payload["collections"]["personal"]["collection_name"] == module.COLLECTION_PERSONAL
+    assert payload["collections"]["digest"]["collection_name"] == module.COLLECTION_DIGEST
     assert {item["source_collection"] for item in payload["memories"]} == {"personal", "digest"}
-    assert {item["source_collection_name"] for item in payload["memories"]} == {"napaarnik_personal", "napaarnik_memory"}
+    assert {item["source_collection_name"] for item in payload["memories"]} == {
+        module.COLLECTION_PERSONAL,
+        module.COLLECTION_DIGEST,
+    }
 
 
+@requires_mem0_bridge
 def test_mem0_bridge_search_dedupes_cross_collection_duplicates(monkeypatch, capsys) -> None:
     module = _load_mem0_bridge_module()
 
@@ -567,14 +717,14 @@ def test_mem0_bridge_search_dedupes_cross_collection_duplicates(monkeypatch, cap
 
         def search(self, query: str, user_id: str, limit: int, filters: dict[str, object] | None = None) -> dict[str, object]:
             assert query == "portfolio shipped"
-            assert user_id == "rzmrn"
+            assert user_id == module.USER_ID
             assert limit == 10
             assert filters is None
             return {"results": list(self._memories)}
 
     duplicate = {
         "id": "shared-id",
-        "memory": "Portfolio V1 shipped to production on rzmrn.com",
+        "memory": "Portfolio V1 shipped to production on example.com",
         "metadata": {"project": "portfolio", "category": "milestone"},
         "score": 0.91,
     }
@@ -591,6 +741,7 @@ def test_mem0_bridge_search_dedupes_cross_collection_duplicates(monkeypatch, cap
     assert "Deduped matches: 2" in output
 
 
+@requires_mem0_bridge
 def test_mem0_bridge_sync_batch_processes_multiple_items(tmp_path, monkeypatch, capsys) -> None:
     module = _load_mem0_bridge_module()
     calls: list[tuple[str, str, dict[str, object] | None]] = []
@@ -600,7 +751,7 @@ def test_mem0_bridge_sync_batch_processes_multiple_items(tmp_path, monkeypatch, 
             self.label = label
 
         def add(self, text: str, user_id: str, metadata: dict[str, object] | None = None) -> dict[str, object]:
-            assert user_id == "rzmrn"
+            assert user_id == module.USER_ID
             calls.append((self.label, text, metadata))
             return {"id": f"{self.label}-{len(calls)}"}
 
@@ -616,7 +767,7 @@ def test_mem0_bridge_sync_batch_processes_multiple_items(tmp_path, monkeypatch, 
             {
                 "items": [
                     {"event_id": "evt-1", "text": "Portfolio shipped", "category": "milestone", "project": "portfolio"},
-                    {"event_id": "evt-2", "text": "Digest event", "category": "intel_digest"},
+                    {"event_id": "evt-2", "text": "Digest event", "category": module.DIGEST_CATEGORY},
                 ]
             },
             ensure_ascii=False,
@@ -648,10 +799,8 @@ def test_add_to_live_mem0_retries_transient_provider_errors(monkeypatch, loaded_
         FakeResult(returncode=0, stdout='{"status":"ok"}'),
     ]
 
-    loaded_automation = replace(
-        loaded_automation,
-        minimax=replace(loaded_automation.minimax, max_retries=2, retry_base_delay=0.0),
-    )
+    monkeypatch.setattr(native_automation_module, "_MEM0_MAX_RETRIES", 2)
+    monkeypatch.setattr(native_automation_module, "_MEM0_RETRY_BASE_DELAY", 0.0)
     monkeypatch.setattr(native_automation_module, "_maybe_load_env", lambda automation: None)
     monkeypatch.setattr(native_automation_module, "_mem0_command", lambda manifest: ["./scripts/mem0"])
     monkeypatch.setattr(native_automation_module.time, "sleep", lambda seconds: None)
@@ -796,6 +945,7 @@ def test_audit_force_creates_fresh_run_same_day(loaded_manifest, loaded_automati
     assert run_count == 2
 
 
+@requires_darwin
 def test_launchd_install_and_doctor(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
     install = install_launchd(
         loaded_manifest,
@@ -805,7 +955,7 @@ def test_launchd_install_and_doctor(chronicle_sandbox, loaded_manifest, loaded_a
         log_dir=chronicle_sandbox.status_root / "logs" / "launchd",
         load_jobs=False,
     )
-    assert len(install["installed"]) == 7
+    assert len(install["installed"]) == 5
 
     doctor = doctor_launchd(
         loaded_manifest,
@@ -821,6 +971,7 @@ def test_launchd_install_and_doctor(chronicle_sandbox, loaded_manifest, loaded_a
     assert all(job["plist_lint_ok"] for job in doctor["jobs"])
 
 
+@requires_darwin
 def test_launchd_doctor_strict_flags_unloaded_jobs(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
     install_launchd(
         loaded_manifest,
@@ -843,6 +994,7 @@ def test_launchd_doctor_strict_flags_unloaded_jobs(chronicle_sandbox, loaded_man
     assert any("not_loaded" in job["issues"] for job in doctor["jobs"])
 
 
+@requires_darwin
 def test_launchd_doctor_flags_missing_wrapper_as_issue(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
     install_launchd(
         loaded_manifest,
@@ -861,7 +1013,8 @@ def test_launchd_doctor_flags_missing_wrapper_as_issue(chronicle_sandbox, loaded
         agent_dir=chronicle_sandbox.root / "LaunchAgents",
         runtime_dir=chronicle_sandbox.status_root / "runtime" / "launchd",
     )
-    mem0_job = next(job for job in doctor["jobs"] if job["label"] == "com.rzmrn.chronicle.mem0-dump")
+    expected_label = launchd_labels(loaded_automation)["mem0_dump"]
+    mem0_job = next(job for job in doctor["jobs"] if job["label"] == expected_label)
     assert doctor["status"] == "issues"
     assert doctor["issue_count"] >= 1
     assert mem0_job["status"] == "critical"
@@ -887,6 +1040,44 @@ def test_daily_capture_keeps_mem0_sync_non_blocking(chronicle_sandbox, loaded_ma
     assert result["snapshot_id"]
     assert result["sync"]["status"] == "ok"
     assert result["sync"]["synced"] >= 1
+
+
+def test_daily_capture_exception_finalizes_failed_automation_run(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    def raise_mid_run(*args: object, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("snapshot capture exploded")
+
+    monkeypatch.setattr(native_automation_module, "capture_runtime_snapshot", raise_mid_run)
+
+    result = run_automation_job(loaded_manifest, loaded_automation, job_name="daily-capture", trigger_source="pytest")
+
+    assert result["status"] == "failed"
+    assert result["error"]["type"] == "RuntimeError"
+    assert "snapshot capture exploded" in result["error"]["message"]
+
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            """
+            SELECT status, finished_at_utc, details_json
+            FROM automation_runs
+            WHERE job_name = 'daily-capture'
+            """
+        ).fetchall()
+        running_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM automation_runs
+            WHERE job_name = 'daily-capture' AND status = 'running'
+            """
+        ).fetchone()[0]
+
+    assert running_count == 0
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["finished_at_utc"] is not None
+    details = json.loads(rows[0]["details_json"])
+    assert details["error"]["type"] == "RuntimeError"
+    assert "snapshot capture exploded" in details["error"]["summary"]
 
 
 def test_sync_mem0_outbox_marks_entries_synced(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
@@ -986,40 +1177,8 @@ def test_sync_mem0_outbox_skips_guarded_local_only_entries(monkeypatch, chronicl
     assert outbox["last_error"] == "guarded_local_only"
 
 
-def test_minimax_canary_records_recovery(monkeypatch, chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
-    config = config_from_manifest(loaded_manifest)
-    monkeypatch.setattr("max_chronicle.native_automation.run_minimax_smoke", lambda automation: {
-        "status": "error",
-        "checked_at_utc": "2026-03-15T10:00:00Z",
-        "base_url": automation.minimax.base_url,
-        "model": automation.minimax.model,
-        "error": "network",
-    })
-    first = run_automation_job(loaded_manifest, loaded_automation, job_name="minimax-canary", trigger_source="pytest")
-    assert first["status"] == "failed_soft"
-
-    monkeypatch.setattr("max_chronicle.native_automation.run_minimax_smoke", lambda automation: {
-        "status": "ok",
-        "checked_at_utc": "2026-03-15T11:00:00Z",
-        "base_url": automation.minimax.base_url,
-        "model": automation.minimax.model,
-        "text": "OK",
-    })
-    second = run_minimax_canary(loaded_manifest, loaded_automation, trigger_source="pytest")
-    assert second["status"] == "ok"
-    assert second["event_id"] is not None
-
-    with open_connection(config) as connection:
-        row = connection.execute(
-            "SELECT text, category FROM events WHERE id = ?",
-            (second["event_id"],),
-        ).fetchone()
-    assert row["category"] == "maintenance"
-    assert "recovered" in row["text"].casefold()
-
-
 def test_install_git_hooks_updates_repo_config(chronicle_sandbox, loaded_automation) -> None:
-    result = install_git_hooks(loaded_automation, repos=["rzmrn-portfolio"])
+    result = install_git_hooks(loaded_automation, repos=["demo-portfolio"])
     assert result["status"] == "ok"
     hooks_path = subprocess.run(
         ["git", "-C", str(chronicle_sandbox.portfolio_repo), "config", "--get", "core.hooksPath"],
@@ -1030,10 +1189,118 @@ def test_install_git_hooks_updates_repo_config(chronicle_sandbox, loaded_automat
     assert hooks_path == str(chronicle_sandbox.status_root / "git-hooks")
 
 
-def test_end_to_end_acceptance(monkeypatch, chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+def test_jsonl_rotation_archives_oversized_file_and_resets(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    """Backup maintenance rotates chronicle-snapshots.jsonl when it exceeds the cap."""
+    from dataclasses import replace as dc_replace
+    from max_chronicle.automation import GuardSettings
+
     chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
-    digest_result = run_digest_hook(loaded_manifest, loaded_automation, trigger_source="pytest")
-    local_date = _local_date_from_hook(digest_result, loaded_manifest["settings"]["timezone"])
+
+    # Write a file that is just over 1 byte cap (tiny cap for testing).
+    snapshots_path = chronicle_sandbox.status_root / "chronicle-snapshots.jsonl"
+    snapshots_path.write_text('{"event":"seed"}\n', encoding="utf-8")
+    assert snapshots_path.stat().st_size > 0
+
+    # Use a 1-byte cap so the file triggers rotation.
+    tiny_guards = dc_replace(loaded_automation.guards, jsonl_rotate_mb=1 / (1024 * 1024))
+    automation_tiny = dc_replace(loaded_automation, guards=tiny_guards)
+
+    result = run_backup(loaded_manifest, automation_tiny, trigger_source="pytest", force=True)
+
+    assert result["status"] == "ok"
+    rotation = result["maintenance"]["jsonl_rotation"]
+    assert rotation["snapshots"]["status"] == "rotated"
+    archive_path = Path(rotation["snapshots"]["archive_path"])
+    assert archive_path.exists(), "gzip archive must be created"
+    assert archive_path.suffix == ".gz"
+    # The live file should now be empty (fresh start).
+    assert snapshots_path.stat().st_size == 0
+
+
+def test_jsonl_rotation_skips_when_below_cap(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    """Backup maintenance skips rotation when file is below the cap."""
+    from dataclasses import replace as dc_replace
+
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+
+    snapshots_path = chronicle_sandbox.status_root / "chronicle-snapshots.jsonl"
+    snapshots_path.write_text('{"event":"seed"}\n', encoding="utf-8")
+
+    # Use a very large cap so no rotation happens.
+    large_guards = dc_replace(loaded_automation.guards, jsonl_rotate_mb=1000.0)
+    automation_large = dc_replace(loaded_automation, guards=large_guards)
+
+    result = run_backup(loaded_manifest, automation_large, trigger_source="pytest", force=True)
+
+    assert result["status"] == "ok"
+    rotation = result["maintenance"]["jsonl_rotation"]
+    assert rotation["snapshots"]["status"] == "skipped"
+    assert rotation["snapshots"]["skip_reason"] == "below_cap"
+
+
+def test_audit_emits_artifact_store_large_warn_when_over_cap(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    """Audit emits artifact_store_large warn when store size exceeds the configured cap."""
+    from dataclasses import replace as dc_replace
+
+    capture_runtime_snapshot(
+        loaded_manifest,
+        domain_id="global",
+        agent="pytest",
+        title="Artifact store size seed",
+        focus="tests",
+        append_compat=True,
+        render_generated=True,
+    )
+
+    # Write a real file in the artifact dir so the store has non-zero size.
+    artifact_dir = chronicle_sandbox.status_root / "chronicle-artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    test_blob = artifact_dir / "test-blob.bin"
+    test_blob.write_bytes(b"x" * 1024)  # 1 KB
+
+    # Use a 1-byte cap → 1 KB > 1 byte → triggers warn.
+    tiny_guards = dc_replace(loaded_automation.guards, artifact_store_warn_gb=1 / (1024 ** 3))
+    automation_tiny_cap = dc_replace(loaded_automation, guards=tiny_guards)
+
+    result = run_audit(loaded_manifest, automation_tiny_cap, trigger_source="pytest")
+    issue_kinds = {issue["kind"] for issue in result["issues"]}
+    assert "artifact_store_large" in issue_kinds
+
+
+def test_audit_does_not_emit_artifact_store_warn_when_below_cap(
+    loaded_manifest, loaded_automation
+) -> None:
+    """Audit does NOT emit artifact_store_large when store is small."""
+    from dataclasses import replace as dc_replace
+
+    capture_runtime_snapshot(
+        loaded_manifest,
+        domain_id="global",
+        agent="pytest",
+        title="Artifact store below cap seed",
+        focus="tests",
+        append_compat=True,
+        render_generated=True,
+    )
+
+    # Very large cap — real artifact dir in sandbox is tiny.
+    large_guards = dc_replace(loaded_automation.guards, artifact_store_warn_gb=1000.0)
+    automation_large_cap = dc_replace(loaded_automation, guards=large_guards)
+
+    result = run_audit(loaded_manifest, automation_large_cap, trigger_source="pytest")
+    issue_kinds = {issue["kind"] for issue in result["issues"]}
+    assert "artifact_store_large" not in issue_kinds
+
+
+def test_end_to_end_acceptance(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    local_date = _local_date(loaded_manifest["settings"]["timezone"])
 
     repo = chronicle_sandbox.digest_repo
     tracked = repo / "new.md"
@@ -1044,14 +1311,13 @@ def test_end_to_end_acceptance(monkeypatch, chronicle_sandbox, loaded_manifest, 
     git_result = run_git_commit_hook(
         loaded_manifest,
         loaded_automation,
-        repo_slug="intel-digest",
+        repo_slug="news-digest",
         commit_sha=commit_sha,
         repo_root=repo,
         trigger_source="pytest",
     )
 
     daily_capture = run_automation_job(loaded_manifest, loaded_automation, job_name="daily-capture", trigger_source="pytest")
-    monkeypatch.setattr("max_chronicle.native_automation._call_minimax", lambda *args, **kwargs: "Acceptance narrative.")
     daybook = run_daybook(loaded_manifest, loaded_automation, target_date=local_date, trigger_source="pytest")
     backup = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
 
@@ -1059,10 +1325,70 @@ def test_end_to_end_acceptance(monkeypatch, chronicle_sandbox, loaded_manifest, 
     with open_connection(config) as connection:
         summary = database_summary(connection)
 
-    assert digest_result["status"] == "stored"
     assert git_result["status"] == "stored"
     assert daily_capture["status"] == "ok"
     assert daybook["status"] in {"ok", "failed_soft"}
     assert backup["status"] == "ok"
-    assert summary["events"] >= 3
-    assert summary["snapshots"] >= 2
+    assert summary["events"] >= 2
+    assert summary["snapshots"] >= 1
+
+
+def test_backup_registers_manifest_artifact_so_weekly_restore_drill_passes(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    """The weekly drill asserts the manifest is registered inside the backup copy.
+
+    _upsert_backup_manifest_in_db existed but was never called, so every weekly
+    audit reported ok=false on healthy backups.
+    """
+    from max_chronicle.native_automation import _restore_check
+
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    capture_runtime_snapshot(
+        loaded_manifest,
+        domain_id="global",
+        agent="pytest",
+        title="Backup manifest registration seed",
+        focus="tests",
+        append_compat=True,
+        render_generated=True,
+    )
+    result = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+    assert result["status"] == "ok"
+
+    backup_path = Path(result["backup_path"])
+    backup_db = backup_path / "chronicle.db"
+    with sqlite3.connect(backup_db) as connection:
+        connection.row_factory = sqlite3.Row
+        artifacts = connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_type = 'backup-manifest' AND storage_path = ?",
+            (result["manifest_path"],),
+        ).fetchone()[0]
+        links = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM artifact_links
+            WHERE target_type = 'backup_run' AND target_id = ? AND link_role = 'generated'
+            """,
+            (result["run_id"],),
+        ).fetchone()[0]
+    assert artifacts == 1
+    assert links == 1
+
+    # The strict drill (require_manifest=True) is what the weekly audit runs.
+    drill = _restore_check(backup_db, backup_path=backup_path, require_manifest=True)
+    assert drill["backup_manifest_artifacts"] == 1
+    assert drill["backup_manifest_links"] == 1
+    assert drill["ok"] is True
+
+    # Registration must happen before the final checkpoint+hash, otherwise the
+    # rows sit in the WAL and the advertised db_sha256 describes a database
+    # that does not include them.
+    manifest_payload = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest_payload["db_sha256"] == hashlib.sha256(backup_db.read_bytes()).hexdigest(), (
+        "manifest advertises a hash that does not match the shipped database"
+    )
+    wal_path = Path(str(backup_db) + "-wal")
+    assert not wal_path.exists() or wal_path.stat().st_size == 0, (
+        "manifest rows stranded in the backup WAL — copying chronicle.db alone would lose them"
+    )

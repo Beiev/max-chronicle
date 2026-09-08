@@ -1,23 +1,44 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import mimetypes
 import re
 import shutil
 import sqlite3
+import tempfile
 import uuid
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .config import ChronicleConfig, default_config, ensure_runtime_dirs
+from .config import (
+    DEFAULT_MEM0_COLLECTION,
+    ChronicleConfig,
+    default_config,
+    ensure_runtime_dirs,
+)
 from .db import apply_migrations, connect, utc_now
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
+DEFAULT_STALE_RUN_TTL_HOURS = 6
+STALE_RUN_STATUS = "stale_failed"
+
+# Per-process memo of DB paths whose migrations were already applied in this
+# interpreter. apply_migrations is idempotent but runs a table scan + glob on
+# every call; skipping it on subsequent connects reclaims most of the overhead
+# that the long-lived MCP daemon pays on each tool invocation.
+_MIGRATIONS_APPLIED: set[Path] = set()
+
+
+def reset_migration_cache() -> None:
+    _MIGRATIONS_APPLIED.clear()
 
 
 def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
@@ -26,7 +47,10 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
     db_value = paths.get("chronicle_db")
     db_path = Path(db_value).expanduser() if db_value else None
     config = default_config(db_path)
-    timezone_name = manifest.get("settings", {}).get("timezone") or config.timezone
+    settings = manifest.get("settings", {})
+    timezone_name = settings.get("timezone") or config.timezone
+    mem0_collection = str(settings.get("mem0_collection") or config.mem0_collection)
+    operator_label = str(settings.get("operator") or config.operator_label)
     artifact_dir = paths.get("chronicle_artifact_dir")
     configured_extensions = artifact_settings.get("allowed_extensions") or config.artifact_allowed_extensions
     normalized_extensions = tuple(
@@ -51,6 +75,8 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
         or artifact_settings.get("pointer_only_enabled") is not None
         or artifact_settings.get("pointer_only_disallowed") is not None
         or artifact_settings.get("follow_symlinks") is not None
+        or mem0_collection != config.mem0_collection
+        or operator_label != config.operator_label
     ):
         config = replace(
             config,
@@ -67,15 +93,48 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
             artifact_follow_symlinks=bool(
                 artifact_settings.get("follow_symlinks", config.artifact_follow_symlinks)
             ),
+            mem0_collection=mem0_collection,
+            operator_label=operator_label,
         )
     return config
 
 
-def open_connection(config: ChronicleConfig) -> sqlite3.Connection:
+@contextmanager
+def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
+    # Yields a scoped connection and closes it on exit. sqlite3.Connection's own
+    # `__exit__` only commits/rollbacks — without this wrapper, `with open_connection(...)`
+    # leaked ~10MB of page cache + prepared statements per call, compounding inside
+    # the long-lived MCP daemon. Callers still wrap in `with connection:` for a txn.
     ensure_runtime_dirs(config)
     connection = connect(config.db_path)
-    apply_migrations(connection, config)
-    return connection
+    try:
+        if config.db_path not in _MIGRATIONS_APPLIED:
+            apply_migrations(connection, config)
+            _MIGRATIONS_APPLIED.add(config.db_path)
+        yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
+def write_transaction(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
+    """Scoped connection holding a BEGIN IMMEDIATE write transaction.
+
+    Python's implicit deferred BEGIN upgrades a read lock to a write lock
+    lazily; under a concurrent writer that upgrade fails with SQLITE_BUSY
+    *immediately* (SQLite skips the busy handler to avoid a WAL upgrade
+    deadlock), so busy_timeout never applies. Taking the write lock up front
+    makes writers queue politely instead of failing.
+    """
+    with open_connection(config) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
 
 
 def chronicle_db_exists(config: ChronicleConfig) -> bool:
@@ -98,6 +157,127 @@ def _parse_iso(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _stale_ttl_delta(ttl_hours: float | int) -> timedelta:
+    ttl = float(ttl_hours)
+    if ttl <= 0:
+        raise ValueError("stale run TTL must be greater than 0 hours")
+    return timedelta(hours=ttl)
+
+
+def _is_stale_run(started_at_utc: str | None, *, now: datetime, ttl_hours: float | int) -> bool:
+    if not started_at_utc:
+        return True
+    try:
+        started = _parse_iso(started_at_utc)
+    except (TypeError, ValueError):
+        return True
+    return now - started > _stale_ttl_delta(ttl_hours)
+
+
+def _run_age_hours(started_at_utc: str | None, *, now: datetime) -> float | None:
+    if not started_at_utc:
+        return None
+    try:
+        started = _parse_iso(started_at_utc)
+    except (TypeError, ValueError):
+        return None
+    return round((now - started).total_seconds() / 3600, 3)
+
+
+def _merge_stale_run_note(
+    raw_json: str | None,
+    *,
+    reason: str,
+    marked_at_utc: str,
+    ttl_hours: float | int,
+    started_at_utc: str | None,
+    original_run_key: str | None,
+) -> dict[str, Any]:
+    payload = _load_json(raw_json)
+    if not isinstance(payload, dict):
+        payload = {"previous_payload": payload}
+    payload["stale_run_recovery"] = {
+        "status": STALE_RUN_STATUS,
+        "reason": reason,
+        "marked_at_utc": marked_at_utc,
+        "ttl_hours": ttl_hours,
+        "started_at_utc": started_at_utc,
+        "original_run_key": original_run_key,
+    }
+    return payload
+
+
+def _retired_stale_run_key(run_key: str, run_id: str) -> str:
+    return f"{run_key}:stale:{run_id}"
+
+
+def _retire_stale_automation_run(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    marked_at_utc: str,
+    ttl_hours: float | int,
+    reason: str,
+    move_run_key: bool,
+) -> None:
+    details = _merge_stale_run_note(
+        row["details_json"],
+        reason=reason,
+        marked_at_utc=marked_at_utc,
+        ttl_hours=ttl_hours,
+        started_at_utc=row["started_at_utc"],
+        original_run_key=row["run_key"],
+    )
+    run_key = _retired_stale_run_key(row["run_key"], row["id"]) if move_run_key and row["run_key"] else row["run_key"]
+    connection.execute(
+        """
+        UPDATE automation_runs
+        SET status = ?,
+            finished_at_utc = ?,
+            run_key = ?,
+            details_json = ?
+        WHERE id = ?
+        """,
+        (STALE_RUN_STATUS, marked_at_utc, run_key, _json(details), row["id"]),
+    )
+
+
+def _retire_stale_curation_run(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    marked_at_utc: str,
+    ttl_hours: float | int,
+    reason: str,
+    move_run_key: bool,
+) -> None:
+    payload = _merge_stale_run_note(
+        row["payload_json"],
+        reason=reason,
+        marked_at_utc=marked_at_utc,
+        ttl_hours=ttl_hours,
+        started_at_utc=row["started_at_utc"],
+        original_run_key=row["run_key"],
+    )
+    run_key = _retired_stale_run_key(row["run_key"], row["id"]) if move_run_key else row["run_key"]
+    connection.execute(
+        """
+        UPDATE curation_runs
+        SET status = ?,
+            finished_at_utc = ?,
+            run_key = ?,
+            payload_json = ?,
+            notes = ?
+        WHERE id = ?
+        """,
+        (STALE_RUN_STATUS, marked_at_utc, run_key, _json(payload), reason, row["id"]),
+    )
 
 
 def to_local_iso(timestamp: str, timezone_name: str) -> str:
@@ -800,10 +980,9 @@ def fetch_event(
     config: ChronicleConfig,
     *,
     event_id: str,
+    connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any] | None:
-    with open_connection(config) as connection:
-        row = connection.execute(
-            """
+    sql = """
             SELECT
                 e.id,
                 e.occurred_at_utc,
@@ -825,9 +1004,12 @@ def fetch_event(
                 ON o.event_id = e.id AND o.operation = 'add'
             WHERE e.id = ?
             LIMIT 1
-            """,
-            (event_id,),
-        ).fetchone()
+    """
+    if connection is not None:
+        row = connection.execute(sql, (event_id,)).fetchone()
+    else:
+        with open_connection(config) as new_conn:
+            row = new_conn.execute(sql, (event_id,)).fetchone()
     if not row:
         return None
     return _event_row_to_entry(row)
@@ -868,26 +1050,6 @@ def snapshot_summary(snapshot: dict[str, Any]) -> str:
             f"{portfolio.get('og_images_needed', 'unknown')}"
         )
 
-    openclaw = snapshot.get("openclaw") or {}
-    if openclaw:
-        lines.append(
-            "openclaw_jobs_found_today="
-            f"{openclaw.get('jobs_found_today', 'unknown')}"
-        )
-        lines.append(
-            "openclaw_applications_sent_today="
-            f"{openclaw.get('applications_sent_today', 'unknown')}"
-        )
-
-    digest = snapshot.get("digest") or {}
-    status = digest.get("status") or {}
-    if isinstance(status, dict) and status:
-        lines.append(
-            "digest_status="
-            f"{status.get('status', 'unknown')}"
-        )
-    for headline in (digest.get("world_headlines") or [])[:2]:
-        lines.append(headline)
 
     if snapshot.get("focus"):
         lines.append(f"focus={snapshot['focus']}")
@@ -948,6 +1110,74 @@ def _bytes_sha256(content: bytes) -> str:
     digest = hashlib.sha256()
     digest.update(content)
     return digest.hexdigest()
+
+
+def _atomic_write_bytes(path: Path, content: bytes, *, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temp_name = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path = Path(temp_name)
+        if mode is not None:
+            temp_path.chmod(mode)
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8", mode: int | None = None) -> None:
+    _atomic_write_bytes(path, content.encode(encoding), mode=mode)
+
+
+def _path_matches_sha256(path: Path, expected_sha256: str) -> bool:
+    return path.exists() and path.is_file() and _file_sha256(path) == expected_sha256
+
+
+def _ensure_bytes_at_path(path: Path, content: bytes, *, sha256: str) -> None:
+    if _path_matches_sha256(path, sha256):
+        return
+    _atomic_write_bytes(path, content)
+
+
+def _copy_source_to_content_addressed_path(
+    source_path: Path,
+    *,
+    artifact_type: str,
+    source_sha256: str,
+    source_name: str,
+    artifact_dir: Path,
+) -> tuple[Path, str]:
+    relative_storage = Path(artifact_type) / source_sha256[:2] / source_sha256[2:4] / f"{source_sha256}-{source_name}"
+    storage_path = artifact_dir / relative_storage
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    if _path_matches_sha256(storage_path, source_sha256):
+        return storage_path, source_sha256
+
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=storage_path.parent, prefix=f".{storage_path.name}.", suffix=".tmp", delete=False) as target:
+            temp_name = target.name
+            with source_path.open("rb") as source:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        temp_path = Path(temp_name)
+        copied_sha256 = _file_sha256(temp_path)
+        if copied_sha256 != source_sha256:
+            temp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Artifact source changed while copying: {source_path}")
+        os.replace(temp_path, storage_path)
+        return storage_path, copied_sha256
+    except Exception:
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
+        raise
 
 
 def _artifact_extension(path: Path) -> str:
@@ -1031,6 +1261,7 @@ def _upsert_mem0_outbox(
     attempts: int | None = None,
     last_attempt_at_utc: str | None = None,
     synced_at_utc: str | None = None,
+    collection_name: str = DEFAULT_MEM0_COLLECTION,
 ) -> None:
     sync_status = _outbox_status(mem0_status)
     if attempts is None:
@@ -1055,7 +1286,7 @@ def _upsert_mem0_outbox(
             created_at_utc,
             synced_at_utc
         )
-        VALUES (?, ?, 'napaarnik_personal', 'add', ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'add', ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(event_id, operation) DO UPDATE SET
             status = excluded.status,
             attempts = excluded.attempts,
@@ -1067,6 +1298,7 @@ def _upsert_mem0_outbox(
         (
             str(uuid.uuid4()),
             event_id,
+            collection_name,
             sync_status,
             attempts,
             last_attempt_at_utc,
@@ -1141,9 +1373,10 @@ def store_event(
                 payload_json,
                 imported_from,
                 mem0_status,
-                mem0_error
+                mem0_error,
+                content_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -1167,6 +1400,7 @@ def store_event(
                 imported_from,
                 payload.get("mem0_status"),
                 payload.get("mem0_error"),
+                payload.get("content_hash"),
             ),
         )
 
@@ -1185,6 +1419,7 @@ def store_event(
             recorded_at_utc,
             payload.get("mem0_status"),
             payload.get("mem0_error"),
+            collection_name=config.mem0_collection,
         )
 
     if connection is not None:
@@ -1563,6 +1798,109 @@ def finish_ingest_run(
         )
 
 
+def stage_artifact_from_path(
+    config: ChronicleConfig,
+    *,
+    source_path: Path,
+    artifact_type: str,
+    observed_at_utc: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Do the filesystem half of artifact storage: hash and copy, no DB writes.
+
+    Split out so callers can stage files *outside* a write transaction — the
+    copy of a 25MB file must not hold SQLite's single write lock. Staging is
+    idempotent (content-addressed destination), so a later rollback leaves an
+    unreferenced blob rather than a corrupt row.
+
+    Returns the kwargs `persist_staged_artifact` needs, or None when the file
+    is missing or policy says skip.
+    """
+    if not source_path.exists() or not source_path.is_file():
+        return None
+
+    observed_at = observed_at_utc or utc_now()
+    source_size = source_path.stat().st_size
+    sha256 = _file_sha256(source_path)
+    mime_type = mimetypes.guess_type(source_path.name)[0]
+    artifact_metadata = dict(metadata or {})
+    artifact_metadata.setdefault("source_name", source_path.name)
+    artifact_metadata.setdefault("source_size", source_size)
+
+    storage_mode, skip_reason = _artifact_decision(
+        config,
+        source_path=source_path,
+        source_size=source_size,
+    )
+    if storage_mode == "skip":
+        return None
+
+    if storage_mode == "copy":
+        storage_path, sha256 = _copy_source_to_content_addressed_path(
+            source_path,
+            artifact_type=artifact_type,
+            source_sha256=sha256,
+            source_name=source_path.name,
+            artifact_dir=config.artifact_dir,
+        )
+        resolved_storage_path = str(storage_path)
+    else:
+        resolved_storage_path = _pointer_storage_path(artifact_type, sha256, source_path.name)
+        artifact_metadata["storage_mode"] = "pointer_only"
+        artifact_metadata["pointer_reason"] = skip_reason
+
+    return {
+        "source_path": source_path,
+        "artifact_type": artifact_type,
+        "sha256": sha256,
+        "storage_path": resolved_storage_path,
+        "mime_type": mime_type,
+        "observed_at": observed_at,
+        "metadata": artifact_metadata,
+    }
+
+
+def persist_staged_artifact(
+    connection: sqlite3.Connection,
+    staged: dict[str, Any],
+    *,
+    entity_type: str | None = None,
+    entity_name: str | None = None,
+    entity_id: str | None = None,
+) -> dict[str, Any]:
+    """Insert the DB row for an artifact already staged on disk."""
+    resolved_entity_id = entity_id
+    if entity_type and entity_name and not resolved_entity_id:
+        resolved_entity_id, _ = _ensure_entity(
+            connection,
+            entity_type,
+            entity_name,
+            staged["observed_at"],
+            metadata={"source_path": str(staged["source_path"])},
+        )
+
+    row = _store_artifact_record(
+        connection,
+        artifact_id=str(uuid.uuid4()),
+        artifact_type=staged["artifact_type"],
+        sha256=staged["sha256"],
+        storage_path=staged["storage_path"],
+        source_path=str(staged["source_path"]),
+        mime_type=staged["mime_type"],
+        observed_at=staged["observed_at"],
+        resolved_entity_id=resolved_entity_id,
+        artifact_metadata=staged["metadata"],
+    )
+    return {
+        "id": row["id"],
+        "artifact_type": row["artifact_type"],
+        "sha256": row["sha256"],
+        "storage_path": row["storage_path"],
+        "source_path": str(staged["source_path"]),
+        "entity_id": row["entity_id"],
+    }
+
+
 def store_artifact_from_path(
     config: ChronicleConfig,
     *,
@@ -1573,6 +1911,7 @@ def store_artifact_from_path(
     entity_name: str | None = None,
     entity_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any] | None:
     if not source_path.exists() or not source_path.is_file():
         return None
@@ -1594,30 +1933,32 @@ def store_artifact_from_path(
         return None
 
     if storage_mode == "copy":
-        relative_storage = Path(artifact_type) / sha256[:2] / sha256[2:4] / f"{sha256}-{source_path.name}"
-        storage_path = config.artifact_dir / relative_storage
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
-        if not storage_path.exists():
-            shutil.copy2(source_path, storage_path)
+        storage_path, sha256 = _copy_source_to_content_addressed_path(
+            source_path,
+            artifact_type=artifact_type,
+            source_sha256=sha256,
+            source_name=source_path.name,
+            artifact_dir=config.artifact_dir,
+        )
         resolved_storage_path = str(storage_path)
     else:
         resolved_storage_path = _pointer_storage_path(artifact_type, sha256, source_path.name)
         artifact_metadata["storage_mode"] = "pointer_only"
         artifact_metadata["pointer_reason"] = skip_reason
 
-    with open_connection(config) as connection, connection:
+    def _persist(active_connection: sqlite3.Connection) -> dict[str, Any]:
         resolved_entity_id = entity_id
         if entity_type and entity_name and not resolved_entity_id:
             resolved_entity_id, _ = _ensure_entity(
-                connection,
+                active_connection,
                 entity_type,
                 entity_name,
                 observed_at,
                 metadata={"source_path": str(source_path)},
             )
 
-        row = _store_artifact_record(
-            connection,
+        return _store_artifact_record(
+            active_connection,
             artifact_id=str(uuid.uuid4()),
             artifact_type=artifact_type,
             sha256=sha256,
@@ -1628,6 +1969,12 @@ def store_artifact_from_path(
             resolved_entity_id=resolved_entity_id,
             artifact_metadata=artifact_metadata,
         )
+
+    if connection is not None:
+        row = _persist(connection)
+    else:
+        with open_connection(config) as scoped_connection, scoped_connection:
+            row = _persist(scoped_connection)
 
     return {
         "id": row["id"],
@@ -1661,8 +2008,7 @@ def store_artifact_text(
     relative_storage = Path(artifact_type) / sha256[:2] / sha256[2:4] / f"{sha256}-{filename}"
     storage_path = config.artifact_dir / relative_storage
     storage_path.parent.mkdir(parents=True, exist_ok=True)
-    if not storage_path.exists():
-        storage_path.write_bytes(payload)
+    _ensure_bytes_at_path(storage_path, payload, sha256=sha256)
 
     artifact_metadata = dict(metadata or {})
     artifact_metadata.setdefault("source_name", filename)
@@ -1710,10 +2056,13 @@ def link_artifact(
     target_id: str,
     link_role: str,
     metadata: dict[str, Any] | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> str:
     link_id = str(uuid.uuid4())
-    with open_connection(config) as connection, connection:
-        existing = connection.execute(
+
+    def _persist(active_connection: sqlite3.Connection) -> str:
+        resolved_id = link_id
+        existing = active_connection.execute(
             """
             SELECT id
             FROM artifact_links
@@ -1723,8 +2072,8 @@ def link_artifact(
             (artifact_id, target_type, target_id, link_role),
         ).fetchone()
         if existing:
-            link_id = existing["id"]
-        connection.execute(
+            resolved_id = existing["id"]
+        active_connection.execute(
             """
             INSERT INTO artifact_links(
                 id,
@@ -1740,7 +2089,7 @@ def link_artifact(
                 metadata_json = COALESCE(excluded.metadata_json, artifact_links.metadata_json)
             """,
             (
-                link_id,
+                resolved_id,
                 artifact_id,
                 target_type,
                 target_id,
@@ -1749,7 +2098,12 @@ def link_artifact(
                 _json(metadata) if metadata else None,
             ),
         )
-    return link_id
+        return resolved_id
+
+    if connection is not None:
+        return _persist(connection)
+    with open_connection(config) as scoped_connection, scoped_connection:
+        return _persist(scoped_connection)
 
 
 def upsert_relation(
@@ -1922,14 +2276,16 @@ def start_automation_run(
     run_key: str | None = None,
     details: dict[str, Any] | None = None,
     retry_failed: bool = False,
+    stale_ttl_hours: float | int = DEFAULT_STALE_RUN_TTL_HOURS,
 ) -> tuple[str, bool]:
     run_id = str(uuid.uuid4())
     started_at = utc_now()
+    started_dt = _parse_iso(started_at)
     with open_connection(config) as connection, connection:
         if run_key:
             existing = connection.execute(
                 """
-                SELECT id, status, details_json, finished_at_utc
+                SELECT id, status, run_key, started_at_utc, details_json, finished_at_utc
                 FROM automation_runs
                 WHERE job_name = ? AND run_key = ?
                 LIMIT 1
@@ -1937,7 +2293,28 @@ def start_automation_run(
                 (job_name, run_key),
             ).fetchone()
             if existing:
-                if retry_failed and existing["status"] in {"failed", "failed_soft"}:
+                if existing["status"] == "running":
+                    if _is_stale_run(existing["started_at_utc"], now=started_dt, ttl_hours=stale_ttl_hours):
+                        _retire_stale_automation_run(
+                            connection,
+                            existing,
+                            marked_at_utc=started_at,
+                            ttl_hours=stale_ttl_hours,
+                            reason="stale running row exceeded TTL",
+                            move_run_key=True,
+                        )
+                    else:
+                        return existing["id"], False
+                elif existing["status"] == STALE_RUN_STATUS:
+                    _retire_stale_automation_run(
+                        connection,
+                        existing,
+                        marked_at_utc=started_at,
+                        ttl_hours=stale_ttl_hours,
+                        reason="stale_failed row retired before new run",
+                        move_run_key=True,
+                    )
+                elif retry_failed and existing["status"] in {"failed", "failed_soft"}:
                     retry_details = {
                         "retry": {
                             "previous_status": existing["status"],
@@ -1962,7 +2339,8 @@ def start_automation_run(
                         (trigger_source, started_at, _json(retry_details), existing["id"]),
                     )
                     return existing["id"], True
-                return existing["id"], False
+                else:
+                    return existing["id"], False
         connection.execute(
             """
             INSERT INTO automation_runs(
@@ -2268,12 +2646,15 @@ def start_curation_run(
     model_name: str | None = None,
     prompt_sha256: str | None = None,
     payload: dict[str, Any] | None = None,
+    stale_ttl_hours: float | int = DEFAULT_STALE_RUN_TTL_HOURS,
 ) -> tuple[str, bool]:
     run_id = str(uuid.uuid4())
+    started_at = utc_now()
+    started_dt = _parse_iso(started_at)
     with open_connection(config) as connection, connection:
         existing = connection.execute(
             """
-            SELECT id
+            SELECT id, status, run_key, started_at_utc, payload_json
             FROM curation_runs
             WHERE curation_type = ? AND run_key = ?
             LIMIT 1
@@ -2281,7 +2662,29 @@ def start_curation_run(
             (curation_type, run_key),
         ).fetchone()
         if existing:
-            return existing["id"], False
+            if existing["status"] == "running":
+                if _is_stale_run(existing["started_at_utc"], now=started_dt, ttl_hours=stale_ttl_hours):
+                    _retire_stale_curation_run(
+                        connection,
+                        existing,
+                        marked_at_utc=started_at,
+                        ttl_hours=stale_ttl_hours,
+                        reason="stale running row exceeded TTL",
+                        move_run_key=True,
+                    )
+                else:
+                    return existing["id"], False
+            elif existing["status"] == STALE_RUN_STATUS:
+                _retire_stale_curation_run(
+                    connection,
+                    existing,
+                    marked_at_utc=started_at,
+                    ttl_hours=stale_ttl_hours,
+                    reason="stale_failed row retired before new run",
+                    move_run_key=True,
+                )
+            else:
+                return existing["id"], False
         connection.execute(
             """
             INSERT INTO curation_runs(
@@ -2300,7 +2703,7 @@ def start_curation_run(
                 run_id,
                 curation_type,
                 run_key,
-                utc_now(),
+                started_at,
                 model_name,
                 prompt_sha256,
                 _json(payload) if payload else None,
@@ -2387,6 +2790,105 @@ def fetch_latest_curation_run(
     payload = dict(row)
     payload["payload"] = _load_json(row["payload_json"])
     return payload
+
+
+def mark_stale_running_runs(
+    config: ChronicleConfig,
+    *,
+    ttl_hours: float | int = DEFAULT_STALE_RUN_TTL_HOURS,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    marked_at_utc = utc_now()
+    now = _parse_iso(marked_at_utc)
+    cutoff_started_before_utc = _utc_iso(now - _stale_ttl_delta(ttl_hours))
+    automation_rows: list[dict[str, Any]] = []
+    curation_rows: list[dict[str, Any]] = []
+
+    with open_connection(config) as connection, connection:
+        automation_candidates = connection.execute(
+            """
+            SELECT id, job_name, run_key, started_at_utc, details_json
+            FROM automation_runs
+            WHERE status = 'running'
+            ORDER BY started_at_utc ASC, id ASC
+            """
+        ).fetchall()
+        curation_candidates = connection.execute(
+            """
+            SELECT id, curation_type, run_key, started_at_utc, payload_json
+            FROM curation_runs
+            WHERE status = 'running'
+            ORDER BY started_at_utc ASC, id ASC
+            """
+        ).fetchall()
+
+        for row in automation_candidates:
+            if not _is_stale_run(row["started_at_utc"], now=now, ttl_hours=ttl_hours):
+                continue
+            automation_rows.append(
+                {
+                    "id": row["id"],
+                    "job_name": row["job_name"],
+                    "run_key": row["run_key"],
+                    "started_at_utc": row["started_at_utc"],
+                    "age_hours": _run_age_hours(row["started_at_utc"], now=now),
+                    "new_status": STALE_RUN_STATUS,
+                }
+            )
+            if dry_run:
+                continue
+            _retire_stale_automation_run(
+                connection,
+                row,
+                marked_at_utc=marked_at_utc,
+                ttl_hours=ttl_hours,
+                reason="repaired stale running row",
+                move_run_key=False,
+            )
+
+        for row in curation_candidates:
+            if not _is_stale_run(row["started_at_utc"], now=now, ttl_hours=ttl_hours):
+                continue
+            curation_rows.append(
+                {
+                    "id": row["id"],
+                    "curation_type": row["curation_type"],
+                    "run_key": row["run_key"],
+                    "started_at_utc": row["started_at_utc"],
+                    "age_hours": _run_age_hours(row["started_at_utc"], now=now),
+                    "new_status": STALE_RUN_STATUS,
+                }
+            )
+            if dry_run:
+                continue
+            _retire_stale_curation_run(
+                connection,
+                row,
+                marked_at_utc=marked_at_utc,
+                ttl_hours=ttl_hours,
+                reason="repaired stale running row",
+                move_run_key=False,
+            )
+
+    stale_count = len(automation_rows) + len(curation_rows)
+    return {
+        "dry_run": dry_run,
+        "ttl_hours": ttl_hours,
+        "cutoff_started_before_utc": cutoff_started_before_utc,
+        "marked_at_utc": marked_at_utc,
+        "stale_count": stale_count,
+        "updated_count": 0 if dry_run else stale_count,
+        "automation_runs": {
+            "stale_count": len(automation_rows),
+            "updated_count": 0 if dry_run else len(automation_rows),
+            "rows": automation_rows,
+        },
+        "curation_runs": {
+            "stale_count": len(curation_rows),
+            "updated_count": 0 if dry_run else len(curation_rows),
+            "rows": curation_rows,
+        },
+    }
 
 
 def link_event_external_ref(
@@ -2750,3 +3252,544 @@ def update_event_mem0_state(
             synced_at_utc=synced_at,
         )
     return True
+
+
+# ==========================================================================
+# v8 — entity_aliases + event content-hash dedup.
+# Added in migration 0008; helpers below are the DB surface used by
+# service.py. Callers pass a normalized alias_key; the DB only enforces the
+# uniqueness of active aliases.
+# ==========================================================================
+
+
+def _entity_alias_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "canonical_entity_id": row["canonical_entity_id"],
+        "entity_type": row["entity_type"],
+        "domain": row["domain"],
+        "alias_text": row["alias_text"],
+        "alias_key": row["alias_key"],
+        "alias_key_kind": row["alias_key_kind"],
+        "confidence": row["confidence"],
+        "status": row["status"],
+        "source": row["source"],
+        "source_refs": json.loads(row["source_refs_json"] or "[]"),
+        "created_at_utc": row["created_at_utc"],
+        "updated_at_utc": row["updated_at_utc"],
+    }
+
+
+def find_entity_alias_by_key(
+    config: ChronicleConfig,
+    *,
+    alias_key: str,
+    entity_type: str,
+    domain: str = "global",
+    include_inactive: bool = False,
+) -> dict[str, Any] | None:
+    with open_connection(config) as connection:
+        sql = (
+            "SELECT * FROM entity_aliases "
+            "WHERE alias_key = ? AND entity_type = ? AND domain = ?"
+        )
+        params: tuple[Any, ...] = (alias_key, entity_type, domain)
+        if not include_inactive:
+            sql += " AND status = 'active'"
+        sql += " LIMIT 1"
+        row = connection.execute(sql, params).fetchone()
+    return _entity_alias_row_to_entry(row) if row else None
+
+
+def list_entity_aliases(
+    config: ChronicleConfig,
+    *,
+    canonical_entity_id: str | None = None,
+    entity_type: str | None = None,
+    domain: str | None = None,
+    status: str | None = "active",
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if canonical_entity_id is not None:
+        clauses.append("canonical_entity_id = ?")
+        params.append(canonical_entity_id)
+    if entity_type is not None:
+        clauses.append("entity_type = ?")
+        params.append(entity_type)
+    if domain is not None:
+        clauses.append("domain = ?")
+        params.append(domain)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = (
+        f"SELECT * FROM entity_aliases {where} "
+        "ORDER BY updated_at_utc DESC LIMIT ?"
+    )
+    params.append(int(limit))
+    with open_connection(config) as connection:
+        rows = connection.execute(sql, params).fetchall()
+    return [_entity_alias_row_to_entry(row) for row in rows]
+
+
+def add_entity_alias(
+    config: ChronicleConfig,
+    *,
+    canonical_entity_id: str,
+    entity_type: str,
+    alias_text: str,
+    alias_key: str,
+    domain: str = "global",
+    alias_key_kind: str | None = None,
+    confidence: float = 1.0,
+    source: str | None = "manual",
+    source_refs: list[dict[str, Any]] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Insert (or report existing) an entity alias row.
+
+    Returns a dict with keys ``action`` ("inserted" | "exists" | "dry_run"),
+    ``alias`` (the row), and ``conflict`` (existing row if an active alias
+    with the same key was already present).
+    """
+    now = utc_now()
+    with open_connection(config) as connection, connection:
+        entity_row = connection.execute(
+            "SELECT id, status, entity_type FROM normalized_entities WHERE id = ? LIMIT 1",
+            (canonical_entity_id,),
+        ).fetchone()
+        if not entity_row:
+            raise ValueError(
+                f"canonical_entity_id '{canonical_entity_id}' not found in normalized_entities"
+            )
+        if entity_row["status"] != "active":
+            raise ValueError(
+                f"canonical entity '{canonical_entity_id}' is not active "
+                f"(status={entity_row['status']}); aliases require an active parent"
+            )
+        if entity_row["entity_type"] != entity_type:
+            raise ValueError(
+                f"entity_type mismatch: alias requests '{entity_type}' but "
+                f"canonical entity '{canonical_entity_id}' is of type '{entity_row['entity_type']}'"
+            )
+
+        existing_row = connection.execute(
+            "SELECT * FROM entity_aliases "
+            "WHERE domain = ? AND entity_type = ? AND alias_key = ? AND status = 'active' "
+            "LIMIT 1",
+            (domain, entity_type, alias_key),
+        ).fetchone()
+        existing = _entity_alias_row_to_entry(existing_row) if existing_row else None
+
+        if existing is not None:
+            if existing["canonical_entity_id"] == canonical_entity_id:
+                return {"action": "exists", "alias": existing, "conflict": None}
+            return {"action": "exists", "alias": existing, "conflict": existing}
+
+        if dry_run:
+            return {
+                "action": "dry_run",
+                "alias": {
+                    "canonical_entity_id": canonical_entity_id,
+                    "entity_type": entity_type,
+                    "domain": domain,
+                    "alias_text": alias_text,
+                    "alias_key": alias_key,
+                    "alias_key_kind": alias_key_kind,
+                    "confidence": confidence,
+                    "status": "active",
+                    "source": source,
+                    "source_refs": source_refs or [],
+                    "created_at_utc": now,
+                    "updated_at_utc": now,
+                },
+                "conflict": None,
+            }
+
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO entity_aliases(
+                    canonical_entity_id,
+                    entity_type,
+                    domain,
+                    alias_text,
+                    alias_key,
+                    alias_key_kind,
+                    confidence,
+                    status,
+                    source,
+                    source_refs_json,
+                    created_at_utc,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    canonical_entity_id,
+                    entity_type,
+                    domain,
+                    alias_text,
+                    alias_key,
+                    alias_key_kind,
+                    float(confidence),
+                    source,
+                    _json(source_refs or []),
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # Race with another writer holding the partial-unique index.
+            # Re-read the winner and return it in the normal 'exists' shape
+            # so callers never see raw sqlite3 exceptions.
+            losing_row = connection.execute(
+                "SELECT * FROM entity_aliases "
+                "WHERE domain = ? AND entity_type = ? AND alias_key = ? AND status = 'active' "
+                "LIMIT 1",
+                (domain, entity_type, alias_key),
+            ).fetchone()
+            if not losing_row:
+                raise  # impossible in practice, but don't swallow real errors
+            winner = _entity_alias_row_to_entry(losing_row)
+            if winner["canonical_entity_id"] == canonical_entity_id:
+                return {"action": "exists", "alias": winner, "conflict": None}
+            return {"action": "exists", "alias": winner, "conflict": winner}
+
+        new_id = cursor.lastrowid
+        row = connection.execute(
+            "SELECT * FROM entity_aliases WHERE id = ? LIMIT 1",
+            (new_id,),
+        ).fetchone()
+    return {"action": "inserted", "alias": _entity_alias_row_to_entry(row), "conflict": None}
+
+
+def set_entity_alias_status(
+    config: ChronicleConfig,
+    *,
+    alias_id: int,
+    status: str,
+) -> dict[str, Any] | None:
+    if status not in {"active", "inactive", "rejected"}:
+        raise ValueError(f"invalid alias status: {status}")
+    now = utc_now()
+    with open_connection(config) as connection, connection:
+        connection.execute(
+            "UPDATE entity_aliases SET status = ?, updated_at_utc = ? WHERE id = ?",
+            (status, now, alias_id),
+        )
+        row = connection.execute(
+            "SELECT * FROM entity_aliases WHERE id = ? LIMIT 1",
+            (alias_id,),
+        ).fetchone()
+    return _entity_alias_row_to_entry(row) if row else None
+
+
+def merge_normalized_entities(
+    config: ChronicleConfig,
+    *,
+    source_entity_id: str,
+    target_entity_id: str,
+    reason: str,
+    actor: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Merge two normalized_entities rows.
+
+    - Re-points entity_aliases.canonical_entity_id from source to target.
+    - Merges source's aliases_json + source_refs_json into target.
+    - Marks source row status='inactive' and stores a pointer in its
+      metadata_json ({"merged_into": target_entity_id, "reason": reason}).
+
+    relations/events use the v7 ``entities`` table, which is a separate layer;
+    they are intentionally left untouched. If callers later need to also merge
+    the truth layer, that lives in a Phase 2 concern.
+    """
+    if source_entity_id == target_entity_id:
+        raise ValueError("source and target must differ")
+
+    now = utc_now()
+    with open_connection(config) as connection, connection:
+        src = connection.execute(
+            "SELECT * FROM normalized_entities WHERE id = ? LIMIT 1",
+            (source_entity_id,),
+        ).fetchone()
+        tgt = connection.execute(
+            "SELECT * FROM normalized_entities WHERE id = ? LIMIT 1",
+            (target_entity_id,),
+        ).fetchone()
+        if src is None:
+            raise ValueError(f"source normalized entity '{source_entity_id}' not found")
+        if tgt is None:
+            raise ValueError(f"target normalized entity '{target_entity_id}' not found")
+        if src["entity_type"] != tgt["entity_type"]:
+            raise ValueError(
+                f"cannot merge across entity types: source is '{src['entity_type']}' "
+                f"but target is '{tgt['entity_type']}'"
+            )
+        if src["status"] != "active":
+            raise ValueError(
+                f"source normalized entity '{source_entity_id}' is not active "
+                f"(status={src['status']}); nothing to merge"
+            )
+        if tgt["status"] != "active":
+            raise ValueError(
+                f"target normalized entity '{target_entity_id}' is not active "
+                f"(status={tgt['status']}); cannot merge into an inactive entity"
+            )
+
+        src_aliases = json.loads(src["aliases_json"] or "[]")
+        tgt_aliases = json.loads(tgt["aliases_json"] or "[]")
+        merged_aliases = sorted({*tgt_aliases, *src_aliases, src["canonical_name"]}, key=str.casefold)
+
+        src_refs = json.loads(src["source_refs_json"] or "[]")
+        tgt_refs = json.loads(tgt["source_refs_json"] or "[]")
+        merged_refs = tgt_refs + [item for item in src_refs if item not in tgt_refs]
+
+        alias_count = connection.execute(
+            "SELECT COUNT(*) FROM entity_aliases WHERE canonical_entity_id = ?",
+            (source_entity_id,),
+        ).fetchone()[0]
+
+        summary: dict[str, Any] = {
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "aliases_repointed": int(alias_count),
+            "merged_aliases": merged_aliases,
+            "merged_source_refs_count": len(merged_refs),
+            "status_change": "inactive",
+            "reason": reason,
+            "actor": actor,
+            "dry_run": dry_run,
+            "timestamp_utc": now,
+        }
+
+        if dry_run:
+            return summary
+
+        connection.execute(
+            "UPDATE entity_aliases SET canonical_entity_id = ?, updated_at_utc = ? "
+            "WHERE canonical_entity_id = ?",
+            (target_entity_id, now, source_entity_id),
+        )
+
+        src_metadata = _load_json(src["metadata_json"])
+        src_metadata.update(
+            {
+                "merged_into": target_entity_id,
+                "merged_reason": reason,
+                "merged_actor": actor,
+                "merged_at_utc": now,
+            }
+        )
+        connection.execute(
+            """
+            UPDATE normalized_entities
+            SET status = 'inactive',
+                metadata_json = ?,
+                updated_at_utc = ?
+            WHERE id = ?
+            """,
+            (_json(src_metadata), now, source_entity_id),
+        )
+
+        connection.execute(
+            """
+            UPDATE normalized_entities
+            SET aliases_json = ?,
+                source_refs_json = ?,
+                updated_at_utc = ?
+            WHERE id = ?
+            """,
+            (_json(merged_aliases), _json(merged_refs), now, target_entity_id),
+        )
+
+        return summary
+
+
+def find_event_by_content_hash_recent(
+    config: ChronicleConfig,
+    *,
+    content_hash: str,
+    window_hours: int = 24,
+    now: datetime | None = None,
+    connection: sqlite3.Connection | None = None,
+) -> dict[str, Any] | None:
+    """Look up a recent event by its v8 content_hash.
+
+    Window filters on ``occurred_at_utc`` — the event-time axis. This matches
+    the Chronicle model where both ``occurred_at_utc`` and ``recorded_at_utc``
+    are caller-controlled and typically equal; a dedicated wall-clock
+    "inserted_at" column would be a Phase 2 addition.
+
+    Callers that need the lookup inside a write transaction (to close the
+    TOCTOU gap between find and insert) should pass an open ``connection``.
+    """
+    if not content_hash:
+        return None
+    current = now or datetime.now(timezone.utc)
+    threshold = current - timedelta(hours=int(window_hours))
+    threshold_iso = threshold.strftime("%Y-%m-%dT%H:%M:%SZ")
+    sql = """
+            SELECT id, occurred_at_utc, recorded_at_utc, event_type, category,
+                   entity_type, entity_id, title, text, actor, content_hash
+            FROM events
+            WHERE content_hash = ? AND occurred_at_utc >= ?
+            ORDER BY occurred_at_utc DESC
+            LIMIT 1
+    """
+    params = (content_hash, threshold_iso)
+    if connection is not None:
+        row = connection.execute(sql, params).fetchone()
+    else:
+        with open_connection(config) as new_conn:
+            row = new_conn.execute(sql, params).fetchone()
+    return dict(row) if row else None
+
+
+def entity_alias_stats(
+    config: ChronicleConfig,
+    *,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    """Count aliases by status + top fragmentation candidates.
+
+    Returns a dict that the MCP tool `entity_resolution_report` reuses.
+    """
+    with open_connection(config) as connection:
+        alias_total = connection.execute(
+            "SELECT COUNT(*) FROM entity_aliases "
+            + ("WHERE domain = ?" if domain else ""),
+            ((domain,) if domain else ()),
+        ).fetchone()[0]
+        alias_active = connection.execute(
+            "SELECT COUNT(*) FROM entity_aliases WHERE status = 'active'"
+            + (" AND domain = ?" if domain else ""),
+            ((domain,) if domain else ()),
+        ).fetchone()[0]
+        alias_inactive = connection.execute(
+            "SELECT COUNT(*) FROM entity_aliases WHERE status = 'inactive'"
+            + (" AND domain = ?" if domain else ""),
+            ((domain,) if domain else ()),
+        ).fetchone()[0]
+        entity_total = connection.execute(
+            "SELECT COUNT(*) FROM normalized_entities"
+        ).fetchone()[0]
+        entity_active = connection.execute(
+            "SELECT COUNT(*) FROM normalized_entities WHERE status = 'active'"
+        ).fetchone()[0]
+        # Fragmentation candidates: normalized entities grouped by
+        # lowercase(canonical_name) whose group has >1 active rows.
+        frag_rows = connection.execute(
+            """
+            SELECT LOWER(canonical_name) AS bucket,
+                   COUNT(*) AS row_count,
+                   GROUP_CONCAT(id, '|') AS ids,
+                   GROUP_CONCAT(canonical_name, '|') AS names,
+                   GROUP_CONCAT(entity_type, '|') AS types
+            FROM normalized_entities
+            WHERE status = 'active'
+            GROUP BY bucket
+            HAVING COUNT(*) > 1
+            ORDER BY COUNT(*) DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        candidates = [
+            {
+                "bucket": row["bucket"],
+                "row_count": row["row_count"],
+                "ids": (row["ids"] or "").split("|"),
+                "names": (row["names"] or "").split("|"),
+                "entity_types": (row["types"] or "").split("|"),
+            }
+            for row in frag_rows
+        ]
+    return {
+        "domain": domain,
+        "normalized_entities_total": entity_total,
+        "normalized_entities_active": entity_active,
+        "aliases_total": alias_total,
+        "aliases_active": alias_active,
+        "aliases_inactive": alias_inactive,
+        "coverage_pct": (
+            round(100.0 * alias_active / entity_active, 1) if entity_active else 0.0
+        ),
+        "fragmentation_candidates": candidates,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Event embeddings
+# ---------------------------------------------------------------------------
+
+
+def store_event_embedding(
+    config: ChronicleConfig,
+    event_id: str,
+    vector: list[float],
+    model: str,
+    dim: int,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> None:
+    """Upsert an embedding row for *event_id*.
+
+    Packs *vector* as a float32 BLOB and writes it into event_embeddings.
+    Idempotent — calling twice with the same event_id replaces the row.
+    """
+    from .embeddings import pack_vector  # local import avoids circular at module load
+
+    blob = pack_vector(vector)
+    now = utc_now()
+
+    def _persist(active_connection: sqlite3.Connection) -> None:
+        active_connection.execute(
+            """
+            INSERT INTO event_embeddings(event_id, model, dim, vector, created_at_utc)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                model          = excluded.model,
+                dim            = excluded.dim,
+                vector         = excluded.vector,
+                created_at_utc = excluded.created_at_utc
+            """,
+            (event_id, model, dim, blob, now),
+        )
+
+    if connection is not None:
+        _persist(connection)
+        return
+    with open_connection(config) as scoped_connection, scoped_connection:
+        _persist(scoped_connection)
+
+
+def fetch_all_event_embeddings(
+    config: ChronicleConfig,
+) -> list[tuple[str, list[float]]]:
+    """Return all (event_id, unpacked_vector) tuples from event_embeddings."""
+    from .embeddings import unpack_vector  # local import
+
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            "SELECT event_id, vector FROM event_embeddings"
+        ).fetchall()
+    return [(row["event_id"], unpack_vector(row["vector"])) for row in rows]
+
+
+def fetch_event_ids_without_embedding(config: ChronicleConfig) -> list[str]:
+    """Return event IDs that have no row in event_embeddings."""
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            """
+            SELECT e.id
+            FROM events AS e
+            LEFT JOIN event_embeddings AS ee ON ee.event_id = e.id
+            WHERE ee.event_id IS NULL
+            ORDER BY e.occurred_at_utc DESC
+            """
+        ).fetchall()
+    return [row["id"] for row in rows]

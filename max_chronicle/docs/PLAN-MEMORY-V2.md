@@ -93,7 +93,7 @@ Mem0 remains a derived recall/index layer.
 
 ### B. First-Party Runtime
 
-- OpenClaw runtime state
+- the agent hub runtime state
 - leads and morning brief
 - watchdog and health data
 - email triage summaries
@@ -102,7 +102,7 @@ Mem0 remains a derived recall/index layer.
 
 ### C. External World
 
-- intel-digest synthesized world stream
+- the digest feed synthesized world stream
 - structured job-market feeds
 - company intelligence
 - selected first-party company pages and filings when needed

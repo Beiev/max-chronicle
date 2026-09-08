@@ -1,18 +1,35 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
-from pathlib import Path
+import logging
+import os
+import sqlite3
 import sys
-from typing import Annotated, Any, Literal
+import threading
+import time
+import weakref
+from pathlib import Path
+from typing import Annotated, Any, Callable, Literal
 
+import anyio
+import anyio.to_thread
+from anyio.lowlevel import RunVar
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from . import __version__
 
 from .config import default_manifest_path
-from .runtime_context import load_manifest, parse_when
+from .runtime_context import load_manifest, load_manifest_cached, parse_when
 from .service import (
     DEFAULT_QUERY_MODE,
+    add_entity_alias_service,
     build_attach_bundle,
     build_activation,
     build_sources_audit,
@@ -20,37 +37,38 @@ from .service import (
     capture_runtime_snapshot,
     current_state,
     default_mem0_status,
+    entity_resolution_report_service,
     materialize_normalized_entities,
-    materialize_situation_model,
+    merge_entities_service,
     project_state,
     query_context,
-    record_scenario,
+    query_memory,
     record_event,
     reconstruct_timeline,
-    review_scenario,
-    render_projections,
-    run_lenses,
+    search_mem0_live_service,
 )
-from .store import config_from_manifest, fetch_recent_events, fetch_latest_snapshot
+from .store import config_from_manifest, fetch_recent_events, fetch_latest_snapshot, open_connection
 
 READ_ONLY_PROFILE = "readonly"
 CHRONICLER_PROFILE = "chronicler"
 MCP_PROFILES = {READ_ONLY_PROFILE, CHRONICLER_PROFILE}
 STARTUP_GATE_DESCRIPTION = (
-    "Call `startup_bundle(...)` or `activate_agent(...)` to warm the session explicitly. "
-    "If a mutating tool is called first, Chronicle runs an internal compact startup read once for that session before mutating."
+    "Call `startup_bundle(...)` or `activate_agent(...)` once per session before mutating Chronicle."
 )
-AUTO_STARTUP_AGENT = "mcp-auto-startup"
-AUTO_STARTUP_LIMIT = 3
 QUERY_CONTEXT_MODE = Literal[
     "truth_only",
     "truth_plus_interpretation",
     "truth_plus_interpretation_plus_scenarios",
 ]
-REVIEW_STATUS = Literal["matched", "partial", "missed"]
 DOMAIN_ARG = Annotated[str, Field(description="Chronicle domain id from the manifest.")]
 OPTIONAL_DOMAIN_ARG = Annotated[str | None, Field(description="Optional Chronicle domain id from the manifest.")]
-AGENT_ARG = Annotated[str, Field(description="Agent name recorded in the output.")]
+AGENT_ARG = Annotated[str, Field(description=(
+    "Agent name recorded in the output. Canonical names: claude, codex, glm, "
+    "deepseek, opencode, memory-librarian, transcript-analyst, or a stable "
+    "pipeline id. Session-flavored variants (claude-<session>, Codex, "
+    "opencode-glm*) are normalized to the canonical actor; put session "
+    "context in why/text instead."
+))]
 OPTIONAL_TITLE_ARG = Annotated[str | None, Field(description="Optional snapshot title.")]
 OPTIONAL_FOCUS_ARG = Annotated[str | None, Field(description="Optional focus string.")]
 CAPTURE_ARG = Annotated[
@@ -82,41 +100,190 @@ SOURCE_FILES_ARG = Annotated[
     list[str] | None,
     Field(description="Optional source file paths to archive with the event."),
 ]
-SCENARIO_NAME_ARG = Annotated[str, Field(description="Scenario name.")]
-ASSUMPTIONS_ARG = Annotated[list[str], Field(description="Scenario assumptions to store with the run.")]
-CHANGED_VARIABLES_ARG = Annotated[
-    dict[str, str] | None,
-    Field(description="Optional key-value map of changed variables."),
-]
-EXPECTED_OUTCOMES_ARG = Annotated[
-    list[str] | None,
-    Field(description="Optional expected outcomes for the scenario."),
-]
-FAILURE_MODES_ARG = Annotated[
-    list[str] | None,
-    Field(description="Optional failure modes to watch for."),
-]
-CONFIDENCE_ARG = Annotated[float, Field(description="Scenario confidence from 0 to 1.")]
-REVIEW_DUE_AT_ARG = Annotated[str | None, Field(description="Optional ISO timestamp for the review due date.")]
-SCENARIO_ID_ARG = Annotated[str, Field(description="Scenario id to review.")]
-STATUS_ARG = Annotated[
-    REVIEW_STATUS,
-    Field(description="Review status to store. Allowed values: matched, partial, missed."),
-]
-SUMMARY_ARG = Annotated[str, Field(description="Review summary to store.")]
-OUTCOME_EVENT_ID_ARG = Annotated[str | None, Field(description="Optional outcome event id linked to the review.")]
+_LOGGER = logging.getLogger("max_chronicle.mcp")
+_PROCESS_STARTED_AT = time.time()
+
+# Writers get a single slot (SQLite is single-writer anyway, and queueing here
+# beats surfacing `database is locked` to agents); readers get 8 so a slow read
+# cannot monopolise the pool. A CapacityLimiter belongs to the event loop that
+# created it, so these live in RunVars — one set per async run. A plain module
+# global would hand a limiter from a dead loop to a new one (the daemon has a
+# single loop, but tests spin up an asyncio.run per case).
+_LIMITER_TOKENS = {"read": 8, "write": 1}
+_limiter_vars = {kind: RunVar(f"chronicle_{kind}_limiter") for kind in _LIMITER_TOKENS}
 
 
-def _startup_gate_key(ctx: Context | None) -> str | None:
+def _get_limiter(kind: str) -> anyio.CapacityLimiter:
+    run_var = _limiter_vars[kind]
+    try:
+        return run_var.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(_LIMITER_TOKENS[kind])
+        run_var.set(limiter)
+        return limiter
+
+
+def _gate_session(ctx: Context | None) -> Any | None:
+    """Return the live session object for gate keying, or None outside a request."""
     if ctx is None:
         return None
     try:
-        session = ctx.session
+        return ctx.session
     except Exception:
-        session = None
-    if session is not None:
-        return f"session:{id(session)}"
-    return None
+        return None
+
+
+def _envelope_error(
+    tool_name: str,
+    *,
+    error_type: str,
+    error: str,
+    retryable: bool,
+    hint: str | None = None,
+    **extra: Any,
+) -> ToolError:
+    """Build a ToolError whose message is the machine-readable failure envelope.
+
+    Raised rather than returned: a returned dict comes back as a *successful*
+    tool call (isError stays false), so a failed write could be mistaken for a
+    recorded one — unacceptable in the system of record. Raising sets isError
+    while the JSON body keeps error_type/retryable/hint actionable. FastMCP
+    prefixes the message with "Error executing tool <name>: ", so parse from
+    the first '{'.
+    """
+    payload: dict[str, Any] = {
+        "status": "error",
+        "tool": tool_name,
+        "error_type": error_type,
+        "error": error,
+        "retryable": retryable,
+    }
+    if hint:
+        payload["hint"] = hint
+    payload.update(extra)
+    return ToolError(json.dumps(payload, ensure_ascii=False))
+
+
+def _offload(fn, *, tool_name: str, writes: bool | Callable[[dict[str, Any]], bool]):
+    """Run a sync tool body in a worker thread and translate failures to envelopes.
+
+    mcp 1.26 executes plain `def` tools directly on the event loop, so one slow
+    body (git capture, Ollama embed, cold `uv run`) used to freeze every session
+    at once — clients saw 30s connection timeouts while launchd saw a healthy
+    process. Failures raise a ToolError whose message is the JSON envelope:
+    raising sets isError (a returned dict would look like a successful call, so
+    a failed write could be mistaken for a recorded one) while the body keeps
+    error_type/retryable/hint machine-readable for agents.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(**kwargs: Any) -> Any:
+        # `writes` may be a predicate: startup_bundle only mutates when the
+        # caller asks for a capture, and must take the write slot when it does.
+        mutating = writes(kwargs) if callable(writes) else writes
+        limiter = _get_limiter("write" if mutating else "read")
+        try:
+            return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs), limiter=limiter)
+        except ToolError as exc:
+            message = str(exc)
+            if "startup_required" in message:
+                raise _envelope_error(
+                    tool_name,
+                    error_type="startup_required",
+                    error=message,
+                    retryable=True,
+                    hint=(
+                        "Call `startup_bundle` for this domain, then retry this call. "
+                        "If you already called it in this session, the Chronicle server "
+                        "restarted and cleared the in-memory gate — calling it again is safe."
+                    ),
+                    server_uptime_s=round(time.time() - _PROCESS_STARTED_AT),
+                ) from exc
+            raise
+        except sqlite3.OperationalError as exc:
+            text = str(exc)
+            locked = "locked" in text.lower() or "busy" in text.lower()
+            _LOGGER.warning("tool %s failed with OperationalError: %s", tool_name, text)
+            raise _envelope_error(
+                tool_name,
+                error_type="db_locked" if locked else "db_error",
+                error=text,
+                retryable=locked,
+                hint=(
+                    "Chronicle DB is briefly locked by a maintenance job; wait a few seconds and retry."
+                    if locked
+                    else "Non-transient SQLite error — inspect the Chronicle DB before retrying."
+                ),
+            ) from exc
+        except ValueError as exc:
+            raise _envelope_error(
+                tool_name,
+                error_type="invalid_argument",
+                error=str(exc),
+                retryable=False,
+                hint=str(exc),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — every failure gets an envelope
+            _LOGGER.exception("tool %s crashed", tool_name)
+            raise _envelope_error(
+                tool_name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                retryable=False,
+            ) from exc
+
+    return wrapper
+
+
+def _offload_read(fn):
+    """Thread-offload for resources and prompts — no envelope, errors propagate."""
+
+    @functools.wraps(fn)
+    async def wrapper(**kwargs: Any) -> Any:
+        return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs), limiter=_get_limiter("read"))
+
+    return wrapper
+
+
+_AGENT_SOLO_ALIASES = {"operator": "claude"}
+
+
+def _normalize_agent(agent: str | None) -> str:
+    """Collapse ad-hoc agent spellings to a canonical actor name.
+
+    Keeps the actor column analyzable: 25+ historical variants (claude-mac,
+    claude-sprint4-night, Codex, opencode-glm5.2, ...) all meant one of a few
+    actors. Session flavor belongs in why/text, not in the actor id.
+    """
+    a = (agent or "mcp").strip().lower()
+    if a in _AGENT_SOLO_ALIASES:
+        return _AGENT_SOLO_ALIASES[a]
+    if a.startswith("claude"):
+        return "claude"
+    if "glm" in a:
+        return "glm"
+    if "deepseek" in a:
+        return "deepseek"
+    if a.startswith("codex"):
+        return "codex"
+    if a.startswith("gemini"):
+        return "gemini"
+    if a.startswith("opencode"):
+        return "opencode"
+    if a.startswith("transcript-analyst"):
+        return "transcript-analyst"
+    return a
+
+
+def _startup_required_message(tool_name: str, *, domain: str = "global") -> str:
+    return (
+        f"startup_required: `{tool_name}` requires Chronicle startup in this session. "
+        f"Call `startup_bundle(domain=\"{domain}\")` first — it unlocks the write surface "
+        f"and returns the startup brief (`activate_agent(domain=\"{domain}\")` also unlocks). "
+        "If you already called it in this session, the Chronicle server has restarted "
+        "since; calling it again is safe and re-unlocks. "
+        "No Chronicle mutation was performed."
+    )
 
 
 def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER_PROFILE) -> FastMCP:
@@ -125,48 +292,121 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     resolved_manifest_path = manifest_path or default_manifest_path()
 
     def manifest() -> dict:
-        return load_manifest(resolved_manifest_path)
+        return load_manifest_cached(resolved_manifest_path)
 
-    startup_gate_unlocked: set[str] = set()
-    sessionless_gate_key = f"server:{id(startup_gate_unlocked)}"
+    # Gate state: WeakSet of live session objects (pruned automatically when a
+    # transport drops its session — the old id()-keyed set leaked forever and a
+    # recycled memory address could spuriously unlock a fresh session). Tool
+    # bodies run in worker threads now, so mutations go through a lock.
+    gate_lock = threading.Lock()
+    unlocked_sessions: weakref.WeakSet = weakref.WeakSet()
+    sessionless_unlocked = False
 
     def unlock_startup_gate(ctx: Context | None) -> None:
-        startup_gate_unlocked.add(_startup_gate_key(ctx) or sessionless_gate_key)
+        nonlocal sessionless_unlocked
+        session = _gate_session(ctx)
+        with gate_lock:
+            if session is not None:
+                unlocked_sessions.add(session)
+            else:
+                sessionless_unlocked = True
 
-    def ensure_startup_gate(
-        ctx: Context | None,
-        *,
-        domain: str = "global",
-        agent: str = AUTO_STARTUP_AGENT,
-    ) -> None:
-        key = _startup_gate_key(ctx) or sessionless_gate_key
-        if key in startup_gate_unlocked:
-            return
-        # Warm the session with the same compact read path exposed to agents,
-        # but keep it non-mutating by forcing capture=False.
-        build_startup_bundle(
-            manifest(),
-            domain_id=domain,
-            agent=agent,
-            capture=False,
-            limit=AUTO_STARTUP_LIMIT,
-            compact=True,
-        )
-        unlock_startup_gate(ctx)
+    def require_startup_gate(ctx: Context | None, *, tool_name: str, domain: str = "global") -> None:
+        session = _gate_session(ctx)
+        with gate_lock:
+            if session is not None:
+                if session in unlocked_sessions:
+                    return
+            elif sessionless_unlocked:
+                return
+        raise ToolError(_startup_required_message(tool_name, domain=domain))
 
     server = FastMCP(
         name="Max Chronicle" if profile == CHRONICLER_PROFILE else "Max Chronicle Read Only",
         instructions=(
-            "Chronicle is the canonical local-first memory system for Maksym Beiev. "
+            "Chronicle is the canonical local-first memory system for this installation. "
             "Use Chronicle DB as truth, status markdown as readable projections, and Mem0 as semantic recall. "
-            "Read surfaces are informational only and do not unlock the session; "
-            "call `startup_bundle` or `activate_agent` when you want the startup context payload explicitly, "
-            "and note that mutating tools auto-start Chronicle with a compact startup read on first use."
+            "Session protocol: call `startup_bundle` ONCE at session start — it returns the brief "
+            "and unlocks the write surface (read tools work without it but do not unlock). "
+            "Recall: `query_memory` is the primary search; `query_context` adds status-markdown and "
+            "mem0-dump context; `recent_events` is the cheap latest-N feed; `state_at` reconstructs "
+            "a moment in time. Write durable facts with `record_event`; entity maintenance lives "
+            "under `entity_admin`. A failing tool raises, so the call is flagged isError and the "
+            "message carries a JSON envelope after the FastMCP prefix — parse from the first '{': "
+            "`status`, `error_type`, `retryable`, `hint`. Follow the hint instead of giving up. "
+            "Renamed 2026-08-13 (older agents may hold the previous names): "
+            "normalize_entities -> entity_admin(action=\"normalize\"); "
+            "add_entity_alias -> entity_admin(action=\"alias\"); "
+            "merge_entities -> entity_admin(action=\"merge\"); "
+            "entity_resolution_report -> entity_admin(action=\"report\"); "
+            "render_projections -> capture_snapshot; activate_agent -> startup_bundle."
         ),
-        log_level="WARNING",
+        log_level="INFO",
     )
 
-    @server.resource(
+    def register_tool(
+        *,
+        name: str,
+        description: str,
+        writes: bool | Callable[[dict[str, Any]], bool],
+        structured_output: bool | None = None,
+    ):
+        """Register a sync tool body wrapped in the thread-offload + envelope layer."""
+
+        def decorator(fn):
+            tool_kwargs: dict[str, Any] = {"name": name, "description": description}
+            if structured_output is not None:
+                tool_kwargs["structured_output"] = structured_output
+            server.tool(**tool_kwargs)(_offload(fn, tool_name=name, writes=writes))
+            return fn
+
+        return decorator
+
+    def register_resource(uri: str, *, title: str, description: str):
+        def decorator(fn):
+            server.resource(uri, title=title, description=description)(_offload_read(fn))
+            return fn
+
+        return decorator
+
+    def register_prompt(*, name: str, description: str):
+        def decorator(fn):
+            server.prompt(name=name, description=description)(_offload_read(fn))
+            return fn
+
+        return decorator
+
+    @server.custom_route("/health", methods=["GET"])
+    async def route_health(_: Request) -> JSONResponse:
+        # Lives on the Starlette app, outside the MCP session machinery: it
+        # answers even when sessions are wedged, and hangs together with the
+        # event loop — exactly the signal the external watchdog polls for.
+        def _db_check() -> bool:
+            config = config_from_manifest(manifest())
+            with open_connection(config) as connection:
+                connection.execute("SELECT 1").fetchone()
+            return True
+
+        db_ok = False
+        error: str | None = None
+        try:
+            with anyio.fail_after(2.0):
+                db_ok = bool(await anyio.to_thread.run_sync(_db_check, abandon_on_cancel=True))
+        except Exception as exc:  # noqa: BLE001 — health must always answer
+            error = f"{type(exc).__name__}: {exc}"
+        payload: dict[str, Any] = {
+            "status": "ok" if db_ok else "degraded",
+            "db_ok": db_ok,
+            "uptime_s": round(time.time() - _PROCESS_STARTED_AT),
+            "version": __version__,
+            "pid": os.getpid(),
+            "profile": profile,
+        }
+        if error:
+            payload["error"] = error
+        return JSONResponse(payload, status_code=200 if db_ok else 503)
+
+    @register_resource(
         "chronicle://attach/current",
         title="Current Attach Bundle",
         description="Machine-readable agent attach bundle for the global domain.",
@@ -174,7 +414,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def resource_attach_current() -> dict:
         return build_attach_bundle(manifest(), domain_id="global", agent="mcp-resource", capture=False)
 
-    @server.resource(
+    @register_resource(
         "chronicle://attach/domain/{domain}",
         title="Domain Attach Bundle",
         description="Machine-readable agent attach bundle for a domain.",
@@ -182,7 +422,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def resource_attach_domain(domain: str) -> dict:
         return build_attach_bundle(manifest(), domain_id=domain, agent="mcp-resource", capture=False)
 
-    @server.resource(
+    @register_resource(
         "chronicle://state/current",
         title="Current Chronicle State",
         description="Database summary, latest snapshot, and recent durable events.",
@@ -190,7 +430,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def resource_state_current() -> dict:
         return current_state(manifest(), domain="global")
 
-    @server.resource(
+    @register_resource(
         "chronicle://state/domain/{domain}",
         title="Domain Chronicle State",
         description="Latest snapshot and recent events for a domain.",
@@ -198,7 +438,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def resource_state_domain(domain: str) -> dict:
         return current_state(manifest(), domain=domain)
 
-    @server.resource(
+    @register_resource(
         "chronicle://sources/audit",
         title="Chronicle Sources Audit",
         description="Machine-readable source catalog, lane coverage, freshness, and trust audit for the global domain.",
@@ -206,7 +446,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def resource_sources_audit() -> dict:
         return build_sources_audit(manifest(), domain_id="global")
 
-    @server.resource(
+    @register_resource(
         "chronicle://sources/audit/{domain}",
         title="Domain Sources Audit",
         description="Machine-readable source catalog, lane coverage, freshness, and trust audit for a domain.",
@@ -214,7 +454,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def resource_sources_audit_domain(domain: str) -> dict:
         return build_sources_audit(manifest(), domain_id=domain)
 
-    @server.resource(
+    @register_resource(
         "chronicle://timeline/{timestamp}",
         title="Chronicle Timeline",
         description="Nearest global snapshots and events around a timestamp.",
@@ -224,7 +464,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         target = parse_when(timestamp, loaded)
         return reconstruct_timeline(loaded, timestamp=target, domain="global", window_hours=6, limit=3)
 
-    @server.resource(
+    @register_resource(
         "chronicle://timeline/domain/{domain}/{timestamp}",
         title="Domain Timeline",
         description="Nearest snapshots and events around a timestamp for a domain.",
@@ -234,7 +474,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         target = parse_when(timestamp, loaded)
         return reconstruct_timeline(loaded, timestamp=target, domain=domain, window_hours=6, limit=3)
 
-    @server.resource(
+    @register_resource(
         "chronicle://project/{project}",
         title="Project State",
         description="Recent events and relations for a project slug.",
@@ -242,7 +482,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def resource_project(project: str) -> dict:
         return project_state(manifest(), project=project)
 
-    @server.resource(
+    @register_resource(
         "chronicle://world/latest",
         title="Latest World Context",
         description="Digest context from the latest Chronicle snapshot.",
@@ -257,11 +497,15 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "digest": (snapshot or {}).get("digest", {}),
         }
 
-    @server.tool(
+    @register_tool(
+        # Reads by default, but capture=true persists a snapshot and rewrites
+        # projections — that has to serialize behind the write limiter.
+        writes=lambda kwargs: bool(kwargs.get("capture")),
         name="startup_bundle",
         description=(
-            "Build the startup brief bundle for an agent without mutating Chronicle by default. "
-            "Calling this tool unlocks the chronicler write surface for the current session."
+            "THE session entry point — call once at session start. Returns the startup brief "
+            "(domain state, recent durable events, freshness audit) and unlocks the chronicler "
+            "write surface for this session. Does not mutate Chronicle unless capture=true."
         ),
     )
     def tool_startup_bundle(
@@ -274,31 +518,41 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         compact: COMPACT_ARG = True,
         ctx: Context | None = None,
     ) -> dict:
+        effective_capture = capture if profile == CHRONICLER_PROFILE else False
         payload = build_startup_bundle(
             manifest(),
             domain_id=domain,
-            agent=agent,
+            agent=_normalize_agent(agent),
             title=title,
             focus=focus,
-            capture=capture,
+            capture=effective_capture,
             limit=limit,
             compact=compact,
         )
         unlock_startup_gate(ctx)
         return payload
 
-    @server.tool(
+    @register_tool(
+        writes=False,
         name="recent_events",
-        description="Read recent Chronicle events for a domain.",
+        description=(
+            "Cheap latest-N feed of Chronicle events for a domain — situational awareness "
+            "without search. For 'what do we know about X' use query_memory instead."
+        ),
     )
     def tool_recent_events(domain: DOMAIN_ARG = "global", limit: LIMIT_ARG = 10) -> list[dict]:
         loaded = manifest()
         config = config_from_manifest(loaded)
         return fetch_recent_events(config, limit=limit, domain=domain, visibility="raw")
 
-    @server.tool(
+    @register_tool(
+        writes=False,
         name="state_at",
-        description="Reconstruct Chronicle state around an ISO timestamp.",
+        description=(
+            "Timeline archaeology: reconstruct what was true around an ISO timestamp "
+            "(nearest snapshots + events in a window). Use for 'what was happening on <date>'; "
+            "for topic search use query_memory."
+        ),
     )
     def tool_state_at(
         timestamp: TIMESTAMP_ARG,
@@ -310,9 +564,14 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         target = parse_when(timestamp, loaded)
         return reconstruct_timeline(loaded, timestamp=target, domain=domain, window_hours=window_hours, limit=limit)
 
-    @server.tool(
+    @register_tool(
+        writes=False,
         name="query_context",
-        description="Search Chronicle events, status sources, and mem0 dump for relevant context.",
+        description=(
+            "Broad context sweep: searches Chronicle events PLUS status-markdown sections and the "
+            "mem0 dump, with truth-layer ordering. Use when you need document/status context around "
+            "a topic; for pure event recall query_memory is faster and ranks better."
+        ),
     )
     def tool_query_context(
         query: QUERY_ARG,
@@ -322,7 +581,25 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     ) -> dict:
         return query_context(manifest(), query=query, domain=domain, limit=limit, mode=mode)
 
-    @server.tool(
+    @register_tool(
+        writes=False,
+        name="query_memory",
+        description=(
+            "PRIMARY recall — start here for 'what do we know about X'. RRF-fused FTS + vector + "
+            "temporal search over Chronicle events; works offline (FTS + temporal) when Ollama is "
+            "down, adds the vector channel automatically when it is up. The `degraded` flag reports "
+            "skipped channels. Independent of the external Mem0/Qdrant stack."
+        ),
+    )
+    def tool_query_memory(
+        query: QUERY_ARG,
+        domain: OPTIONAL_DOMAIN_ARG = None,
+        limit: LIMIT_ARG = 10,
+    ) -> dict:
+        return query_memory(manifest(), query=query, domain=domain, limit=limit)
+
+    @register_tool(
+        writes=False,
         name="sources_audit",
         description="Inspect source coverage, lane enablement, freshness, and trust metadata.",
     )
@@ -330,11 +607,13 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         return build_sources_audit(manifest(), domain_id=domain)
 
     if profile == CHRONICLER_PROFILE:
-        @server.tool(
+        @register_tool(
+            writes=True,
             name="activate_agent",
             description=(
-                "Capture current state if needed and return the universal activation prompt. "
-                "Calling this tool unlocks the chronicler write surface for the current session."
+                "DEPRECATED alias — prefer `startup_bundle` as the single session entry point. "
+                "Kept for transition: captures current state (capture=true by default) and returns "
+                "the universal activation prompt; also unlocks the chronicler write surface."
             ),
         )
         def tool_activate_agent(
@@ -348,7 +627,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             payload = build_activation(
                 manifest(),
                 domain_id=domain,
-                agent=agent,
+                agent=_normalize_agent(agent),
                 title=title,
                 focus=focus,
                 capture=capture,
@@ -356,10 +635,13 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             unlock_startup_gate(ctx)
             return payload
 
-        @server.tool(
+        @register_tool(
+            writes=True,
             name="record_event",
             description=(
                 "Write a durable Chronicle event and archive linked source files. "
+                "Unknown-but-well-formed categories are stored as `note` with a "
+                "`category_fallback` report instead of failing. "
                 f"{STARTUP_GATE_DESCRIPTION}"
             ),
         )
@@ -373,11 +655,11 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             source_files: SOURCE_FILES_ARG = None,
             ctx: Context | None = None,
         ) -> dict:
-            ensure_startup_gate(ctx, domain=domain, agent=agent)
+            require_startup_gate(ctx, tool_name="record_event", domain=domain)
             return record_event(
                 manifest(),
                 {
-                    "agent": agent,
+                    "agent": _normalize_agent(agent),
                     "domain": domain,
                     "category": category,
                     "project": project,
@@ -397,10 +679,13 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                 imported_from="max_chronicle.mcp.record_event",
             )
 
-        @server.tool(
+        @register_tool(
+            writes=True,
             name="capture_snapshot",
             description=(
-                "Capture live runtime state into Chronicle, archive evidence, and refresh projections. "
+                "Capture live runtime state into Chronicle, archive evidence, and refresh the "
+                "markdown projections (status.md and friends — the former render_projections tool "
+                "is folded in here). "
                 f"{STARTUP_GATE_DESCRIPTION}"
             ),
         )
@@ -411,120 +696,122 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             focus: OPTIONAL_FOCUS_ARG = None,
             ctx: Context | None = None,
         ) -> dict:
-            ensure_startup_gate(ctx, domain=domain, agent=agent)
+            require_startup_gate(ctx, tool_name="capture_snapshot", domain=domain)
             return capture_runtime_snapshot(
                 manifest(),
                 domain_id=domain,
-                agent=agent,
+                agent=_normalize_agent(agent),
                 title=title,
                 focus=focus,
             )
 
-        @server.tool(
-            name="normalize_entities",
+        @register_tool(
+            writes=True,
+            name="entity_admin",
             description=(
-                "Materialize normalized entities from Chronicle truth and runtime evidence. "
-                f"{STARTUP_GATE_DESCRIPTION}"
+                "Entity maintenance multiplexer — one tool for the rare admin operations. "
+                "action='report': read-only QA (alias/entity counts, fragmentation candidates like "
+                "Ivan/Ivan/Иван needing a merge). "
+                "action='normalize': materialize normalized entities from Chronicle truth. "
+                "action='alias': register an alternate spelling for a normalized entity "
+                "(requires alias_text + canonical_entity_id; NFKC+casefold key, so Ivan/IVAN/Иван "
+                "collapse into one active row per domain+type). "
+                "action='merge': fold one normalized entity into another (requires source_entity_id "
+                "+ target_entity_id + reason; aliases re-pointed, source marked inactive, v7 truth "
+                "tables untouched). "
+                f"Mutating actions only: {STARTUP_GATE_DESCRIPTION}"
             ),
         )
-        def tool_normalize_entities(domain: DOMAIN_ARG = "global", ctx: Context | None = None) -> dict:
-            ensure_startup_gate(ctx, domain=domain)
-            entities = materialize_normalized_entities(manifest(), domain_id=domain)
-            return {"domain": domain, "normalized_entities": entities, "count": len(entities)}
-
-        @server.tool(
-            name="build_situation_model",
-            description=(
-                "Materialize the latest situation model for a domain. "
-                f"{STARTUP_GATE_DESCRIPTION}"
-            ),
-        )
-        def tool_build_situation_model(domain: DOMAIN_ARG = "global", ctx: Context | None = None) -> dict:
-            ensure_startup_gate(ctx, domain=domain)
-            return materialize_situation_model(manifest(), domain_id=domain)
-
-        @server.tool(
-            name="run_lenses",
-            description=(
-                "Materialize deterministic lens runs for the latest situation model. "
-                f"{STARTUP_GATE_DESCRIPTION}"
-            ),
-        )
-        def tool_run_lenses(
-            domain: DOMAIN_ARG = "global",
-            persist: Annotated[bool, Field(description="When true, persist the lens runs to Chronicle.")] = True,
+        def tool_entity_admin(
+            action: Annotated[
+                Literal["report", "normalize", "alias", "merge"],
+                Field(description="Which entity operation to run."),
+            ],
+            domain: Annotated[
+                str | None,
+                Field(description="Domain scope for report/normalize/alias ('global' default where relevant)."),
+            ] = None,
+            alias_text: Annotated[str | None, Field(description="alias: human-facing alias text (e.g., 'Иван', 'Ivan').")] = None,
+            canonical_entity_id: Annotated[str | None, Field(description="alias: target normalized_entities.id (e.g., 'person:ivan').")] = None,
+            entity_type: Annotated[str, Field(description="alias: entity type ('person','company','project',…).")] = "person",
+            source: Annotated[str | None, Field(description="alias: origin label ('manual','llm','ingest').")] = "manual",
+            confidence: Annotated[float, Field(description="alias: confidence in [0..1].")] = 1.0,
+            alias_key_kind: Annotated[str, Field(description="alias: 'base' | 'compact' | 'translit' | 'diacritic_fold'.")] = "base",
+            source_entity_id: Annotated[str | None, Field(description="merge: normalized_entities.id to retire.")] = None,
+            target_entity_id: Annotated[str | None, Field(description="merge: normalized_entities.id to keep.")] = None,
+            reason: Annotated[str | None, Field(description="merge: why — stored in source metadata.")] = None,
+            actor: Annotated[str | None, Field(description="merge: operator/agent that triggered the merge.")] = None,
+            dry_run: Annotated[bool, Field(description="alias/merge: preview without writing.")] = False,
             ctx: Context | None = None,
         ) -> dict:
-            ensure_startup_gate(ctx, domain=domain)
-            runs = run_lenses(manifest(), domain_id=domain, persist=persist)
-            return {"domain": domain, "lens_runs": runs, "count": len(runs)}
+            if action == "report":
+                report = entity_resolution_report_service(manifest(), domain=domain)
+                return {**report, "action": "report"}
+            require_startup_gate(ctx, tool_name="entity_admin", domain=domain or "global")
+            if action == "normalize":
+                resolved_domain = domain or "global"
+                entities = materialize_normalized_entities(manifest(), domain_id=resolved_domain)
+                return {
+                    "action": "normalize",
+                    "domain": resolved_domain,
+                    "normalized_entities": entities,
+                    "count": len(entities),
+                }
+            if action == "alias":
+                if not alias_text or not canonical_entity_id:
+                    raise ValueError("action='alias' requires alias_text and canonical_entity_id.")
+                result = add_entity_alias_service(
+                    manifest(),
+                    alias_text=alias_text,
+                    canonical_entity_id=canonical_entity_id,
+                    entity_type=entity_type,
+                    domain=domain or "global",
+                    source=source,
+                    confidence=confidence,
+                    alias_key_kind=alias_key_kind,
+                    dry_run=dry_run,
+                )
+                return {**result, "action": "alias", "alias_action": result.get("action")}
+            if action == "merge":
+                if not source_entity_id or not target_entity_id or not reason:
+                    raise ValueError("action='merge' requires source_entity_id, target_entity_id, and reason.")
+                result = merge_entities_service(
+                    manifest(),
+                    source_entity_id=source_entity_id,
+                    target_entity_id=target_entity_id,
+                    reason=reason,
+                    actor=actor,
+                    dry_run=dry_run,
+                )
+                return {**result, "action": "merge"}
+            raise ValueError(f"Unknown entity_admin action: {action}")
 
-        @server.tool(
-            name="record_scenario",
+        @register_tool(
+            writes=False,
+            name="search_mem0_live",
             description=(
-                "Store a what-if scenario against the latest situation model. "
-                f"{STARTUP_GATE_DESCRIPTION}"
+                "Live semantic search over Mem0 (Qdrant + Gemini embeddings) via scripts/mem0_bridge.py. "
+                "Fail-closed: timeouts, non-zero exits, or unparseable output return status='degraded' with "
+                "results=[] instead of raising, so Chronicle stays usable when Mem0 is down."
             ),
         )
-        def tool_record_scenario(
-            name: SCENARIO_NAME_ARG,
-            assumptions: ASSUMPTIONS_ARG,
-            domain: DOMAIN_ARG = "global",
-            changed_variables: CHANGED_VARIABLES_ARG = None,
-            expected_outcomes: EXPECTED_OUTCOMES_ARG = None,
-            failure_modes: FAILURE_MODES_ARG = None,
-            confidence: CONFIDENCE_ARG = 0.6,
-            review_due_at: REVIEW_DUE_AT_ARG = None,
-            ctx: Context | None = None,
+        def tool_search_mem0_live(
+            query: Annotated[str, Field(description="Semantic query text.")],
+            limit: Annotated[int, Field(description="Max results (default 10).")] = 10,
+            collection: Annotated[Literal["personal", "digest", "both"], Field(description="Which Mem0 collection to query.")] = "personal",
+            category: Annotated[str | None, Field(description="Optional metadata.category filter.")] = None,
+            timeout_s: Annotated[float | None, Field(description="Override bridge timeout (seconds).")] = None,
         ) -> dict:
-            ensure_startup_gate(ctx, domain=domain)
-            return record_scenario(
+            return search_mem0_live_service(
                 manifest(),
-                domain_id=domain,
-                scenario_name=name,
-                assumptions=assumptions,
-                changed_variables=changed_variables,
-                expected_outcomes=expected_outcomes,
-                failure_modes=failure_modes,
-                confidence=confidence,
-                review_due_at=review_due_at,
+                query=query,
+                limit=limit,
+                collection=collection,
+                category=category,
+                timeout_s=timeout_s,
             )
 
-        @server.tool(
-            name="review_scenario",
-            description=(
-                "Store a replay/eval review for a previously recorded scenario. "
-                f"{STARTUP_GATE_DESCRIPTION}"
-            ),
-        )
-        def tool_review_scenario(
-            scenario_id: SCENARIO_ID_ARG,
-            status: STATUS_ARG,
-            summary: SUMMARY_ARG,
-            outcome_event_id: OUTCOME_EVENT_ID_ARG = None,
-            ctx: Context | None = None,
-        ) -> dict:
-            ensure_startup_gate(ctx)
-            return review_scenario(
-                manifest(),
-                scenario_id=scenario_id,
-                status=status,
-                review_summary=summary,
-                outcome_event_id=outcome_event_id,
-            )
-
-        @server.tool(
-            name="render_projections",
-            description=(
-                "Render markdown projections from the latest Chronicle snapshot. "
-                f"{STARTUP_GATE_DESCRIPTION}"
-            ),
-        )
-        def tool_render_projections(ctx: Context | None = None) -> list[dict]:
-            ensure_startup_gate(ctx)
-            return render_projections(manifest())
-
-    @server.prompt(
+    @register_prompt(
         name="activate",
         description="Return the current activation prompt for a new agent.",
     )
@@ -532,7 +819,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         activation = build_activation(manifest(), domain_id=domain, agent="mcp-prompt", capture=False)
         return [{"role": "user", "content": activation["prompt"]}]
 
-    @server.prompt(
+    @register_prompt(
         name="continue_work",
         description="Provide a compact continuation brief for ongoing work.",
     )
@@ -541,7 +828,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         content = json.dumps(state, ensure_ascii=False, indent=2)
         return [{"role": "user", "content": f"Continue from this Chronicle state:\n{content}"}]
 
-    @server.prompt(
+    @register_prompt(
         name="reconstruct_moment",
         description="Provide the timeline state around a specific timestamp.",
     )
@@ -580,7 +867,48 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
     parser = build_parser()
     parser.set_defaults(profile=default_profile)
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     server = build_server(args.manifest, profile=args.profile)
+    endpoint = args.transport
+    if args.transport in ("sse", "streamable-http"):
+        host = os.environ.get("MCP_HOST", "127.0.0.1")
+        port = int(os.environ.get("MCP_PORT", "8000"))
+        allowed_hosts = [
+            host,
+            f"{host}:*",
+            "127.0.0.1",
+            "127.0.0.1:*",
+            "localhost",
+            "localhost:*",
+            "[::1]",
+            "[::1]:*",
+        ]
+        allowed_hosts.extend(
+            item.strip() for item in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if item.strip()
+        )
+        server.settings.host = host
+        server.settings.port = port
+        server.settings.transport_security = TransportSecuritySettings(allowed_hosts=allowed_hosts)
+        endpoint = f"{args.transport} {host}:{port}"
+    try:
+        db_path = str(config_from_manifest(load_manifest(args.manifest)).db_path)
+    except Exception as exc:  # noqa: BLE001 — the banner must never block startup
+        db_path = f"<unresolved: {exc}>"
+    # Startup banner: with no banner and WARNING-level logs, restarts were
+    # invisible — an empty err.log looked like health when it proved nothing.
+    _LOGGER.info(
+        "chronicle-mcp starting: version=%s pid=%d profile=%s transport=%s db=%s manifest=%s",
+        __version__,
+        os.getpid(),
+        args.profile,
+        endpoint,
+        db_path,
+        args.manifest,
+    )
     server.run(transport=args.transport)
     return 0
 

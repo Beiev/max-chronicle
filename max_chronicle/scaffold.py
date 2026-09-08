@@ -69,9 +69,9 @@ def _write_executable(
 
 
 def _manifest_template(root: Path, timezone_name: str) -> str:
-    runtime_root = root / "runtime"
     workspaces_root = root / "workspaces"
     docs_root = root / "docs"
+    runtime_root = root / "runtime"
     return f"""version = 1
 title = "Chronicle Workspace"
 
@@ -89,20 +89,10 @@ mem0_dump = "{_path(root / 'mem0-dump.json')}"
 mem0_bridge = "{_path(root / 'scripts' / 'mem0_bridge.py')}"
 env_file = "{_path(root / '.env')}"
 workspace_root = "{_path(workspaces_root)}"
-openclaw_memory_dir = "{_path(runtime_root / 'openclaw' / 'memory')}"
-openclaw_state_json = "{_path(runtime_root / 'openclaw' / 'state.json')}"
-openclaw_brief_json = "{_path(runtime_root / 'openclaw' / 'morning-brief.json')}"
-openclaw_leads_json = "{_path(runtime_root / 'openclaw' / 'leads.json')}"
-openclaw_email_triage_json = "{_path(runtime_root / 'openclaw' / 'email-triage-latest.json')}"
-digest_status_json = "{_path(runtime_root / 'digest' / 'last_status.json')}"
-digest_synthesis_md = "{_path(runtime_root / 'digest' / 'synthesis.md')}"
-digest_previous_summary = "{_path(runtime_root / 'digest' / 'previous_summary.txt')}"
-company_intel_json = "{_path(root / 'company-intel.json')}"
 portfolio_asset_manifest = "{_path(runtime_root / 'portfolio' / 'asset-manifest.ts')}"
 portfolio_repo = "{_path(workspaces_root / 'portfolio')}"
-remotion_repo = "{_path(workspaces_root / 'remotion')}"
-fcp_sorter_repo = "{_path(workspaces_root / 'fcp-sorter')}"
-intel_digest_repo = "{_path(workspaces_root / 'intel-digest')}"
+render_repo = "{_path(workspaces_root / 'renderkit')}"
+media_sorter_repo = "{_path(workspaces_root / 'media-sorter')}"
 
 [[lanes]]
 id = "work"
@@ -162,87 +152,6 @@ owner = "chronicle"
 questions_it_can_answer = ["What asset readiness or missing-media signals exist right now?"]
 questions_it_cannot_answer = ["Anything outside the portfolio/media pipeline."]
 
-[[runtime_sources]]
-id = "openclaw_state_json"
-label = "Agent Runtime State"
-path_key = "openclaw_state_json"
-lane = "agents"
-trust_tier = "canonical"
-owner = "system"
-questions_it_can_answer = ["What does the latest agent runtime state say?"]
-questions_it_cannot_answer = ["Whether the current strategy is correct without corroboration."]
-
-[[runtime_sources]]
-id = "openclaw_brief_json"
-label = "Agent Morning Brief"
-path_key = "openclaw_brief_json"
-lane = "agents"
-trust_tier = "canonical"
-owner = "system"
-questions_it_can_answer = ["What was the latest operator-facing brief?"]
-questions_it_cannot_answer = ["Canonical truth when Chronicle disagrees."]
-
-[[runtime_sources]]
-id = "openclaw_leads_json"
-label = "Leads / Queue"
-path_key = "openclaw_leads_json"
-lane = "career_market"
-trust_tier = "canonical"
-owner = "system"
-questions_it_can_answer = ["Which queued items or leads are active right now?"]
-questions_it_cannot_answer = ["Whether a queued item is strategically valuable on its own."]
-
-[[runtime_sources]]
-id = "company_intel_json"
-label = "Company Intel"
-path_key = "company_intel_json"
-lane = "companies"
-trust_tier = "reference"
-owner = "chronicle"
-questions_it_can_answer = ["What company-level supporting context exists?"]
-questions_it_cannot_answer = ["Canonical truth without corroboration."]
-
-[[runtime_sources]]
-id = "digest_status_json"
-label = "Digest Status"
-path_key = "digest_status_json"
-lane = "world"
-trust_tier = "canonical"
-owner = "chronicle"
-questions_it_can_answer = ["Did the external digest run successfully?"]
-questions_it_cannot_answer = ["Current project truth."]
-
-[[runtime_sources]]
-id = "digest_synthesis_md"
-label = "Digest Synthesis"
-path_key = "digest_synthesis_md"
-lane = "world"
-trust_tier = "reference"
-owner = "chronicle"
-questions_it_can_answer = ["What external developments are currently salient?"]
-questions_it_cannot_answer = ["Directly verified first-party truth."]
-
-[[runtime_sources]]
-id = "digest_previous_summary"
-label = "Digest Previous Summary"
-path_key = "digest_previous_summary"
-lane = "world"
-trust_tier = "reference"
-owner = "chronicle"
-questions_it_can_answer = ["What was salient in the prior digest window?"]
-questions_it_cannot_answer = ["The latest real-time external state."]
-
-[[runtime_sources]]
-id = "openclaw_email_triage_json"
-label = "Email Triage"
-path_key = "openclaw_email_triage_json"
-lane = "life_admin"
-trust_tier = "canonical"
-owner = "system"
-enabled = false
-questions_it_can_answer = ["What inbox/admin obligations are visible in recent triage output?"]
-questions_it_cannot_answer = ["Anything outside explicit opt-in for the life_admin lane."]
-
 [freshness.attach_sources.status]
 live_hours = 12
 recent_hours = 72
@@ -257,10 +166,6 @@ stale_hours = 240
 live_hours = 12
 recent_hours = 72
 stale_hours = 168
-
-[freshness.attach_sources.openclaw_runbook]
-recent_hours = 240
-stale_hours = 1440
 
 [freshness.attach_sources.memory_system]
 recent_hours = 240
@@ -329,15 +234,6 @@ kind = "markdown"
 role = "pipeline_metrics"
 trust_tier = "operator_curated"
 priority = 80
-
-[[sources]]
-id = "openclaw_runbook"
-label = "Agent Runbook"
-path = "{_path(root / 'OPENCLAW-RUNBOOK.md')}"
-kind = "markdown"
-role = "ops"
-trust_tier = "reference"
-priority = 70
 
 [[sources]]
 id = "memory_system"
@@ -418,7 +314,7 @@ mem0_queries = [
 [[domains]]
 id = "job_search"
 label = "Pipeline / Outreach"
-source_ids = ["status", "priorities", "job_search", "openclaw_runbook", "chronicle_protocol"]
+source_ids = ["status", "priorities", "job_search", "chronicle_protocol"]
 mem0_queries = [
   "job search pipeline leads outreach",
   "active queue status",
@@ -452,15 +348,6 @@ launchd_log_dir = "{_path(root / 'logs' / 'launchd')}"
 daybook_dir = "{_path(root / 'daybooks')}"
 git_hooks_dir = "{_path(root / 'git-hooks')}"
 
-[minimax]
-base_url = "https://api.minimax.io/v1"
-model = "MiniMax-M2.7"
-temperature = 0.2
-max_tokens = 3200
-timeout_seconds = 45
-max_retries = 3
-retry_base_delay = 2.0
-
 [guards]
 daybook_per_day = 1
 weekly_audit_per_week = 1
@@ -468,27 +355,24 @@ backup_interval_days = 2
 projection_stale_hours = 36
 snapshot_stale_hours = 30
 mem0_sync_batch_size = 25
-minimax_canary_stale_hours = 36
+jsonl_rotate_mb = 25
+artifact_store_warn_gb = 6
 
 [[repos]]
 slug = "status"
 path = "{_path(root)}"
 
 [[repos]]
-slug = "intel-digest"
-path = "{_path(workspaces_root / 'intel-digest')}"
-
-[[repos]]
 slug = "portfolio"
 path = "{_path(workspaces_root / 'portfolio')}"
 
 [[repos]]
-slug = "remotion"
-path = "{_path(workspaces_root / 'remotion')}"
+slug = "renderkit"
+path = "{_path(workspaces_root / 'renderkit')}"
 
 [[repos]]
-slug = "fcp-sorter"
-path = "{_path(workspaces_root / 'fcp-sorter')}"
+slug = "media-sorter"
+path = "{_path(workspaces_root / 'media-sorter')}"
 
 [jobs.daily_capture]
 hour = 2
@@ -504,16 +388,6 @@ throttle_seconds = 600
 hour = 7
 minute = 0
 throttle_seconds = 900
-
-[jobs.company_intel]
-hour = 7
-minute = 10
-throttle_seconds = 900
-
-[jobs.minimax_canary]
-hour = 22
-minute = 40
-throttle_seconds = 600
 
 [jobs.weekly_audit]
 weekday = 0
@@ -775,12 +649,11 @@ def scaffold_workspace(
         resolved_root / "job-search-status.md": _job_search_template(),
         resolved_root / "MEMORY_SYSTEM.md": _memory_system_template(),
         resolved_root / "CHRONICLE_PROTOCOL.md": _protocol_template(resolved_root),
-        resolved_root / "OPENCLAW-RUNBOOK.md": _runbook_template(),
         resolved_root / "docs" / "ADR-0001-canonical-memory.md": _adr_template(),
         resolved_root / "docs" / "SCHEMA_V1.md": _schema_template(),
         resolved_root / "docs" / "IMPLEMENTATION_CHECKLIST.md": _checklist_template(),
         resolved_root / ".gitignore": _gitignore_template(),
-        resolved_root / ".env.example": "# Optional secrets for Chronicle integrations.\n# MINIMAX_API_KEY=\n",
+        resolved_root / ".env.example": "# Optional secrets for Chronicle integrations.\n",
         resolved_root / "ssot-ledger.jsonl": "",
         resolved_root / "chronicle-snapshots.jsonl": "",
     }
@@ -795,19 +668,11 @@ def scaffold_workspace(
             "collections": {},
             "memories": [],
         },
-        resolved_root / "company-intel.json": {"companies": {}, "lead_companies": {"with_intel": [], "without_intel": []}},
-        resolved_root / "runtime" / "openclaw" / "state.json": {},
-        resolved_root / "runtime" / "openclaw" / "morning-brief.json": {},
-        resolved_root / "runtime" / "openclaw" / "leads.json": [],
-        resolved_root / "runtime" / "openclaw" / "email-triage-latest.json": {},
-        resolved_root / "runtime" / "digest" / "last_status.json": {},
     }
     for path, payload in json_files.items():
         _write_json(path, payload, created=created, skipped=skipped, force=force)
 
     text_files = {
-        resolved_root / "runtime" / "digest" / "synthesis.md": "# Digest Synthesis\n\nPlaceholder.\n",
-        resolved_root / "runtime" / "digest" / "previous_summary.txt": "Placeholder.\n",
         resolved_root / "runtime" / "portfolio" / "asset-manifest.ts": "export const assetManifest = {};\n",
     }
     for path, content in text_files.items():
@@ -821,12 +686,10 @@ def scaffold_workspace(
         resolved_root / "logs" / "launchd",
         resolved_root / "runtime" / "launch-agents",
         resolved_root / "runtime" / "launchd",
-        resolved_root / "runtime" / "openclaw" / "memory",
         resolved_root / "workspaces",
         resolved_root / "workspaces" / "portfolio",
-        resolved_root / "workspaces" / "remotion",
-        resolved_root / "workspaces" / "fcp-sorter",
-        resolved_root / "workspaces" / "intel-digest",
+        resolved_root / "workspaces" / "renderkit",
+        resolved_root / "workspaces" / "media-sorter",
         resolved_root / "scripts",
     ):
         directory.mkdir(parents=True, exist_ok=True)

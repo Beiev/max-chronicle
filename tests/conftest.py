@@ -10,6 +10,17 @@ import pytest
 
 from max_chronicle.automation import load_automation_config
 from max_chronicle.runtime_context import load_manifest
+from max_chronicle.store import reset_migration_cache
+
+# Anchor on the checkout, not on one machine's absolute path.
+CHRONICLE_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "max_chronicle"
+
+
+@pytest.fixture(autouse=True)
+def _reset_migration_cache():
+    reset_migration_cache()
+    yield
+    reset_migration_cache()
 
 
 @dataclass
@@ -20,9 +31,9 @@ class ChronicleSandbox:
     automation_path: Path
     digest_repo: Path
     portfolio_repo: Path
-    remotion_repo: Path
-    fcp_repo: Path
-    openclaw_root: Path
+    render_repo: Path
+    media_sorter_repo_path: Path
+    agenthub_root: Path
     backup_root: Path
 
     @property
@@ -63,7 +74,7 @@ def _status_sources(status_root: Path) -> None:
     )
     _write(status_root / "job-search-status.md", "# Job Search Status\n\nPlaceholder.\n")
     _write(status_root / "ECOSYSTEM.md", "# Ecosystem\n\n## Agents & Zones\n- Chronicle only.\n")
-    _write(status_root / "OPENCLAW-RUNBOOK.md", "# OpenClaw Runbook\n\nPlaceholder.\n")
+    _write(status_root / "AGENT-RUNBOOK.md", "# AgentHub Runbook\n\nPlaceholder.\n")
     _write(status_root / "MEMORY_SYSTEM.md", "# Memory System\n\n## 1. Truth Model\n- Chronicle is truth.\n\n## 2. Main Layers\n- SSOT is small.\n\n## 5. How Mem0 Works In This System\n- Mem0 is derived.\n\n## 7. How Activation Works\n- Use chronicle activate.\n")
     _write(status_root / "CODEX_MEM0_PROTOCOL.md", "# Archived\n\nDeprecated.\n")
     _write(status_root / "CHRONICLE_PROTOCOL.md", "# Chronicle Protocol\n\n## Command Surface\n- Native CLI.\n\n## Data Model\n- Chronicle is truth.\n\n## Operational Constraint\n- Mem0 can lag.\n")
@@ -90,25 +101,15 @@ ledger_file = "{sandbox.status_root / 'ssot-ledger.jsonl'}"
 snapshot_file = "{sandbox.status_root / 'chronicle-snapshots.jsonl'}"
 chronicle_db = "{sandbox.status_root / 'chronicle.db'}"
 chronicle_artifact_dir = "{sandbox.status_root / 'chronicle-artifacts'}"
-chronicle_package_root = "/Users/maksymbeiev/Projects/status/max_chronicle"
+chronicle_package_root = "{CHRONICLE_PACKAGE_ROOT}"
 mem0_dump = "{sandbox.status_root / 'mem0-dump.json'}"
 mem0_bridge = "{sandbox.status_root / 'scripts' / 'mem0_bridge.py'}"
-env_file = "{sandbox.digest_repo / '.env'}"
 workspace_root = "{sandbox.root}"
-openclaw_memory_dir = "{sandbox.openclaw_root / 'workspace' / 'memory'}"
-openclaw_state_json = "{sandbox.openclaw_root / 'workspace' / 'memory' / 'state.json'}"
-openclaw_brief_json = "{sandbox.openclaw_root / 'workspace' / 'memory' / 'morning-brief.json'}"
-openclaw_leads_json = "{sandbox.openclaw_root / 'workspace' / 'memory' / 'leads.json'}"
-openclaw_email_triage_json = "{sandbox.openclaw_root / 'workspace' / 'memory' / 'email-triage-latest.json'}"
-digest_status_json = "{sandbox.digest_repo / 'data' / 'last_status.json'}"
-digest_synthesis_md = "{sandbox.digest_repo / 'data' / 'analysis_ua' / 'synthesis.md'}"
-digest_previous_summary = "{sandbox.digest_repo / 'data' / 'previous_summary.txt'}"
 company_intel_json = "{sandbox.status_root / 'company-intel.json'}"
 portfolio_asset_manifest = "{sandbox.portfolio_repo / 'src' / 'data' / 'asset-manifest.ts'}"
 portfolio_repo = "{sandbox.portfolio_repo}"
-remotion_repo = "{sandbox.remotion_repo}"
-fcp_sorter_repo = "{sandbox.fcp_repo}"
-intel_digest_repo = "{sandbox.digest_repo}"
+render_repo = "{sandbox.render_repo}"
+media_sorter_repo = "{sandbox.media_sorter_repo_path}"
 
 [[lanes]]
 id = "work"
@@ -169,36 +170,6 @@ questions_it_can_answer = ["What portfolio asset gaps exist?"]
 questions_it_cannot_answer = ["Anything outside portfolio asset readiness."]
 
 [[runtime_sources]]
-id = "openclaw_state_json"
-label = "OpenClaw State"
-path_key = "openclaw_state_json"
-lane = "agents"
-trust_tier = "canonical"
-owner = "system"
-questions_it_can_answer = ["What is the autonomous runtime state?"]
-questions_it_cannot_answer = ["Whether strategy is correct without corroboration."]
-
-[[runtime_sources]]
-id = "openclaw_brief_json"
-label = "OpenClaw Morning Brief"
-path_key = "openclaw_brief_json"
-lane = "agents"
-trust_tier = "canonical"
-owner = "system"
-questions_it_can_answer = ["What did OpenClaw last brief?"]
-questions_it_cannot_answer = ["Durable truth when Chronicle disagrees."]
-
-[[runtime_sources]]
-id = "openclaw_leads_json"
-label = "OpenClaw Leads"
-path_key = "openclaw_leads_json"
-lane = "career_market"
-trust_tier = "canonical"
-owner = "system"
-questions_it_can_answer = ["Which leads are in the pipeline?"]
-questions_it_cannot_answer = ["Whether a lead is strategically good on its own."]
-
-[[runtime_sources]]
 id = "company_intel_json"
 label = "Company Intel"
 path_key = "company_intel_json"
@@ -208,50 +179,13 @@ owner = "chronicle"
 questions_it_can_answer = ["Which company-level supporting context exists?"]
 questions_it_cannot_answer = ["Canonical truth without corroboration."]
 
-[[runtime_sources]]
-id = "digest_status_json"
-label = "Digest Status"
-path_key = "digest_status_json"
-lane = "world"
-trust_tier = "canonical"
-owner = "chronicle"
-questions_it_can_answer = ["Did the world digest run successfully?"]
-questions_it_cannot_answer = ["Current project truth."]
-
-[[runtime_sources]]
-id = "digest_synthesis_md"
-label = "Digest Synthesis"
-path_key = "digest_synthesis_md"
-lane = "world"
-trust_tier = "reference"
-owner = "chronicle"
-questions_it_can_answer = ["What external developments are currently salient?"]
-questions_it_cannot_answer = ["Directly verified first-party truth."]
-
-[[runtime_sources]]
-id = "digest_previous_summary"
-label = "Digest Previous Summary"
-path_key = "digest_previous_summary"
-lane = "world"
-trust_tier = "reference"
-owner = "chronicle"
-questions_it_can_answer = ["What was salient in the prior digest window?"]
-questions_it_cannot_answer = ["The latest real-time external state."]
-
-[[runtime_sources]]
-id = "openclaw_email_triage_json"
-label = "Email Triage"
-path_key = "openclaw_email_triage_json"
-lane = "life_admin"
-trust_tier = "canonical"
-owner = "system"
-enabled = false
-questions_it_can_answer = ["What inbox/admin obligations are visible?"]
-questions_it_cannot_answer = ["Anything outside explicit life_admin opt-in."]
-
 [freshness.runtime_evidence.portfolio_asset_manifest]
 recent_hours = 168
-stale_hours = 720
+stale_hours = 999999
+
+[freshness.runtime_evidence.company_intel_json]
+recent_hours = 999999
+stale_hours = 999999
 
 [freshness.attach_sources.status]
 live_hours = 12
@@ -299,15 +233,6 @@ kind = "markdown"
 role = "pipeline_metrics"
 trust_tier = "operator_curated"
 priority = 80
-
-[[sources]]
-id = "openclaw_runbook"
-label = "OpenClaw Runbook"
-path = "{sandbox.status_root / 'OPENCLAW-RUNBOOK.md'}"
-kind = "markdown"
-role = "ops"
-trust_tier = "reference"
-priority = 70
 
 [[sources]]
 id = "memory_system"
@@ -378,21 +303,12 @@ title = "Chronicle Native Automation Tests"
 
 [paths]
 backup_root = "{sandbox.backup_root}"
-env_file = "{sandbox.digest_repo / '.env'}"
+env_file = "{sandbox.status_root / '.env'}"
 launch_agent_dir = "{sandbox.root / 'LaunchAgents'}"
 launchd_runtime_dir = "{sandbox.status_root / 'runtime' / 'launchd'}"
 launchd_log_dir = "{sandbox.status_root / 'logs' / 'launchd'}"
 daybook_dir = "{sandbox.status_root / 'daybooks'}"
 git_hooks_dir = "{sandbox.status_root / 'git-hooks'}"
-
-[minimax]
-base_url = "https://api.minimax.io/v1"
-model = "MiniMax-M2.7"
-temperature = 0.2
-max_tokens = 2000
-timeout_seconds = 5
-max_retries = 1
-retry_base_delay = 0.1
 
 [guards]
 daybook_per_day = 1
@@ -401,27 +317,28 @@ backup_interval_days = 2
 projection_stale_hours = 36
 snapshot_stale_hours = 30
 mem0_sync_batch_size = 10
-minimax_canary_stale_hours = 36
+jsonl_rotate_mb = 25
+artifact_store_warn_gb = 6
 
 [[repos]]
 slug = "status"
 path = "{sandbox.status_root}"
 
 [[repos]]
-slug = "intel-digest"
+slug = "news-digest"
 path = "{sandbox.digest_repo}"
 
 [[repos]]
-slug = "rzmrn-portfolio"
+slug = "demo-portfolio"
 path = "{sandbox.portfolio_repo}"
 
 [[repos]]
-slug = "fcp-sorter"
-path = "{sandbox.fcp_repo}"
+slug = "media-sorter"
+path = "{sandbox.media_sorter_repo_path}"
 
 [[repos]]
-slug = "remotion"
-path = "{sandbox.remotion_repo}"
+slug = "renderkit"
+path = "{sandbox.render_repo}"
 
 [jobs.daily_capture]
 hour = 2
@@ -437,16 +354,6 @@ throttle_seconds = 600
 hour = 7
 minute = 0
 throttle_seconds = 900
-
-[jobs.company_intel]
-hour = 7
-minute = 10
-throttle_seconds = 900
-
-[jobs.minimax_canary]
-hour = 22
-minute = 40
-throttle_seconds = 600
 
 [jobs.weekly_audit]
 weekday = 0
@@ -469,12 +376,12 @@ def chronicle_sandbox(tmp_path: Path) -> ChronicleSandbox:
         status_root=tmp_path / "status",
         manifest_path=tmp_path / "status" / "SSOT_MANIFEST.toml",
         automation_path=tmp_path / "status" / "CHRONICLE_AUTOMATION.toml",
-        digest_repo=tmp_path / "intel-digest",
-        portfolio_repo=tmp_path / "rzmrn-portfolio",
-        remotion_repo=tmp_path / "remotion",
-        fcp_repo=tmp_path / "fcp-sorter",
-        openclaw_root=tmp_path / ".openclaw",
-        backup_root=tmp_path / "Volumes" / "T9" / "RZMRN-Chronicle-Backups",
+        digest_repo=tmp_path / "news-digest",
+        portfolio_repo=tmp_path / "demo-portfolio",
+        render_repo=tmp_path / "renderkit",
+        media_sorter_repo_path=tmp_path / "media-sorter",
+        agenthub_root=tmp_path / ".agenthub",
+        backup_root=tmp_path / "Volumes" / "BackupDrive" / "Chronicle-Backups",
     )
 
     _status_sources(sandbox.status_root)
@@ -496,46 +403,11 @@ def chronicle_sandbox(tmp_path: Path) -> ChronicleSandbox:
             "src/data/asset-manifest.ts": 'export const assetManifest = {\n  "case-study": {\n    hero: null, // STATUS: missing\n  },\n};\n',
         },
     )
-    _init_repo(sandbox.remotion_repo, files={"README.md": "# Remotion\n"})
-    _init_repo(sandbox.fcp_repo, files={"README.md": "# FCP\n"})
+    _init_repo(sandbox.render_repo, files={"README.md": "# RenderKit\n"})
+    _init_repo(sandbox.media_sorter_repo_path, files={"README.md": "# Media Sorter\n"})
 
-    _json(
-        sandbox.digest_repo / "data" / "last_status.json",
-        {
-            "status": "ok",
-            "timestamp": "2026-03-15T13:12:46.393298+00:00",
-            "sources_ok": 12,
-            "sources_total": 12,
-            "items": 42,
-            "elapsed_seconds": 321.1,
-            "deployed": True,
-        },
-    )
-    _write(sandbox.digest_repo / "logs" / "digest_2026-03-15_1312.log", "Digest run log\n")
 
-    _json(
-        sandbox.openclaw_root / "workspace" / "memory" / "state.json",
-        {
-            "jobs_found_today": 3,
-            "applications_sent_today": 1,
-            "gpt_calls_today": 2,
-            "pipeline_counts": {"found": 3, "shortlisted": 2, "cl_written": 1, "applied": 1},
-        },
-    )
-    _json(
-        sandbox.openclaw_root / "workspace" / "memory" / "morning-brief.json",
-        {"last_scout": "2026-03-15", "last_nightly": "2026-03-15", "last_backup": "2026-03-15"},
-    )
-    _json(
-        sandbox.openclaw_root / "workspace" / "memory" / "leads.json",
-        [{"company": "Example", "role": "Producer", "status": "shortlisted"}],
-    )
-    _json(
-        sandbox.openclaw_root / "workspace" / "memory" / "email-triage-latest.json",
-        {"items": [{"subject": "Utility bill", "status": "needs-attention"}]},
-    )
-    _write(sandbox.openclaw_root / "workspace" / "memory" / "2026-03-15.md", "Daily memory log.\n")
-
+    _write(sandbox.status_root / ".env", "# Chronicle test env\n")
     _write(sandbox.status_root / "scripts" / "ssot_hub.py", "#!/usr/bin/env python3\nprint('sync ok')\n")
     _write(sandbox.status_root / "scripts" / "chronicle", "#!/bin/zsh\nexec python3 -m max_chronicle.cli \"$@\"\n")
     (sandbox.status_root / "scripts" / "chronicle").chmod(0o755)

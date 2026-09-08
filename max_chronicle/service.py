@@ -1,14 +1,28 @@
 from __future__ import annotations
 
-from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
+import unicodedata
 from typing import Any
 
-from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION
+from .config import (
+    ACTIVATION_CONTRACT_NAME,
+    ACTIVATION_CONTRACT_VERSION,
+    DEFAULT_EVENT_DEDUP_WINDOW_HOURS,
+    DEFAULT_MEM0_LIVE_TIMEOUT_S,
+    ENV_EVENT_DEDUP_WINDOW_HOURS,
+    ENV_FEATURE_ENTITY_ALIASES,
+    ENV_FEATURE_EVENT_HASH_DEDUP,
+    ENV_FEATURE_MEM0_LIVE_SEARCH,
+    ENV_MEM0_LIVE_TIMEOUT_S,
+    env_float,
+    env_int,
+    feature_enabled,
+)
 from .db import database_summary
 from .projections import render_job_search_status, render_status_generated_block, update_status_file
 from .runtime_context import (
@@ -33,8 +47,14 @@ from .runtime_context import (
     utc_now,
 )
 from .store import (
+    _atomic_write_text,
+    add_entity_alias,
     config_from_manifest,
+    DEFAULT_STALE_RUN_TTL_HOURS,
+    entity_alias_stats,
+    fetch_all_event_embeddings,
     fetch_event,
+    fetch_event_ids_without_embedding,
     fetch_latest_projection_run,
     fetch_latest_snapshot,
     fetch_latest_situation_model,
@@ -43,21 +63,23 @@ from .store import (
     fetch_project_events,
     fetch_recent_events,
     fetch_relations_for_entity,
-    fetch_scenario_runs,
-    fetch_situation_model,
-    fetch_forecast_reviews,
+    find_entity_alias_by_key,
+    find_event_by_content_hash_recent,
     finish_ingest_run,
     link_artifact,
+    list_entity_aliases,
     mark_missing_normalized_entities_inactive,
+    mark_stale_running_runs,
+    merge_normalized_entities,
     open_connection,
+    persist_staged_artifact,
     search_events,
+    stage_artifact_from_path,
+    set_entity_alias_status,
     start_ingest_run,
-    store_forecast_review,
-    store_lens_run,
-    store_scenario_run,
-    store_situation_model,
     store_artifact_from_path,
     store_event,
+    store_event_embedding,
     store_projection_run,
     store_snapshot,
     timeline_state,
@@ -65,10 +87,12 @@ from .store import (
     update_event_memory_guard,
     upsert_normalized_entity,
     upsert_relation,
+    write_transaction,
 )
 
 
 VALID_CATEGORY_RE = re.compile(r"^[a-z0-9_.-]{2,64}$")
+ENV_FEATURE_EVENT_EMBEDDINGS = "CHRONICLE_FEATURE_EVENT_EMBEDDINGS"
 VALID_RELATION_RE = re.compile(r"^[a-z_]+$")
 FRESHNESS_THRESHOLDS_HOURS = {
     "live": 6,
@@ -89,11 +113,6 @@ FRESHNESS_RANK = {
     "archival": 1,
     "unknown": 0,
 }
-STRATEGY_SOURCE_PREFERENCE = {
-    "priorities": 3,
-    "status": 2,
-    "job_search": 1,
-}
 VALID_TRUST_TIERS = frozenset(TRUST_TIER_RANK)
 CANONICAL_EVENT_CATEGORIES = frozenset(
     {
@@ -113,6 +132,8 @@ CANONICAL_EVENT_CATEGORIES = frozenset(
         "state_change",
         "observation",
         "research",
+        "insight",
+        "constraint",
     }
 )
 CATEGORY_ALIASES = {
@@ -128,7 +149,9 @@ MCP_MEM0_NOISE_CATEGORIES = frozenset(
 )
 MEMORY_GUARD_VERSION = "2026-03-22.v1"
 MEMORY_GUARD_SCOPED_CATEGORIES = frozenset({"note", "state_change", "maintenance", "observation"})
-MEMORY_GUARD_EVIDENCE_CATEGORIES = frozenset({"decision", "milestone", "blocker", "implementation", "architecture_insight", "workflow"})
+MEMORY_GUARD_EVIDENCE_CATEGORIES = frozenset(
+    {"decision", "milestone", "blocker", "implementation", "architecture_insight", "workflow", "insight", "constraint"}
+)
 MEMORY_GUARD_PROTOCOL_TERMS = (
     "agent",
     "session",
@@ -156,7 +179,6 @@ QUERY_MODES = (
     "truth_plus_interpretation_plus_scenarios",
 )
 DEFAULT_QUERY_MODE = "truth_plus_interpretation"
-FIXED_LENSES = ("operator", "strategist", "risk", "market", "systems")
 LANE_DEFAULTS: dict[str, dict[str, Any]] = {
     "work": {
         "label": "Work",
@@ -321,14 +343,7 @@ GENERIC_COMPANY_ALIASES = {
 }
 RUNTIME_SOURCE_DEFAULTS = {
     "portfolio_asset_manifest": {"label": "Portfolio Asset Manifest", "lane": "work"},
-    "openclaw_state_json": {"label": "OpenClaw State", "lane": "agents"},
-    "openclaw_brief_json": {"label": "OpenClaw Morning Brief", "lane": "agents"},
-    "openclaw_leads_json": {"label": "OpenClaw Leads", "lane": "career_market"},
-    "digest_status_json": {"label": "Digest Status", "lane": "world"},
-    "digest_synthesis_md": {"label": "Digest Synthesis", "lane": "world"},
-    "digest_previous_summary": {"label": "Digest Previous Summary", "lane": "world"},
     "company_intel_json": {"label": "Company Intel", "lane": "companies"},
-    "openclaw_email_triage_json": {"label": "Email Triage", "lane": "life_admin"},
 }
 
 
@@ -340,8 +355,20 @@ def _compat_path(manifest: dict[str, Any], key: str) -> Path:
     return expand_path(manifest["paths"][key])
 
 
+def _operator_label(manifest: dict[str, Any]) -> str:
+    """Installation owner shown in agent prompts; generic unless the manifest names one."""
+    return str(manifest.get("settings", {}).get("operator") or "the operator")
+
+
 def _source_path(manifest: dict[str, Any], source_id: str) -> Path:
     return expand_path(manifest["source_map"][source_id]["path"])
+
+
+def _projection_note(manifest: dict[str, Any], source_id: str) -> str | None:
+    """Operator-supplied banner for a generated projection, from the manifest."""
+    source = manifest.get("source_map", {}).get(source_id) or {}
+    note = source.get("projection_note")
+    return str(note).strip() or None if note else None
 
 
 def default_mem0_status(entry: dict[str, Any], *, source_kind: str) -> str | None:
@@ -372,7 +399,7 @@ def _validate_category(value: str | None) -> None:
         raise ValueError(f"Invalid category: {value}")
 
 
-def _normalize_category(value: str | None) -> str:
+def _normalize_category(value: str | None, *, fallback_sink: dict[str, Any] | None = None) -> str:
     if value is None:
         return "note"
     normalized = re.sub(r"[\s-]+", "_", value.strip().casefold())
@@ -382,9 +409,13 @@ def _normalize_category(value: str | None) -> str:
     normalized = CATEGORY_ALIASES.get(normalized, normalized)
     _validate_category(normalized)
     if normalized not in CANONICAL_EVENT_CATEGORIES:
-        raise ValueError(
-            f"Unsupported category: {normalized}. Allowed categories: {', '.join(sorted(CANONICAL_EVENT_CATEGORIES))}"
-        )
+        # Soft fallback: agents keep inventing reasonable lane names, and a hard
+        # ValueError used to bounce the whole write. Store under "note" and let
+        # the caller surface what happened via `category_fallback`. Only input
+        # that fails VALID_CATEGORY_RE (above) still raises.
+        if fallback_sink is not None:
+            fallback_sink["category_fallback"] = {"requested": normalized, "stored": "note"}
+        return "note"
     return normalized
 
 
@@ -487,7 +518,7 @@ def _resolve_source_trust_tier(source: dict[str, Any] | None) -> tuple[str, str]
 def _normalize_record_entry(entry: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(entry)
     normalized["domain"] = str(normalized.get("domain") or "global").strip() or "global"
-    normalized["category"] = _normalize_category(normalized.get("category"))
+    normalized["category"] = _normalize_category(normalized.get("category"), fallback_sink=normalized)
     normalized["text"] = str(normalized.get("text") or "").strip()
     if not normalized["text"]:
         raise ValueError("Event text is required.")
@@ -764,8 +795,6 @@ def _optional_runtime_path(manifest: dict[str, Any], path_key: str, fallback_fil
     explicit = (manifest.get("paths") or {}).get(path_key)
     if explicit:
         return expand_path(explicit)
-    if fallback_filename:
-        return expand_path(manifest["paths"]["openclaw_memory_dir"]) / fallback_filename
     return None
 
 
@@ -1364,25 +1393,14 @@ def build_attach_bundle(
     domain = manifest["domain_map"][domain_id]
     freshness_audit = build_freshness_audit(manifest, domain_id=domain_id)
     source_audit = build_sources_audit(manifest, domain_id=domain_id)
-    normalized_entities = build_normalized_entities(
-        manifest,
-        domain_id=domain_id,
-        snapshot=snapshot,
-        event_limit=max(event_limit, 24),
-    )
-    situation_model = build_situation_model(
-        manifest,
-        domain_id=domain_id,
-        snapshot=snapshot,
-        normalized_entities=normalized_entities,
-    )
-    latest_lens_runs = run_lenses(
-        manifest,
-        domain_id=domain_id,
-        situation_model=situation_model,
-        persist=False,
-    )
-    latest_scenarios = fetch_scenario_runs(config, situation_id=situation_model["situation_id"], limit=8) if situation_model else []
+    normalized_entities = fetch_normalized_entities(config, limit=200)
+    if not normalized_entities:
+        normalized_entities = build_normalized_entities(
+            manifest,
+            domain_id=domain_id,
+            snapshot=snapshot,
+            event_limit=max(event_limit, 24),
+        )
     attach_sources = _source_catalog(manifest, domain_id)
     return {
         "contract_name": ACTIVATION_CONTRACT_NAME,
@@ -1408,9 +1426,6 @@ def build_attach_bundle(
         "source_catalog": attach_sources,
         "source_audit": source_audit,
         "normalized_entities": normalized_entities[:40],
-        "situation_model": situation_model,
-        "latest_lens_runs": latest_lens_runs,
-        "latest_scenarios": latest_scenarios,
         "query_modes": list(QUERY_MODES),
         "truth_order": [
             "chronicle.db",
@@ -1428,8 +1443,6 @@ STARTUP_BUNDLE_SCHEMA_VERSION = "2026-03-29.v1"
 def _build_startup_runtime_view(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Extract compact runtime view from a snapshot for startup bundle."""
     portfolio_assets = snapshot.get("portfolio_assets", {})
-    openclaw = snapshot.get("openclaw", {})
-    digest = snapshot.get("digest", {})
     return {
         "snapshot_meta": {
             "id": snapshot.get("id"),
@@ -1444,20 +1457,6 @@ def _build_startup_runtime_view(snapshot: dict[str, Any]) -> dict[str, Any]:
             "missing_assets_total": portfolio_assets.get("missing_assets_total", 0),
             "og_images_needed": portfolio_assets.get("og_images_needed", 0),
             "missing_assets_sample": portfolio_assets.get("missing_assets_sample", [])[:5],
-        },
-        "openclaw": {
-            "last_scout": openclaw.get("last_scout"),
-            "last_nightly": openclaw.get("last_nightly"),
-            "jobs_found_today": openclaw.get("jobs_found_today", 0),
-            "applications_sent_today": openclaw.get("applications_sent_today", 0),
-            "gpt_calls_today": openclaw.get("gpt_calls_today", 0),
-            "pipeline_counts": openclaw.get("pipeline_counts", {}),
-            "top_leads": openclaw.get("top_leads", [])[:3],
-            "lead_count": openclaw.get("lead_count", 0),
-        },
-        "digest": {
-            "status": digest.get("status", {}),
-            "world_headlines": digest.get("world_headlines", [])[:4],
         },
         "repos": [
             {
@@ -1507,11 +1506,6 @@ def _build_startup_sources(
     for source_id in source_ids:
         source_config = manifest["source_map"][source_id]
         source_data = read_source_content(source_config)
-        freshness_thresholds = _source_freshness_policy(
-            manifest,
-            source_class="ssot_source",
-            source_id=source_id,
-        )
         raw_content = source_data.get("content", "")
         content_truncated = False
         if compact and len(raw_content) > 1200:
@@ -1526,44 +1520,12 @@ def _build_startup_sources(
             "exists": source_data.get("exists", False),
             "mtime": source_data.get("mtime"),
             "size": source_data.get("size", 0),
-            "freshness_status": _freshness_status(
-                source_data.get("mtime"),
-                thresholds=freshness_thresholds,
-            ),
-            "source_priority": source_config.get("priority", 0),
             "content": raw_content,
         }
         if compact:
             entry["content_truncated"] = content_truncated
         results.append(entry)
     return results
-
-
-def _build_startup_focus(
-    situation_model: dict[str, Any] | None,
-    latest_lens_runs: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    """Build compact focus section from situation model and lens runs."""
-    if situation_model is None:
-        return None
-    return {
-        "situation_id": situation_model.get("situation_id"),
-        "summary_text": situation_model.get("summary_text", ""),
-        "goals": situation_model.get("goals", [])[:5],
-        "constraints": situation_model.get("constraints", [])[:6],
-        "pressures": situation_model.get("pressures", [])[:6],
-        "open_questions": situation_model.get("open_questions", [])[:5],
-        "risks": situation_model.get("risks", [])[:4],
-        "trajectory": situation_model.get("trajectory"),
-        "lens_summaries": [
-            {
-                "lens": run.get("lens"),
-                "summary_text": run.get("summary_text"),
-                "confidence": run.get("confidence"),
-            }
-            for run in latest_lens_runs
-        ],
-    }
 
 
 def _build_startup_entity_digest(
@@ -1655,28 +1617,15 @@ def build_startup_bundle(
     # 5. Runtime view (compact extract from snapshot)
     runtime = _build_startup_runtime_view(snapshot)
 
-    # 6. Situation model + lens runs → focus
-    normalized_entities = build_normalized_entities(
-        manifest,
-        domain_id=domain_id,
-        snapshot=snapshot,
-        event_limit=max(limit, 24),
-    )
-    situation_model = build_situation_model(
-        manifest,
-        domain_id=domain_id,
-        snapshot=snapshot,
-        normalized_entities=normalized_entities,
-    )
-    latest_lens_runs = run_lenses(
-        manifest,
-        domain_id=domain_id,
-        situation_model=situation_model,
-        persist=False,
-    )
-    focus_section = _build_startup_focus(situation_model, latest_lens_runs)
-
-    # 7. Normalized entities → compact digest
+    # 6. Normalized entities → compact digest
+    normalized_entities = fetch_normalized_entities(config, limit=200)
+    if not normalized_entities:
+        normalized_entities = build_normalized_entities(
+            manifest,
+            domain_id=domain_id,
+            snapshot=snapshot,
+            event_limit=max(limit, 24),
+        )
     entity_digest = _build_startup_entity_digest(
         normalized_entities, compact=compact
     )
@@ -1704,7 +1653,6 @@ def build_startup_bundle(
         "sources": sources,
         "recent_events": recent_events,
         "mem0_dump_hits": mem0_dump_hits,
-        "focus": focus_section,
         "entity_digest": entity_digest,
         "db_summary": db_summary,
         "query_modes": list(QUERY_MODES),
@@ -1716,30 +1664,6 @@ def build_startup_bundle(
             "mem0 semantic recall",
         ],
     }
-
-
-def _summary_lines_from_excerpt(text: str, *, limit: int = 5) -> list[str]:
-    def clean(value: str) -> str:
-        value = re.sub(r"`([^`]+)`", r"\1", value)
-        value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
-        value = re.sub(r"__([^_]+)__", r"\1", value)
-        return re.sub(r"\s+", " ", value).strip()
-
-    numbered: list[str] = []
-    lines: list[str] = []
-    for raw_line in text.splitlines():
-        stripped = raw_line.strip()
-        if re.match(r"^\d+\.\s+", stripped):
-            numbered.append(clean(re.sub(r"^\d+\.\s+", "", stripped)))
-        elif stripped.startswith("- "):
-            lines.append(clean(stripped[2:].strip()))
-        elif stripped.endswith("?"):
-            lines.append(clean(stripped))
-        if len(numbered) >= limit:
-            break
-        if len(lines) >= limit:
-            break
-    return (numbered or lines)[:limit]
 
 
 def _clean_markdown_text(value: str) -> str:
@@ -1757,169 +1681,6 @@ def _parse_labeled_bullet(line: str) -> tuple[str | None, str | None]:
     label = normalize_heading(match.group(1))
     value = _clean_markdown_text(match.group(2))
     return label, value or None
-
-
-def _dedupe_text(values: list[str], *, limit: int) -> list[str]:
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for item in values:
-        cleaned = _clean_markdown_text(item)
-        if not cleaned:
-            continue
-        key = cleaned.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(cleaned)
-        if len(deduped) >= limit:
-            break
-    return deduped
-
-
-def _extract_priority_goals(text: str, *, limit: int) -> list[str]:
-    sections = parse_markdown_sections(text)
-    priority_section = next(
-        (section for section in sections if section["normalized"] == normalize_heading("Priority Stack (ordered)")),
-        None,
-    )
-    if priority_section is None:
-        priority_section = next(
-            (section for section in sections if section["normalized"] == normalize_heading("Priorities")),
-            None,
-        )
-    section_text = priority_section["body"] if priority_section else text
-
-    goals: list[str] = []
-    numbered_items: list[str] = []
-    current_heading: str | None = None
-    current_target: str | None = None
-
-    def flush() -> None:
-        if not current_heading:
-            return
-        goal = f"{current_heading}: {current_target}" if current_target else current_heading
-        goals.append(shorten(_clean_markdown_text(goal), 180))
-
-    for raw_line in section_text.splitlines():
-        stripped = raw_line.strip()
-        numbered_match = re.match(r"^\d+\.\s+(.+)$", stripped)
-        if numbered_match:
-            numbered_items.append(_clean_markdown_text(numbered_match.group(1)))
-            if len(numbered_items) >= limit:
-                break
-        heading_match = re.match(r"^###\s+(.*)$", stripped)
-        if heading_match:
-            flush()
-            title = _clean_markdown_text(heading_match.group(1))
-            title = re.sub(r"^[^A-Za-zА-Яа-я0-9]+", "", title)
-            title = re.sub(r"^P\d+\s*[—-]\s*", "", title, flags=re.IGNORECASE)
-            current_heading = title or None
-            current_target = None
-            continue
-        label, value = _parse_labeled_bullet(stripped)
-        if current_heading and label == "target" and value and current_target is None:
-            current_target = value
-
-    flush()
-    if not goals and numbered_items:
-        goals = numbered_items
-    return _dedupe_text(goals, limit=limit)
-
-
-def _section_bullets(text: str, titles: set[str], *, limit: int) -> list[str]:
-    values: list[str] = []
-    wanted = {normalize_heading(title) for title in titles}
-    for section in parse_markdown_sections(text):
-        if section["normalized"] not in wanted:
-            continue
-        for raw_line in section["body"].splitlines():
-            stripped = raw_line.strip()
-            if not stripped.startswith("- "):
-                continue
-            label, value = _parse_labeled_bullet(stripped)
-            if value:
-                values.append(value)
-            else:
-                values.append(_clean_markdown_text(stripped[2:]))
-            if len(values) >= limit:
-                return _dedupe_text(values, limit=limit)
-    return _dedupe_text(values, limit=limit)
-
-
-def _extract_priority_constraints(text: str, *, limit: int) -> list[str]:
-    constraints: list[str] = []
-    for raw_line in text.splitlines():
-        label, value = _parse_labeled_bullet(raw_line.strip())
-        if label in {"rule", "depends on", "portfolio dependency", "constraint"} and value:
-            constraints.append(value)
-    constraints.extend(
-        _section_bullets(
-            text,
-            {"Anti-Patterns (ADHD Guard Rails)", "Key Constraints"},
-            limit=limit,
-        )
-    )
-    return _dedupe_text(constraints, limit=limit)
-
-
-def _strategy_source_inputs(
-    manifest: dict[str, Any],
-    source_audit: dict[str, Any],
-    *,
-    source_ids: tuple[str, ...] = ("priorities", "status", "job_search"),
-) -> list[dict[str, Any]]:
-    freshness_rows = {
-        row.get("id"): row
-        for row in source_audit.get("freshness_audit", {}).get("attach_sources", [])
-        if row.get("id")
-    }
-    candidates: list[dict[str, Any]] = []
-    for source_id in source_ids:
-        source = manifest.get("source_map", {}).get(source_id)
-        if not source:
-            continue
-        path = expand_path(source["path"])
-        if not path.exists():
-            continue
-        content = path.read_text(encoding="utf-8", errors="replace").strip()
-        if not content:
-            continue
-        source_data = file_meta(path)
-        thresholds = _source_freshness_policy(
-            manifest,
-            source_class="ssot_source",
-            source_id=source_id,
-        )
-        freshness_row = freshness_rows.get(source_id, {})
-        freshness_status = freshness_row.get("freshness_status") or _freshness_status(
-            source_data.get("mtime"),
-            thresholds=thresholds,
-        )
-        freshness_rank = freshness_row.get("freshness_rank")
-        if freshness_rank is None:
-            freshness_rank = _freshness_rank(
-                source_data.get("mtime"),
-                thresholds=thresholds,
-            )
-        candidates.append(
-            {
-                "source_id": source_id,
-                "content": content,
-                "freshness_status": freshness_status,
-                "freshness_rank": freshness_rank,
-                "source_priority": int(source.get("priority", 0)),
-                "strategy_preference": STRATEGY_SOURCE_PREFERENCE.get(source_id, 0),
-            }
-        )
-    candidates.sort(
-        key=lambda item: (
-            -item["freshness_rank"],
-            -item["strategy_preference"],
-            -item["source_priority"],
-            item["source_id"],
-        )
-    )
-    return candidates
 
 
 def _normalize_company_candidate(value: str) -> str | None:
@@ -1986,23 +1747,6 @@ def _entity_name_preference(entity_type: str, value: str) -> tuple[int, int]:
             score -= 5
     score -= max(len(tokens) - 2, 0)
     return score, -len(value)
-
-
-def _entity_quality_score(entity: dict[str, Any]) -> tuple[int, int]:
-    aliases = entity.get("aliases") or []
-    canonical_name = (entity.get("canonical_name") or "").casefold()
-    score = len(entity.get("source_refs") or []) if "source_refs" in entity else int(entity.get("source_ref_count") or 0)
-    if canonical_name in {"business", "cloud", "marketing", "sr"}:
-        score -= 3
-    if "..." in canonical_name or "key" in canonical_name:
-        score -= 4
-    if ".com" in canonical_name or "remote" in canonical_name:
-        score -= 1
-    if len(canonical_name) <= 2:
-        score -= 3
-    if len(aliases) > 1:
-        score += 1
-    return score, len(aliases)
 
 
 def _entity_display_name(entity_type: str, alias: str) -> str:
@@ -2089,10 +1833,8 @@ def build_normalized_entities(
                 metadata={"lane": "work"},
             )
 
-    for system_name in ("chronicle", "openclaw", "digest", "mem0"):
-        if system_name in {"openclaw", "mem0"} and not agents_enabled:
-            continue
-        if system_name == "digest" and not world_enabled:
+    for system_name in ("chronicle", "mem0"):
+        if system_name == "mem0" and not agents_enabled:
             continue
         if system_name == "chronicle" and not decisions_enabled:
             continue
@@ -2103,9 +1845,7 @@ def build_normalized_entities(
             metadata={
                 "lane": (
                     "agents"
-                    if system_name in {"openclaw", "mem0"}
-                    else "world"
-                    if system_name == "digest"
+                    if system_name == "mem0"
                     else "decisions"
                 )
             },
@@ -2120,18 +1860,6 @@ def build_normalized_entities(
                 _source_ref("snapshot", resolved_snapshot["id"], "portfolio"),
                 metadata={"lane": "work"},
             )
-
-        openclaw = resolved_snapshot.get("openclaw") or {}
-        if companies_enabled:
-            for lead in openclaw.get("top_leads", [])[:12]:
-                company = lead.get("company")
-                if company:
-                    add(
-                        "company",
-                        company,
-                        _source_ref("snapshot", resolved_snapshot["id"], company, path=openclaw.get("leads_path")),
-                        metadata={"lane": "companies"},
-                    )
 
         digest = resolved_snapshot.get("digest") or {}
         if world_enabled:
@@ -2148,24 +1876,6 @@ def build_normalized_entities(
                             _source_ref("snapshot", resolved_snapshot["id"], topic, path=digest.get("synthesis_path")),
                             metadata={"lane": "world"},
                         )
-
-    openclaw = resolved_snapshot.get("openclaw") if resolved_snapshot else {}
-    leads_path = openclaw.get("leads_path") if isinstance(openclaw, dict) else None
-    if not leads_path:
-        fallback_leads_path = _optional_runtime_path(manifest, "openclaw_leads_json")
-        leads_path = str(fallback_leads_path) if fallback_leads_path else None
-    if companies_enabled and leads_path:
-        leads_payload = read_json(Path(leads_path)) or []
-        if isinstance(leads_payload, list):
-            for item in leads_payload[:100]:
-                company = item.get("company") if isinstance(item, dict) else None
-                if company:
-                    add(
-                        "company",
-                        company,
-                        _source_ref("runtime", "openclaw_leads_json", company, path=leads_path),
-                        metadata={"lane": "companies"},
-                    )
 
     company_intel_path = _company_intel_path(manifest)
     company_intel = read_json(company_intel_path) or {}
@@ -2250,380 +1960,6 @@ def materialize_normalized_entities(
     return fetch_normalized_entities(config, limit=200)
 
 
-def _event_transition_label(event: dict[str, Any]) -> str:
-    category = event.get("category") or "note"
-    project = event.get("project") or event.get("entity_id") or "system"
-    return f"{category}:{project}"
-
-
-def _detect_contradictions(
-    recent_events: list[dict[str, Any]],
-    normalized_entities: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    contradictions: list[dict[str, Any]] = []
-    status_by_project: dict[str, set[str]] = {}
-    for event in recent_events:
-        project = event.get("project")
-        if not project:
-            continue
-        statuses = status_by_project.setdefault(project, set())
-        if event.get("category") == "blocker":
-            statuses.add("blocked")
-        if event.get("category") in {"milestone", "implementation", "state_change"}:
-            statuses.add("advancing")
-    for project, statuses in status_by_project.items():
-        if {"blocked", "advancing"} <= statuses:
-            contradictions.append(
-                {
-                    "entity_id": f"project:{project.casefold().replace(' ', '-')}",
-                    "detail": f"Project `{project}` has both blocker and progress signals in the recent event window.",
-                    "evidence_refs": [event["id"] for event in recent_events if event.get("project") == project][:6],
-                }
-            )
-
-    for entity in normalized_entities:
-        aliases = {alias.casefold() for alias in entity.get("aliases", [])}
-        if _has_noisy_alias(entity):
-            contradictions.append(
-                {
-                    "entity_id": entity.get("entity_id") or entity.get("id"),
-                    "detail": f"Entity `{entity['canonical_name']}` still has noisy aliases that need cleanup.",
-                    "evidence_refs": [ref.get("source_id") for ref in entity.get("source_refs", [])[:4]],
-                }
-            )
-    return contradictions
-
-
-def _situation_summary(
-    domain_id: str,
-    *,
-    goals: list[str],
-    pressures: list[dict[str, Any]],
-    contradictions: list[dict[str, Any]],
-    risks: list[dict[str, Any]],
-) -> str:
-    goal_text = goals[0] if goals else f"{domain_id} state is active"
-    pressure_text = pressures[0]["detail"] if pressures else "no major external pressure captured"
-    contradiction_text = (
-        f"{len(contradictions)} contradiction(s) active"
-        if contradictions
-        else "no active contradiction detected"
-    )
-    risk_text = risks[0]["detail"] if risks else "no elevated risk captured"
-    return f"{goal_text}; pressure: {pressure_text}; {contradiction_text}; risk: {risk_text}."
-
-
-def build_situation_model(
-    manifest: dict[str, Any],
-    *,
-    domain_id: str = "global",
-    snapshot: dict[str, Any] | None = None,
-    event_limit: int = 24,
-    normalized_entities: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    config = _config(manifest)
-    resolved_snapshot = snapshot or fetch_latest_snapshot(config, domain=domain_id) or fetch_latest_snapshot(config)
-    recent_events = fetch_recent_events(config, limit=event_limit, domain=domain_id)
-    resolved_entities = normalized_entities or fetch_normalized_entities(config, limit=200) or build_normalized_entities(
-        manifest,
-        domain_id=domain_id,
-        snapshot=resolved_snapshot,
-        event_limit=max(event_limit, 50),
-    )
-    source_audit = build_sources_audit(manifest, domain_id=domain_id)
-    source_excerpt_map = {
-        item["id"]: item.get("excerpt", "")
-        for item in (resolved_snapshot or {}).get("source_excerpts", [])
-    }
-
-    strategy_sources = _strategy_source_inputs(manifest, source_audit)
-    strategy_source_ids = [item["source_id"] for item in strategy_sources]
-
-    goals: list[str] = []
-    for item in strategy_sources:
-        goals = _extract_priority_goals(item["content"], limit=5)
-        if goals:
-            break
-    if not goals:
-        for source_id in strategy_source_ids:
-            goals = _summary_lines_from_excerpt(
-                source_excerpt_map.get(source_id, ""),
-                limit=5,
-            )
-            if goals:
-                break
-    if not goals:
-        goals = [event["text"] for event in recent_events if event.get("category") in {"decision", "milestone"}][:5]
-    goals = [shorten(goal, 180) for goal in goals]
-
-    constraints: list[str] = []
-    for item in strategy_sources:
-        constraints = _extract_priority_constraints(item["content"], limit=8)
-        if constraints:
-            break
-    if not constraints:
-        for source_id in strategy_source_ids:
-            constraints = _summary_lines_from_excerpt(
-                source_excerpt_map.get(source_id, ""),
-                limit=6,
-            )
-            if constraints:
-                break
-    if not constraints:
-        constraints = _summary_lines_from_excerpt(source_excerpt_map.get("status", ""), limit=6)
-    constraints = [shorten(item, 180) for item in constraints]
-
-    pressures: list[dict[str, Any]] = []
-    for issue in source_audit["freshness_audit"].get("issues", [])[:8]:
-        pressures.append(
-            {
-                "kind": issue["kind"],
-                "detail": issue["detail"],
-                "severity": issue["severity"],
-                "source_id": issue.get("source_id"),
-            }
-        )
-
-    if resolved_snapshot:
-        portfolio = resolved_snapshot.get("portfolio_assets") or {}
-        if portfolio.get("missing_assets_total", 0):
-            pressures.append(
-                {
-                    "kind": "portfolio_gap",
-                    "detail": f"Portfolio still has {portfolio.get('missing_assets_total')} missing asset slot(s).",
-                    "severity": "warn",
-                    "source_id": "portfolio_asset_manifest",
-                }
-            )
-        openclaw = resolved_snapshot.get("openclaw") or {}
-        if openclaw.get("gpt_limit_warning"):
-            pressures.append(
-                {
-                    "kind": "openclaw_limit",
-                    "detail": str(openclaw["gpt_limit_warning"]),
-                    "severity": "warn",
-                    "source_id": "openclaw_state_json",
-                }
-            )
-        if int(openclaw.get("applications_sent_today") or 0) == 0 and int(openclaw.get("jobs_found_today") or 0) > 0:
-            pressures.append(
-                {
-                    "kind": "pipeline_conversion",
-                    "detail": "Job search is generating leads today without same-day application conversion.",
-                    "severity": "warn",
-                    "source_id": "openclaw_state_json",
-                }
-            )
-
-    contradictions = _detect_contradictions(recent_events, resolved_entities)
-    open_questions = [
-        f"How should `{issue.get('source_id')}` be refreshed or trusted?"
-        for issue in source_audit["freshness_audit"].get("issues", [])
-        if issue.get("severity") == "critical"
-    ][:5]
-    open_questions.extend(
-        shorten(event["text"], 220)
-        for event in recent_events
-        if event.get("category") == "research"
-    )
-    open_questions = open_questions[:6]
-
-    risks: list[dict[str, Any]] = []
-    for contradiction in contradictions[:5]:
-        risks.append(
-            {
-                "kind": "contradiction",
-                "detail": contradiction["detail"],
-                "evidence_refs": contradiction["evidence_refs"],
-            }
-        )
-    for issue in source_audit["freshness_audit"].get("issues", []):
-        if issue.get("severity") == "critical":
-            risks.append(
-                {
-                    "kind": issue["kind"],
-                    "detail": issue["detail"],
-                    "evidence_refs": [issue.get("source_id")],
-                }
-            )
-    risks = risks[:8]
-
-    actors = []
-    actor_quotas = {"project": 8, "system": 2, "company": 4}
-    for actor_type in ("project", "system", "company"):
-        candidates = [entity for entity in resolved_entities if entity["entity_type"] == actor_type]
-        candidates.sort(
-            key=lambda entity: (
-                -_entity_quality_score(entity)[0],
-                -_entity_quality_score(entity)[1],
-                entity["canonical_name"].casefold(),
-            )
-        )
-        added_count = 0
-        for entity in candidates:
-            if actor_type == "company" and _entity_quality_score(entity)[0] <= 0:
-                continue
-            actors.append(
-                {
-                    "entity_id": entity["id"] if "id" in entity else entity["entity_id"],
-                    "entity_type": entity["entity_type"],
-                    "canonical_name": entity["canonical_name"],
-                    "aliases": entity["aliases"][:5],
-                }
-            )
-            added_count += 1
-            if added_count >= actor_quotas[actor_type]:
-                break
-
-    trajectory = {
-        "recent_transitions": [_event_transition_label(event) for event in recent_events[:8]],
-        "event_categories": Counter(event.get("category") or "note" for event in recent_events),
-        "top_vectors": goals[:3],
-    }
-
-    snapshot_id = resolved_snapshot.get("id") if resolved_snapshot else None
-    valid_at = (resolved_snapshot or {}).get("captured_at_utc") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    summary_text = _situation_summary(
-        domain_id,
-        goals=goals,
-        pressures=pressures,
-        contradictions=contradictions,
-        risks=risks,
-    )
-    return {
-        "situation_id": str(hashlib.sha256(f"{domain_id}:{snapshot_id or valid_at}".encode("utf-8")).hexdigest()[:24]),
-        "domain": domain_id,
-        "snapshot_id": snapshot_id,
-        "valid_at": valid_at,
-        "status": "active",
-        "summary_text": summary_text,
-        "actors": actors,
-        "goals": goals,
-        "pressures": pressures,
-        "constraints": constraints[:8],
-        "contradictions": contradictions,
-        "open_questions": open_questions,
-        "risks": risks,
-        "trajectory": {
-            "recent_transitions": trajectory["recent_transitions"],
-            "event_categories": dict(trajectory["event_categories"]),
-            "top_vectors": trajectory["top_vectors"],
-        },
-        "derived_from": {
-            "snapshot_id": snapshot_id,
-            "event_ids": [event["id"] for event in recent_events],
-            "source_ids": [entry["source_id"] for entry in source_audit["source_catalog"] if entry.get("enabled")],
-            "strategy_source_ids": strategy_source_ids,
-            "normalized_entity_ids": [entity["id"] if "id" in entity else entity["entity_id"] for entity in resolved_entities],
-        },
-    }
-
-
-def materialize_situation_model(
-    manifest: dict[str, Any],
-    *,
-    domain_id: str = "global",
-    snapshot: dict[str, Any] | None = None,
-    event_limit: int = 24,
-    normalized_entities: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    model = build_situation_model(
-        manifest,
-        domain_id=domain_id,
-        snapshot=snapshot,
-        event_limit=event_limit,
-        normalized_entities=normalized_entities,
-    )
-    return store_situation_model(_config(manifest), model)
-
-
-def _lens_findings(situation_model: dict[str, Any], lens: str) -> tuple[list[dict[str, Any]], float]:
-    findings: list[dict[str, Any]] = []
-    if lens == "operator":
-        if situation_model.get("goals"):
-            findings.append({"title": "Current Goal", "detail": situation_model["goals"][0], "severity": "info"})
-        if situation_model.get("pressures"):
-            findings.append({"title": "Primary Pressure", "detail": situation_model["pressures"][0]["detail"], "severity": "warn"})
-        confidence = 0.78
-    elif lens == "strategist":
-        vector = (situation_model.get("trajectory") or {}).get("top_vectors") or []
-        findings.append(
-            {
-                "title": "Strategic Direction",
-                "detail": vector[0] if vector else "Need clearer strategic vector from current evidence.",
-                "severity": "info",
-            }
-        )
-        if situation_model.get("constraints"):
-            findings.append({"title": "Constraint", "detail": situation_model["constraints"][0], "severity": "warn"})
-        confidence = 0.74
-    elif lens == "risk":
-        if situation_model.get("risks"):
-            findings.extend(
-                {
-                    "title": "Risk",
-                    "detail": risk["detail"],
-                    "severity": "critical" if risk["kind"] == "contradiction" else "warn",
-                }
-                for risk in situation_model["risks"][:3]
-            )
-        else:
-            findings.append({"title": "Risk", "detail": "No elevated risk captured from current evidence.", "severity": "info"})
-        confidence = 0.82
-    elif lens == "market":
-        actors = [actor["canonical_name"] for actor in situation_model.get("actors", []) if actor["entity_type"] == "company"]
-        findings.append(
-            {
-                "title": "Market Signal",
-                "detail": ", ".join(actors[:3]) if actors else "No strong company/market actor signal captured.",
-                "severity": "info",
-            }
-        )
-        confidence = 0.66
-    else:
-        pressures = situation_model.get("pressures") or []
-        findings.append(
-            {
-                "title": "System Health",
-                "detail": pressures[0]["detail"] if pressures else "No major systems pressure captured.",
-                "severity": "warn" if pressures else "info",
-            }
-        )
-        confidence = 0.8
-    return findings, confidence
-
-
-def run_lenses(
-    manifest: dict[str, Any],
-    *,
-    domain_id: str = "global",
-    situation_model: dict[str, Any] | None = None,
-    persist: bool = True,
-) -> list[dict[str, Any]]:
-    config = _config(manifest)
-    resolved_situation = situation_model or fetch_latest_situation_model(config, domain=domain_id)
-    if resolved_situation is None:
-        resolved_situation = materialize_situation_model(manifest, domain_id=domain_id)
-    evidence_refs = [{"type": "snapshot", "id": resolved_situation.get("snapshot_id")}]
-    evidence_refs.extend({"type": "event", "id": event_id} for event_id in (resolved_situation.get("derived_from") or {}).get("event_ids", [])[:6])
-
-    runs: list[dict[str, Any]] = []
-    for lens in FIXED_LENSES:
-        findings, confidence = _lens_findings(resolved_situation, lens)
-        run = {
-            "run_id": hashlib.sha256(f"{resolved_situation['situation_id']}:{lens}".encode("utf-8")).hexdigest()[:24],
-            "situation_id": resolved_situation["situation_id"],
-            "lens": lens,
-            "status": "completed",
-            "confidence": confidence,
-            "summary_text": findings[0]["detail"] if findings else f"{lens} lens completed.",
-            "findings": findings,
-            "evidence_refs": evidence_refs,
-        }
-        runs.append(store_lens_run(config, run) if persist else run)
-    return runs
-
-
 def _search_derived_hits(
     query: str,
     records: list[dict[str, Any]],
@@ -2645,70 +1981,6 @@ def _search_derived_hits(
         hits.append(hit)
     hits.sort(key=lambda item: (-item["score"], item.get("summary_text") or ""))
     return hits[:limit]
-
-
-def record_scenario(
-    manifest: dict[str, Any],
-    *,
-    domain_id: str = "global",
-    scenario_name: str,
-    assumptions: list[str],
-    changed_variables: dict[str, Any] | None = None,
-    expected_outcomes: list[str] | None = None,
-    failure_modes: list[str] | None = None,
-    confidence: float = 0.6,
-    review_due_at: str | None = None,
-    situation_id: str | None = None,
-) -> dict[str, Any]:
-    resolved_assumptions = [item.strip() for item in assumptions if item and item.strip()]
-    if not resolved_assumptions:
-        raise ValueError("Scenario assumptions are required.")
-    config = _config(manifest)
-    if situation_id:
-        situation = fetch_situation_model(config, situation_id=situation_id)
-    else:
-        situation = fetch_latest_situation_model(config, domain=domain_id)
-    if situation is None:
-        situation = materialize_situation_model(manifest, domain_id=domain_id)
-    payload = {
-        "scenario_id": hashlib.sha256(f"{situation['situation_id']}:{scenario_name}:{'|'.join(resolved_assumptions)}".encode("utf-8")).hexdigest()[:24],
-        "situation_id": situation["situation_id"],
-        "scenario_name": scenario_name,
-        "status": "active",
-        "confidence": confidence,
-        "review_due_at": review_due_at,
-        "summary_text": (expected_outcomes or [scenario_name])[0],
-        "assumptions": resolved_assumptions,
-        "changed_variables": changed_variables or {},
-        "expected_outcomes": expected_outcomes or [],
-        "failure_modes": failure_modes or [],
-    }
-    return store_scenario_run(config, payload)
-
-
-def review_scenario(
-    manifest: dict[str, Any],
-    *,
-    scenario_id: str,
-    status: str,
-    review_summary: str,
-    outcome_event_id: str | None = None,
-) -> dict[str, Any]:
-    config = _config(manifest)
-    scenarios = fetch_scenario_runs(config, limit=200)
-    scenario = next((item for item in scenarios if item["scenario_id"] == scenario_id or item["id"] == scenario_id), None)
-    if scenario is None:
-        raise ValueError(f"Unknown scenario_id: {scenario_id}")
-    if outcome_event_id is not None and fetch_event(config, event_id=outcome_event_id) is None:
-        raise ValueError(f"Unknown outcome_event_id: {outcome_event_id}")
-    review = {
-        "review_id": hashlib.sha256(f"{scenario_id}:{status}:{review_summary}".encode("utf-8")).hexdigest()[:24],
-        "scenario_id": scenario["scenario_id"],
-        "outcome_event_id": outcome_event_id,
-        "status": status,
-        "review_summary": review_summary,
-    }
-    return store_forecast_review(config, review)
 
 
 def reconstruct_timeline(
@@ -2750,6 +2022,8 @@ def record_event(
     source_kind: str = "agent_command",
     imported_from: str = "chronicle.record",
 ) -> dict[str, Any]:
+    # Pop private test/injection keys before any serialization path sees them.
+    _embed_fn_override = entry.pop("_embed_fn", None)
     normalized_entry = _normalize_record_entry(entry)
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
     resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind)
@@ -2763,9 +2037,80 @@ def record_event(
         if memory_guard["verdict"] == "local_only":
             normalized_entry["mem0_status"] = "off"
 
-    if dedupe:
-        with open_connection(config) as connection, connection:
-            connection.execute("BEGIN IMMEDIATE")
+    # v8: compute a stable content_hash so store_event persists it. The hash
+    # omits timestamps on purpose — it represents the logical event, not the
+    # exact moment of recording — and is canonicalised as sorted-keys JSON so
+    # '|' inside a field cannot collide with a neighbouring field.
+    content_hash = compute_event_content_hash(
+        text=normalized_entry.get("text"),
+        category=normalized_entry.get("category"),
+        actor=normalized_entry.get("agent"),
+        entity_id=normalized_entry.get("entity_id"),
+        domain=normalized_entry.get("domain"),
+        project=normalized_entry.get("project"),
+        why=normalized_entry.get("why"),
+    )
+    normalized_entry["content_hash"] = content_hash
+
+    hash_dedup_active = (
+        not dedupe and feature_enabled(ENV_FEATURE_EVENT_HASH_DEDUP)
+    )
+    hash_dedup_window = (
+        env_int(ENV_EVENT_DEDUP_WINDOW_HOURS, default=DEFAULT_EVENT_DEDUP_WINDOW_HOURS)
+        if hash_dedup_active
+        else 0
+    )
+
+    # Best-effort embedding, computed BEFORE the write transaction — the
+    # Ollama call can take seconds and must not hold the write lock. The row
+    # itself lands inside the same transaction as the event below, so an
+    # event either commits with its embedding or without one (never a
+    # dangling embedding). Failure MUST NOT surface to the caller; the flag
+    # (default ON) lets tests opt out via the env var.
+    embedding_vec: list[float] | None = None
+    embed_model: str | None = None
+    embed_dim: int | None = None
+    if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
+        try:
+            from .embeddings import embed_text as _embed_text_default, EMBED_DIM, EMBED_MODEL
+            # _embed_fn_override is popped from entry before normalization
+            # so it never reaches payload_json.
+            _embed_fn = _embed_fn_override or _embed_text_default
+            title_part = normalized_entry.get("project") or ""
+            text_part = normalized_entry.get("text") or ""
+            why_part = normalized_entry.get("why") or ""
+            embed_input = " ".join(
+                part for part in [title_part, text_part, why_part] if part
+            ).strip()
+            if embed_input:
+                embedding_vec = _embed_fn(embed_input)
+                embed_model, embed_dim = EMBED_MODEL, EMBED_DIM
+        except Exception:  # noqa: BLE001
+            embedding_vec = None  # embedding is non-critical
+
+    # Stage attachments (hash + content-addressed copy) BEFORE the transaction:
+    # copying a 25MB file must not hold SQLite's single write lock. Staging is
+    # idempotent, so a rollback leaves at most an unreferenced blob.
+    staged_artifacts: list[dict[str, Any]] = []
+    if not skip_generic_source_archives:
+        for source_file in entry.get("source_files") or []:
+            path = Path(source_file).expanduser()
+            staged = stage_artifact_from_path(
+                config,
+                source_path=path,
+                artifact_type="event-source",
+                metadata={"category": normalized_entry.get("category")},
+            )
+            if staged is not None:
+                staged_artifacts.append(staged)
+
+    # One BEGIN IMMEDIATE transaction for dedup lookup + event + embedding +
+    # artifacts + links: a crash mid-way can no longer leave a half-recorded
+    # event, and the up-front write lock avoids the deferred-BEGIN upgrade
+    # deadlock that bypasses busy_timeout.
+    artifacts_written = 0
+    with write_transaction(config) as connection:
+        if dedupe:
             existing = _find_recent_exact_duplicate(
                 config,
                 normalized_entry,
@@ -2780,42 +2125,75 @@ def record_event(
                 existing["dedupe_window_hours"] = dedupe_window_hours
                 existing["artifacts_written"] = 0
                 return existing
-            stored = store_event(
+        elif hash_dedup_active:
+            # v8: find + insert inside one transaction so a concurrent writer
+            # cannot slip past the lookup. Window filters on occurred_at_utc
+            # (event-time axis); since occurred_at_utc is caller controlled,
+            # callers that backfill with a historical occurred_at opt out of
+            # the 24h guard by design.
+            existing_row = find_event_by_content_hash_recent(
                 config,
-                normalized_entry,
-                source_kind=source_kind,
-                imported_from=imported_from,
+                content_hash=content_hash,
+                window_hours=hash_dedup_window,
                 connection=connection,
             )
-    else:
-        stored = store_event(config, normalized_entry, source_kind=source_kind, imported_from=imported_from)
-    stored["chronicle_status"] = "stored"
-    stored["chronicle_db_path"] = str(config.db_path)
-    stored["chronicle_error"] = None
-
-    artifacts_written = 0
-    if not skip_generic_source_archives:
-        for source_file in entry.get("source_files") or []:
-            path = Path(source_file).expanduser()
-            artifact = store_artifact_from_path(
+            if existing_row is not None:
+                # Rehydrate via fetch_event so downstream sees the full
+                # event shape ('recorded_at', 'project', mem0 fields).
+                rehydrated = fetch_event(
+                    config,
+                    event_id=existing_row["id"],
+                    connection=connection,
+                )
+                if rehydrated is not None:
+                    rehydrated["chronicle_status"] = "existing"
+                    rehydrated["chronicle_db_path"] = str(config.db_path)
+                    rehydrated["chronicle_error"] = None
+                    rehydrated["dedupe_status"] = "content_hash_match"
+                    rehydrated["dedupe_window_hours"] = hash_dedup_window
+                    rehydrated["artifacts_written"] = 0
+                    return rehydrated
+                # Row vanished between find and fetch — fall through and insert.
+        stored = store_event(
+            config,
+            normalized_entry,
+            source_kind=source_kind,
+            imported_from=imported_from,
+            connection=connection,
+        )
+        if embedding_vec is not None and embed_model is not None and embed_dim is not None:
+            store_event_embedding(
                 config,
-                source_path=path,
-                artifact_type="event-source",
-                observed_at_utc=stored["recorded_at"],
-                entity_id=stored.get("entity_id"),
-                metadata={"event_id": stored["id"], "category": stored.get("category")},
+                stored["id"],
+                embedding_vec,
+                embed_model,
+                embed_dim,
+                connection=connection,
             )
-            if artifact is None:
-                continue
+        for staged in staged_artifacts:
+            staged["observed_at"] = stored["recorded_at"]
+            staged["metadata"]["event_id"] = stored["id"]
+            artifact = persist_staged_artifact(
+                connection,
+                staged,
+                entity_id=stored.get("entity_id"),
+            )
             link_artifact(
                 config,
                 artifact_id=artifact["id"],
                 target_type="event",
                 target_id=stored["id"],
                 link_role="source",
-                metadata={"path": str(path)},
+                metadata={"path": str(staged["source_path"])},
+                connection=connection,
             )
             artifacts_written += 1
+    stored["chronicle_status"] = "stored"
+    stored["chronicle_db_path"] = str(config.db_path)
+    stored["chronicle_error"] = None
+    category_fallback = normalized_entry.get("category_fallback")
+    if category_fallback:
+        stored["category_fallback"] = category_fallback
 
     if append_compat:
         ledger_row = dict(stored)
@@ -2823,7 +2201,14 @@ def record_event(
         ledger_row["mem0_status"] = entry.get("mem0_status")
         ledger_row["mem0_error"] = entry.get("mem0_error")
         ledger_row["mem0_raw"] = entry.get("mem0_raw")
-        append_jsonl(_compat_path(manifest, "ledger_file"), ledger_row)
+        try:
+            append_jsonl(_compat_path(manifest, "ledger_file"), ledger_row)
+        except OSError as exc:
+            # The canonical event is already committed. Raising here would tell
+            # the caller the write failed and invite a retry that dedupes into a
+            # no-op, so the ledger would never be repaired and the caller would
+            # believe nothing was recorded. Report it as a partial instead.
+            stored["compat_ledger_error"] = f"{type(exc).__name__}: {exc}"
 
     stored["artifacts_written"] = artifacts_written
     return stored
@@ -2881,6 +2266,20 @@ def guard_event(
     )
     payload["event"] = fetch_event(config, event_id=event_id)
     return payload
+
+
+def repair_stale_runs(
+    manifest: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    ttl_hours: float | int = DEFAULT_STALE_RUN_TTL_HOURS,
+) -> dict[str, Any]:
+    config = _config(manifest)
+    result = mark_stale_running_runs(config, ttl_hours=ttl_hours, dry_run=dry_run)
+    return {
+        "status": "dry_run" if dry_run else "ok",
+        "db_path": str(config.db_path),
+    } | result
 
 
 def repair_event_categories(
@@ -3191,12 +2590,6 @@ def _snapshot_artifact_specs(manifest: dict[str, Any], snapshot: dict[str, Any])
     for item in snapshot.get("source_excerpts", []):
         add(item.get("path"), "ssot-source", None, None)
 
-    openclaw = snapshot.get("openclaw", {})
-    add(openclaw.get("state_path"), "openclaw-state", "system", "openclaw")
-    add(openclaw.get("brief_path"), "openclaw-brief", "system", "openclaw")
-    add(openclaw.get("leads_path"), "openclaw-leads", "system", "openclaw")
-    add(openclaw.get("daily_log_path"), "openclaw-daily-log", "system", "openclaw")
-
     digest = snapshot.get("digest", {})
     add(digest.get("status_path"), "digest-status", "system", "digest")
     add(digest.get("synthesis_path"), "digest-synthesis", "system", "digest")
@@ -3218,10 +2611,7 @@ def _refresh_relations(config, snapshot: dict[str, Any]) -> list[dict[str, Any]]
     )
 
     relation_specs = [
-        ("system", "openclaw", "supports", "project", "job-search", "OpenClaw is the autonomous execution layer for job search."),
-        ("system", "digest", "informs", "project", "job-search", "Digest supplies world context that informs job search decisions."),
         ("project", "portfolio", "gates", "project", "linkedin", rationale),
-        ("project", "linkedin", "gates", "project", "job-search", "LinkedIn follow-up depends on portfolio readiness."),
     ]
 
     for from_type, from_name, relation_type, to_type, to_name, why in relation_specs:
@@ -3266,8 +2656,6 @@ def persist_snapshot(
     artifact_count = 0
     relation_count = 0
     normalized_entities: list[dict[str, Any]] = []
-    situation_model: dict[str, Any] | None = None
-    lens_runs: list[dict[str, Any]] = []
     try:
         for spec in _snapshot_artifact_specs(manifest, stored):
             artifact = store_artifact_from_path(
@@ -3298,19 +2686,6 @@ def persist_snapshot(
             snapshot=stored,
             event_limit=64,
         )
-        situation_model = materialize_situation_model(
-            manifest,
-            domain_id=stored.get("domain") or "global",
-            snapshot=stored,
-            event_limit=24,
-            normalized_entities=normalized_entities,
-        )
-        lens_runs = run_lenses(
-            manifest,
-            domain_id=stored.get("domain") or "global",
-            situation_model=situation_model,
-            persist=True,
-        )
         finish_ingest_run(
             config,
             run_id=run_id,
@@ -3320,8 +2695,6 @@ def persist_snapshot(
             metadata={
                 "relation_count": relation_count,
                 "normalized_entity_count": len(normalized_entities),
-                "situation_id": situation_model.get("situation_id") if situation_model else None,
-                "lens_run_count": len(lens_runs),
             },
         )
     except Exception as exc:
@@ -3343,8 +2716,6 @@ def persist_snapshot(
     stored["artifacts_written"] = artifact_count
     stored["relations_written"] = relation_count
     stored["normalized_entities"] = normalized_entities
-    stored["situation_model"] = situation_model
-    stored["lens_runs"] = lens_runs
     stored["projection_runs"] = projections
     return stored
 
@@ -3402,9 +2773,8 @@ def build_activation(
     )
     snapshot = attach_bundle["snapshot"]
     prompt = render_activation_prompt(
-        snapshot,
-        situation_model=attach_bundle.get("situation_model"),
-    )
+            {**snapshot, "operator": snapshot.get("operator") or _operator_label(manifest)}
+        )
     warnings = attach_bundle["freshness_audit"].get("warnings", [])
     if warnings:
         warning_lines = ["", "Freshness warnings:"]
@@ -3435,33 +2805,43 @@ def render_projections(
 
     with open_connection(config) as connection:
         summary = database_summary(connection)
-    projected_summary = dict(summary)
-    projected_summary["projection_runs"] = int(summary.get("projection_runs", 0)) + 2
 
     global_events = fetch_recent_events(config, limit=8)
     job_events = fetch_recent_events(config, limit=8, domain="job_search")
     if not job_events:
         job_events = fetch_project_events(config, project="job-search", limit=8)
 
+    job_path = _source_path(manifest, "job_search")
+    status_path = _source_path(manifest, "status")
+    # Every projection writes one projection_runs row *after* the summary above
+    # was read, so the count rendered into status.md must look ahead by exactly
+    # the number of projections about to run. Derived from that list, not a
+    # hardcoded +2 that silently drifts when a projection is added or removed.
+    projection_names = ("job-search-status", "status-generated-view")
+    projected_summary = dict(summary)
+    projected_summary["projection_runs"] = int(summary.get("projection_runs", 0)) + len(projection_names)
+
     outputs: list[dict[str, Any]] = []
 
-    job_path = _source_path(manifest, "job_search")
-    job_content = render_job_search_status(snapshot, job_events)
-    job_path.write_text(job_content, encoding="utf-8")
+    job_content = render_job_search_status(
+        snapshot,
+        job_events,
+        note=_projection_note(manifest, "job_search"),
+    )
+    _atomic_write_text(job_path, job_content)
     outputs.append(
         {
-            "projection_name": "job-search-status",
+            "projection_name": projection_names[0],
             "target_path": str(job_path),
             "content_sha256": _sha256_text(job_content),
         }
     )
 
-    status_path = _source_path(manifest, "status")
     block = render_status_generated_block(snapshot, projected_summary, global_events)
     status_content = update_status_file(status_path, block)
     outputs.append(
         {
-            "projection_name": "status-generated-view",
+            "projection_name": projection_names[1],
             "target_path": str(status_path),
             "content_sha256": _sha256_text(status_content),
         }
@@ -3491,25 +2871,6 @@ def current_state(
     events = fetch_recent_events(config, limit=event_limit, domain=domain)
     with open_connection(config) as connection:
         summary = database_summary(connection)
-    normalized_entities = build_normalized_entities(
-        manifest,
-        domain_id=domain,
-        snapshot=snapshot,
-        event_limit=max(event_limit, 24),
-    )
-    situation = build_situation_model(
-        manifest,
-        domain_id=domain,
-        snapshot=snapshot,
-        event_limit=max(event_limit, 24),
-        normalized_entities=normalized_entities,
-    )
-    lens_runs = run_lenses(
-        manifest,
-        domain_id=domain,
-        situation_model=situation,
-        persist=False,
-    )
     return {
         "contract_name": ACTIVATION_CONTRACT_NAME,
         "contract_version": ACTIVATION_CONTRACT_VERSION,
@@ -3519,8 +2880,6 @@ def current_state(
         "recent_events": events,
         "freshness_audit": build_freshness_audit(manifest, domain_id=domain),
         "source_audit": build_sources_audit(manifest, domain_id=domain),
-        "latest_situation_model": situation,
-        "latest_lens_runs": lens_runs,
     }
 
 
@@ -3629,8 +2988,6 @@ def query_context(
     normalized_entities = fetch_normalized_entities(config, limit=200)
     normalized_entity_hits: list[dict[str, Any]] = []
     interpretation_hits: list[dict[str, Any]] = []
-    scenario_hits: list[dict[str, Any]] = []
-    forecast_review_hits: list[dict[str, Any]] = []
 
     if mode != "truth_only":
         normalized_entity_hits = _search_derived_hits(
@@ -3675,24 +3032,6 @@ def query_context(
                 )
             )
 
-            if mode == "truth_plus_interpretation_plus_scenarios":
-                scenarios = fetch_scenario_runs(config, situation_id=situation["situation_id"], limit=20)
-                scenario_hits = _search_derived_hits(
-                    query,
-                    scenarios,
-                    record_kind="scenario_run",
-                    text_builder=lambda item: json.dumps(item, ensure_ascii=False),
-                    limit=limit,
-                )
-                reviews = fetch_forecast_reviews(config, limit=20)
-                forecast_review_hits = _search_derived_hits(
-                    query,
-                    reviews,
-                    record_kind="forecast_review",
-                    text_builder=lambda item: json.dumps(item, ensure_ascii=False),
-                    limit=limit,
-                )
-
     return {
         "contract_name": ACTIVATION_CONTRACT_NAME,
         "contract_version": ACTIVATION_CONTRACT_VERSION,
@@ -3705,8 +3044,518 @@ def query_context(
         "status_hits": status_hits,
         "normalized_entity_hits": normalized_entity_hits,
         "interpretation_hits": interpretation_hits[:limit],
-        "scenario_hits": scenario_hits[:limit] if mode == "truth_plus_interpretation_plus_scenarios" else [],
-        "forecast_review_hits": forecast_review_hits[:limit] if mode == "truth_plus_interpretation_plus_scenarios" else [],
+        "scenario_hits": [],
+        "forecast_review_hits": [],
         "briefing_hits": [],
         "mem0_dump_hits": mem0_hits,
+    }
+
+
+# ==========================================================================
+# v8 Phase 1 surface — entity aliases, entity merge, live Mem0 search,
+# entity resolution report, event content-hash. Every tool is gated behind an
+# environment flag (see config.ENV_FEATURE_*) so it can be disabled without
+# redeploying.
+# ==========================================================================
+
+
+_ALIAS_NORMALIZE_WHITESPACE = re.compile(r"\s+")
+
+
+def normalize_alias_text(text: str | None) -> str:
+    """Canonical alias key: NFKC + casefold + whitespace collapse.
+
+    Used as the unique key in entity_aliases. NFKC collapses compatibility
+    codepoints (fullwidth digits, ligatures); casefold is Unicode-aware
+    lowercasing that handles ß → ss, cyrillic, turkish dotted i, etc.;
+    the whitespace pass turns any run (tabs, newlines, double spaces) into
+    a single space. Leading/trailing whitespace is stripped last.
+    """
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(text)).casefold()
+    collapsed = _ALIAS_NORMALIZE_WHITESPACE.sub(" ", normalized).strip()
+    return collapsed
+
+
+def compute_event_content_hash(
+    *,
+    text: str | None,
+    category: str | None = None,
+    actor: str | None = None,
+    entity_id: str | None = None,
+    domain: str | None = None,
+    project: str | None = None,
+    why: str | None = None,
+) -> str:
+    """Stable SHA-256 for a logical event, used for content-based dedup.
+
+    The payload is serialised as a sorted-keys JSON object so delimiter
+    collisions are impossible (``("a|b","c")`` and ``("a","b|c")`` now
+    produce distinct hashes) and the canonicalisation is deterministic
+    across Python versions. Timestamps are excluded on purpose — two rapid
+    calls with the same semantic payload collide and dedup kicks in.
+
+    Domain/project/why are included because Chronicle routinely records
+    functionally distinct events that share text+category in different
+    domains (``digest_run`` across projects, audits, canaries).
+    """
+    canonical = json.dumps(
+        {
+            "text": (text or "").strip(),
+            "category": (category or "").strip(),
+            "actor": (actor or "").strip(),
+            "entity_id": (entity_id or "").strip(),
+            "domain": (domain or "").strip(),
+            "project": (project or "").strip(),
+            "why": (why or "").strip(),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _manifest_status_root(manifest: dict[str, Any]) -> Path:
+    """Resolve status root from a loaded manifest dict."""
+    raw = manifest.get("__path__") or manifest.get("__manifest_path__")
+    if raw:
+        return Path(raw).expanduser().resolve().parent
+    cfg = _config(manifest)
+    return Path(cfg.status_root)
+
+
+def _resolve_mem0_bridge_path(manifest: dict[str, Any]) -> Path:
+    """Locate ``scripts/mem0_bridge.py`` relative to the Chronicle status root."""
+    return _manifest_status_root(manifest) / "scripts" / "mem0_bridge.py"
+
+
+def add_entity_alias_service(
+    manifest: dict[str, Any],
+    *,
+    alias_text: str,
+    canonical_entity_id: str,
+    entity_type: str,
+    domain: str = "global",
+    source: str | None = "manual",
+    confidence: float = 1.0,
+    alias_key_kind: str = "base",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if not feature_enabled(ENV_FEATURE_ENTITY_ALIASES):
+        return {
+            "status": "disabled",
+            "reason": f"{ENV_FEATURE_ENTITY_ALIASES}=off",
+            "alias": None,
+        }
+    if not alias_text or not alias_text.strip():
+        raise ValueError("alias_text is required and must not be blank")
+    if not canonical_entity_id:
+        raise ValueError("canonical_entity_id is required")
+
+    key = normalize_alias_text(alias_text)
+    if not key:
+        raise ValueError("alias_text is empty after normalization")
+
+    config = _config(manifest)
+    outcome = add_entity_alias(
+        config,
+        canonical_entity_id=canonical_entity_id,
+        entity_type=entity_type,
+        alias_text=alias_text,
+        alias_key=key,
+        domain=domain,
+        alias_key_kind=alias_key_kind,
+        confidence=confidence,
+        source=source,
+        dry_run=dry_run,
+    )
+    outcome["status"] = outcome.get("status", "ok")
+    outcome["normalized_key"] = key
+    return outcome
+
+
+def merge_entities_service(
+    manifest: dict[str, Any],
+    *,
+    source_entity_id: str,
+    target_entity_id: str,
+    reason: str,
+    actor: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if not feature_enabled(ENV_FEATURE_ENTITY_ALIASES):
+        return {
+            "status": "disabled",
+            "reason": f"{ENV_FEATURE_ENTITY_ALIASES}=off",
+        }
+    if not reason or not reason.strip():
+        raise ValueError("reason is required when merging entities")
+
+    config = _config(manifest)
+    summary = merge_normalized_entities(
+        config,
+        source_entity_id=source_entity_id,
+        target_entity_id=target_entity_id,
+        reason=reason,
+        actor=actor,
+        dry_run=dry_run,
+    )
+    summary["status"] = "dry_run" if dry_run else "ok"
+    return summary
+
+
+def entity_resolution_report_service(
+    manifest: dict[str, Any],
+    *,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    config = _config(manifest)
+    stats = entity_alias_stats(config, domain=domain)
+    stats["status"] = "ok"
+    stats["feature_enabled"] = feature_enabled(ENV_FEATURE_ENTITY_ALIASES)
+    return stats
+
+
+def search_mem0_live_service(
+    manifest: dict[str, Any],
+    *,
+    query: str,
+    limit: int = 10,
+    collection: str = "personal",
+    category: str | None = None,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """Wrap ``scripts/mem0_bridge.py search --json`` as an MCP tool.
+
+    Fail-closed: timeouts, non-zero exit, or unparseable output all return
+    ``{"status": "degraded", ...}`` with ``results=[]`` — never raises, so
+    callers can trust Chronicle's own answers regardless of Mem0 health.
+    """
+    if not feature_enabled(ENV_FEATURE_MEM0_LIVE_SEARCH):
+        return {
+            "status": "disabled",
+            "reason": f"{ENV_FEATURE_MEM0_LIVE_SEARCH}=off",
+            "results": [],
+        }
+    if not query or not query.strip():
+        raise ValueError("query is required and must not be blank")
+    if collection not in {"personal", "digest", "both"}:
+        raise ValueError(f"invalid collection: {collection!r}")
+
+    bridge_path = _resolve_mem0_bridge_path(manifest)
+    if not bridge_path.exists():
+        return {
+            "status": "degraded",
+            "reason": f"mem0_bridge not found at {bridge_path}",
+            "results": [],
+        }
+
+    timeout = (
+        float(timeout_s)
+        if timeout_s is not None
+        else env_float(ENV_MEM0_LIVE_TIMEOUT_S, default=DEFAULT_MEM0_LIVE_TIMEOUT_S)
+    )
+    cmd = [
+        "uv", "run", str(bridge_path),
+        "search", query,
+        "--json",
+        "--limit", str(int(limit)),
+        "--collection", collection,
+    ]
+    if category:
+        cmd.extend(["--category", category])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "degraded",
+            "reason": f"mem0 bridge timed out after {timeout}s",
+            "results": [],
+        }
+    except FileNotFoundError as exc:
+        return {
+            "status": "degraded",
+            "reason": f"mem0 bridge not runnable ({exc})",
+            "results": [],
+        }
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] if proc.stderr else []
+        return {
+            "status": "degraded",
+            "reason": f"mem0 bridge exit={proc.returncode}: {''.join(stderr_tail)[:300]}",
+            "results": [],
+        }
+
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+        return {"status": "degraded", "reason": "empty stdout", "results": []}
+
+    last_line = stdout.splitlines()[-1]
+    try:
+        payload = json.loads(last_line)
+    except json.JSONDecodeError:
+        return {
+            "status": "degraded",
+            "reason": "unparseable JSON from mem0 bridge",
+            "results": [],
+        }
+
+    payload.setdefault("status", "ok")
+    payload.setdefault("results", [])
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Hybrid recall — query_memory (RRF-fused FTS + vector + temporal)
+# ---------------------------------------------------------------------------
+
+_RRF_K = 60
+
+
+def _rrf_score(ranks: list[int | None]) -> float:
+    """Reciprocal Rank Fusion score: sum 1/(k + rank) for each non-None rank."""
+    return sum(1.0 / (_RRF_K + r) for r in ranks if r is not None)
+
+
+def _event_row_to_recall_entry(
+    event: dict[str, Any],
+    timezone_name: str,
+) -> dict[str, Any]:
+    """Compact event dict for query_memory results."""
+    occurred_utc = event.get("recorded_at") or ""
+    occurred_local = ""
+    if occurred_utc:
+        try:
+            from zoneinfo import ZoneInfo
+            from .store import _parse_iso  # type: ignore[attr-defined]
+            occurred_local = (
+                _parse_iso(occurred_utc)
+                .astimezone(ZoneInfo(timezone_name))
+                .isoformat(timespec="seconds")
+            )
+        except Exception:  # noqa: BLE001
+            occurred_local = occurred_utc
+    return {
+        "event_id": event.get("id"),
+        "text": event.get("text") or "",
+        "category": event.get("category"),
+        "occurred_at_local": occurred_local,
+        "occurred_at_utc": occurred_utc,
+        "project": event.get("project"),
+    }
+
+
+def query_memory(
+    manifest: dict[str, Any],
+    *,
+    query: str,
+    domain: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Hybrid recall: RRF-fused FTS, vector, and temporal channels.
+
+    Channels:
+      (a) FTS5/BM25 — reuses search_events.
+      (b) VECTOR — cosine over fetch_all_event_embeddings; skipped if
+          embed_text returns None (Ollama down).
+      (c) TEMPORAL — recency rank over all events.
+
+    Fused via Reciprocal Rank Fusion (k=60).
+
+    Returns a dict with:
+      ``results``      — list of up to *limit* hits, ranked by rrf_score desc.
+      ``channels_used``— list of channel names that contributed.
+      ``degraded``     — True when the vector channel was skipped.
+      ``query``        — the original query string.
+    """
+    from .embeddings import cosine, embed_text, EMBED_DIM, EMBED_MODEL
+
+    config = _config(manifest)
+    tz = manifest.get("settings", {}).get("timezone", "UTC")
+
+    channels_used: list[str] = []
+    degraded = False
+
+    # ---- per-channel ranked lists: {event_id: rank (0-based)} ----
+
+    fts_ranks: dict[str, int] = {}
+    vector_sims: dict[str, float] = {}
+    temporal_ranks: dict[str, int] = {}
+    channel_errors: dict[str, str] = {}
+
+    # (a) FTS channel
+    try:
+        fts_hits = search_events(
+            config,
+            query=query,
+            limit=max(limit * 4, 40),
+            domain=domain,
+        )
+        for idx, hit in enumerate(fts_hits):
+            fts_ranks[hit["id"]] = idx
+        if fts_hits:
+            channels_used.append("fts")
+    except Exception as exc:  # noqa: BLE001
+        # A broken FTS index must not silently masquerade as a clean recall —
+        # flag degradation so callers can tell partial results from full ones.
+        degraded = True
+        channel_errors["fts"] = f"{type(exc).__name__}: {exc}"
+
+    # (b) VECTOR channel
+    try:
+        query_vec = embed_text(query)
+        if query_vec is None:
+            degraded = True
+        else:
+            all_embeddings = fetch_all_event_embeddings(config)
+            if all_embeddings:
+                scored = sorted(
+                    ((eid, cosine(query_vec, vec)) for eid, vec in all_embeddings),
+                    key=lambda t: t[1],
+                    reverse=True,
+                )
+                for idx, (eid, sim) in enumerate(scored[: max(limit * 4, 40)]):
+                    vector_sims[eid] = sim
+                channels_used.append("vector")
+    except Exception as exc:  # noqa: BLE001
+        degraded = True
+        channel_errors["vector"] = f"{type(exc).__name__}: {exc}"
+
+    # (c) TEMPORAL channel — all event IDs ranked by recency
+    try:
+        recent_pool = fetch_recent_events(
+            config,
+            limit=max(limit * 8, 80),
+            domain=domain,
+        )
+        for idx, ev in enumerate(recent_pool):
+            temporal_ranks[ev["id"]] = idx
+        if recent_pool:
+            channels_used.append("temporal")
+    except Exception as exc:  # noqa: BLE001
+        degraded = True
+        channel_errors["temporal"] = f"{type(exc).__name__}: {exc}"
+
+    # ---- RRF fusion ----
+    all_candidate_ids: set[str] = (
+        set(fts_ranks) | set(vector_sims) | set(temporal_ranks)
+    )
+
+    if not all_candidate_ids:
+        return {
+            "query": query,
+            "domain": domain,
+            "results": [],
+            "channels_used": channels_used,
+            "degraded": degraded,
+            "channel_errors": channel_errors,
+        }
+
+    scored_candidates: list[tuple[float, str]] = []
+    for eid in all_candidate_ids:
+        fts_r = fts_ranks.get(eid)
+        vec_r: int | None = None
+        if eid in vector_sims:
+            # Convert similarity to rank position within the vector list
+            vec_list = sorted(vector_sims, key=lambda k: vector_sims[k], reverse=True)
+            vec_r = vec_list.index(eid) if eid in vec_list else None
+        tmp_r = temporal_ranks.get(eid)
+        score = _rrf_score([fts_r, vec_r, tmp_r])
+        scored_candidates.append((score, eid))
+
+    scored_candidates.sort(key=lambda t: t[0], reverse=True)
+    # Build a lookup dict from the sorted list
+    score_by_id: dict[str, float] = {eid: score for score, eid in scored_candidates}
+    top_ids = [eid for _, eid in scored_candidates[:limit]]
+
+    # ---- hydrate events ----
+    results: list[dict[str, Any]] = []
+    for eid in top_ids:
+        event = fetch_event(config, event_id=eid)
+        if event is None:
+            continue
+        entry = _event_row_to_recall_entry(event, tz)
+        entry["rrf_score"] = round(score_by_id.get(eid, 0.0), 6)
+        entry["channels"] = {
+            "fts_rank": fts_ranks.get(eid),
+            "vector_similarity": round(vector_sims[eid], 6) if eid in vector_sims else None,
+            "recency_rank": temporal_ranks.get(eid),
+        }
+        results.append(entry)
+
+    return {
+        "query": query,
+        "domain": domain,
+        "results": results,
+        "channels_used": channels_used,
+        "degraded": degraded,
+        "channel_errors": channel_errors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Embed backfill
+# ---------------------------------------------------------------------------
+
+
+def embed_backfill(
+    manifest: dict[str, Any],
+    *,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Embed all events that lack an embedding row.
+
+    Returns counts: {embedded, skipped, failed}.
+    Best-effort — individual failures do not abort the run.
+    """
+    from .embeddings import embed_text, EMBED_DIM, EMBED_MODEL
+
+    config = _config(manifest)
+    event_ids = fetch_event_ids_without_embedding(config)
+    if limit is not None:
+        event_ids = event_ids[:limit]
+
+    embedded = 0
+    skipped = 0
+    failed = 0
+
+    for event_id in event_ids:
+        try:
+            event = fetch_event(config, event_id=event_id)
+            if event is None:
+                skipped += 1
+                continue
+            title_part = event.get("project") or ""
+            text_part = event.get("text") or ""
+            why_part = event.get("why") or ""
+            embed_input = " ".join(
+                part for part in [title_part, text_part, why_part] if part
+            ).strip()
+            if not embed_input:
+                skipped += 1
+                continue
+            vec = embed_text(embed_input)
+            if vec is None:
+                failed += 1
+                continue
+            store_event_embedding(config, event_id, vec, EMBED_MODEL, EMBED_DIM)
+            embedded += 1
+        except Exception:  # noqa: BLE001
+            failed += 1
+
+    return {
+        "total_without_embedding": len(event_ids),
+        "embedded": embedded,
+        "skipped": skipped,
+        "failed": failed,
     }

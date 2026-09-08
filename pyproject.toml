@@ -4,13 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "max-chronicle"
-version = "0.2.0"
-description = "Canonical local-first chronicle for Maksym Beiev's systems, projects, and durable memory."
+version = "0.9.0"
+description = "Local-first durable memory for AI agents: append-only events, snapshots, hybrid recall, MCP server."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.9.4,<2",
-  "openai>=1.0.0,<2",
+  # Imported directly by the MCP server (transport, schemas, thread offload).
+  # They arrive with `mcp` today, but declaring them keeps an upstream change
+  # from silently breaking the build.
+  "anyio>=4.0,<5",
+  "pydantic>=2.0,<3",
+  "starlette>=0.37",
 ]
 
 [project.scripts]
@@ -29,4 +34,18 @@ max_chronicle = ["migrations/*.sql"]
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2,<9",
+  "httpx>=0.27",   # starlette.testclient, used by the /health route test
 ]
+
+# `chronicle browse` renders richer output when this is present and degrades
+# to plain text when it is not.
+pretty = [
+  "rich>=13.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importmode=importlib + rootdir on sys.path lets `pytest` work from anywhere,
+# not just `python -m pytest` at the repo root (tests import tests.conftest).
+addopts = "--import-mode=importlib"
+pythonpath = ["."]

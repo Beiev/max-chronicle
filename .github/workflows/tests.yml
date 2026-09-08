@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # macOS: the optional automation layer drives launchd and shells out to
+    # `launchctl` and `plutil`, so the doctor tests only make sense here. The
+    # core (store, service, MCP server, recall) is platform-independent —
+    # gating those tests by platform is what a Linux job is waiting on.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run tests
+        # Hermetic: every case builds its own sandbox workspace and SQLite file
+        # under tmp_path. No network, no Ollama, no Mem0 — the optional bridge
+        # tests skip when that operator tooling is absent.
+        run: python -m pytest -q
