@@ -1990,6 +1990,7 @@ def reconstruct_timeline(
     domain: str | None = None,
     window_hours: int = 6,
     limit: int = 3,
+    detail: str = "digest",
 ) -> dict[str, Any]:
     config = _config(manifest)
     payload = timeline_state(
@@ -1999,6 +2000,7 @@ def reconstruct_timeline(
         window_hours=window_hours,
         limit=limit,
         visibility="raw",
+        detail=detail,
     )
     payload["contract_name"] = ACTIVATION_CONTRACT_NAME
     payload["contract_version"] = ACTIVATION_CONTRACT_VERSION

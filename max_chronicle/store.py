@@ -3032,6 +3032,34 @@ def has_snapshot_for_local_date(
     return row is not None
 
 
+# A snapshot payload embeds copies of the ledger and of semantic recall as they
+# stood at capture time. Those three keys are ~23 KB of a ~24 KB snapshot, and
+# they answer questions that the live tools answer better and more currently.
+# Replaying them verbatim made a two-snapshot state_at call 62 KB — enough to
+# crowd out an agent's working context for an archaeology lookup.
+_SNAPSHOT_BULK_KEYS = ("recent_ledger", "mem0_snapshot_hits", "source_excerpts")
+
+
+def digest_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop a snapshot's embedded bulk, keeping a count of what was left out."""
+    digest = {key: value for key, value in payload.items() if key not in _SNAPSHOT_BULK_KEYS}
+    omitted = {
+        key: (len(payload[key]) if isinstance(payload[key], (list, dict)) else 1)
+        for key in _SNAPSHOT_BULK_KEYS
+        if payload.get(key)
+    }
+    if omitted:
+        digest["omitted"] = {
+            "counts": omitted,
+            "hint": (
+                "Snapshot-time copies of the ledger and semantic recall. Pass "
+                'detail="full" for the stored payload, or use recent_events / '
+                "query_memory for current data."
+            ),
+        }
+    return digest
+
+
 def timeline_state(
     config: ChronicleConfig,
     *,
@@ -3040,7 +3068,10 @@ def timeline_state(
     window_hours: int = 6,
     limit: int = 3,
     visibility: str = "default",
+    detail: str = "digest",
 ) -> dict[str, Any]:
+    if detail not in ("digest", "full"):
+        raise ValueError(f"detail must be 'digest' or 'full', got {detail!r}")
     resolved_visibility = _normalize_event_visibility(visibility)
     target_utc = target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -3092,7 +3123,7 @@ def timeline_state(
         payload = _load_json(row["payload_json"])
         payload.setdefault("captured_at_utc", row["captured_at_utc"])
         payload["delta_seconds"] = int(row["delta_seconds"])
-        snapshots.append(payload)
+        snapshots.append(payload if detail == "full" else digest_snapshot(payload))
 
     return {
         "target_utc": target_utc,

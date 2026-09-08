@@ -1684,3 +1684,94 @@ def test_offload_limiters_are_scoped_per_event_loop(chronicle_sandbox) -> None:
     first = asyncio.run(exercise())
     second = asyncio.run(exercise())
     assert first != second, "limiter leaked across event loops"
+
+
+def test_mcp_activate_agent_does_not_return_the_full_document_bundle(
+    chronicle_sandbox, loaded_manifest
+) -> None:
+    """The deprecated entry point used to hand back ~130 KB at session start.
+
+    `attach_bundle` carried the verbatim text of every status document and the
+    snapshot carried capture-time copies of the ledger and semantic recall — a
+    context bomb on the one call older agents still make by this name. It now
+    returns the prompt, a runtime digest and the freshness audit.
+    """
+    async def exercise() -> dict:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        activation = await server.call_tool(
+            "activate_agent",
+            {"domain": "global", "agent": "pytest", "capture": False},
+        )
+        return _decode_mcp_json(activation)
+
+    payload = asyncio.run(exercise())
+
+    assert "attach_bundle" not in payload
+    assert payload["prompt"]
+    assert payload["deprecated"]["superseded_by"] == "startup_bundle"
+    assert "freshness_audit" in payload
+    for bulk_key in ("recent_ledger", "mem0_snapshot_hits", "source_excerpts"):
+        assert bulk_key not in payload["snapshot"]
+
+
+def test_mcp_activate_agent_still_unlocks_and_still_carries_runtime_state(
+    chronicle_sandbox, loaded_manifest
+) -> None:
+    """Trimming the payload must not cost the caller what the tool is for."""
+    async def exercise() -> dict:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        activation = await server.call_tool(
+            "activate_agent",
+            {"domain": "global", "agent": "pytest", "capture": False},
+        )
+        stored = await server.call_tool(
+            "record_event",
+            {
+                "text": "Write surface still unlocked after the payload was trimmed.",
+                "domain": "global",
+                "category": "decision",
+                "project": "status",
+                "why": "Regression guard for the activate_agent slimming.",
+                "agent": "pytest",
+                "source_files": [],
+            },
+        )
+        return {
+            "activation": _decode_mcp_json(activation),
+            "stored": _decode_mcp_json(stored),
+        }
+
+    result = asyncio.run(exercise())
+
+    assert result["stored"]["chronicle_status"] == "stored"
+    snapshot = result["activation"]["snapshot"]
+    assert snapshot["id"]
+    assert "repos" in snapshot
+
+
+def test_mcp_capture_snapshot_returns_a_receipt_not_the_whole_snapshot(
+    chronicle_sandbox, loaded_manifest
+) -> None:
+    """Agents capture before a handoff — the reply must not eat the context they have left.
+
+    The stored snapshot embeds a copy of the ledger, document excerpts and every
+    normalized entity with its full source_refs list. The caller needs the id and
+    what was written, not a replay.
+    """
+    async def exercise() -> dict:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        await server.call_tool("startup_bundle", {"domain": "global", "agent": "pytest"})
+        captured = await server.call_tool(
+            "capture_snapshot",
+            {"domain": "global", "agent": "pytest", "title": "Receipt shape"},
+        )
+        return _decode_mcp_json(captured)
+
+    payload = asyncio.run(exercise())
+
+    assert payload["chronicle_status"] == "stored"
+    assert payload["id"]
+    assert payload["projection_runs"]
+    for bulk_key in ("recent_ledger", "mem0_snapshot_hits", "source_excerpts"):
+        assert bulk_key not in payload
+    assert set(payload["normalized_entities"]) == {"count", "ids"}

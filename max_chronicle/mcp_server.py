@@ -47,7 +47,13 @@ from .service import (
     reconstruct_timeline,
     search_mem0_live_service,
 )
-from .store import config_from_manifest, fetch_recent_events, fetch_latest_snapshot, open_connection
+from .store import (
+    digest_snapshot,
+    config_from_manifest,
+    fetch_latest_snapshot,
+    fetch_recent_events,
+    open_connection,
+)
 
 READ_ONLY_PROFILE = "readonly"
 CHRONICLER_PROFILE = "chronicler"
@@ -79,6 +85,16 @@ LIMIT_ARG = Annotated[int, Field(description="Maximum number of recent items or 
 COMPACT_ARG = Annotated[bool, Field(description="Return the compact startup bundle variant.")]
 TIMESTAMP_ARG = Annotated[str, Field(description="ISO timestamp to reconstruct around.")]
 WINDOW_HOURS_ARG = Annotated[int, Field(description="Search window in hours around the timestamp.")]
+SNAPSHOT_DETAIL_ARG = Annotated[
+    str,
+    Field(
+        description=(
+            "How much of each snapshot to return: 'digest' (default) drops the "
+            "capture-time copies of the ledger and semantic recall, 'full' returns "
+            "the stored payload verbatim."
+        )
+    ),
+]
 QUERY_ARG = Annotated[str, Field(description="Search string to match across Chronicle, status sources, and Mem0.")]
 QUERY_MODE_ARG = Annotated[
     QUERY_CONTEXT_MODE,
@@ -284,6 +300,17 @@ def _startup_required_message(tool_name: str, *, domain: str = "global") -> str:
         "since; calling it again is safe and re-unlocks. "
         "No Chronicle mutation was performed."
     )
+
+
+def _audit_summary(audit: dict | None) -> dict | None:
+    """Verdict and warnings only — `sources_audit` serves the per-source detail.
+
+    The full audit repeats every source's metadata, and its warnings are
+    already spelled out at the end of the activation prompt.
+    """
+    if not audit:
+        return audit
+    return {key: audit[key] for key in ("status", "issue_count", "warnings", "issues") if key in audit}
 
 
 def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER_PROFILE) -> FastMCP:
@@ -551,7 +578,10 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         description=(
             "Timeline archaeology: reconstruct what was true around an ISO timestamp "
             "(nearest snapshots + events in a window). Use for 'what was happening on <date>'; "
-            "for topic search use query_memory."
+            "for topic search use query_memory. Snapshots come back digested — their "
+            "capture-time copies of the ledger and of semantic recall are replaced by a "
+            "count, since live recall serves those better; pass detail=\"full\" to get the "
+            "stored payload verbatim (tens of KB per snapshot)."
         ),
     )
     def tool_state_at(
@@ -559,10 +589,18 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         domain: OPTIONAL_DOMAIN_ARG = None,
         window_hours: WINDOW_HOURS_ARG = 6,
         limit: LIMIT_ARG = 3,
+        detail: SNAPSHOT_DETAIL_ARG = "digest",
     ) -> dict:
         loaded = manifest()
         target = parse_when(timestamp, loaded)
-        return reconstruct_timeline(loaded, timestamp=target, domain=domain, window_hours=window_hours, limit=limit)
+        return reconstruct_timeline(
+            loaded,
+            timestamp=target,
+            domain=domain,
+            window_hours=window_hours,
+            limit=limit,
+            detail=detail,
+        )
 
     @register_tool(
         writes=False,
@@ -612,8 +650,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             name="activate_agent",
             description=(
                 "DEPRECATED alias — prefer `startup_bundle` as the single session entry point. "
-                "Kept for transition: captures current state (capture=true by default) and returns "
-                "the universal activation prompt; also unlocks the chronicler write surface."
+                "Kept for transition: captures current state (capture=true by default), unlocks "
+                "the chronicler write surface, and returns the activation prompt plus a digest of "
+                "runtime state. Call `startup_bundle` for the full brief."
             ),
         )
         def tool_activate_agent(
@@ -624,7 +663,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             capture: CAPTURE_ARG = True,
             ctx: Context | None = None,
         ) -> dict:
-            payload = build_activation(
+            activation = build_activation(
                 manifest(),
                 domain_id=domain,
                 agent=_normalize_agent(agent),
@@ -632,6 +671,31 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                 focus=focus,
                 capture=capture,
             )
+            # The full activation payload is ~130 KB: the attach bundle carries the
+            # verbatim text of every status document (~87 KB) and the snapshot carries
+            # capture-time copies of the ledger and semantic recall (~40 KB). Handing
+            # that to an agent at session start costs more context than the session
+            # has to spend, and it is the entry point older agents still call by this
+            # name. What this tool is actually for is the prompt and the unlock; the
+            # documents are served by `startup_bundle`, `query_context` and the
+            # resources. The CLI keeps the unabridged payload.
+            snapshot = activation.get("snapshot") or {}
+            payload = {
+                "contract_name": activation.get("contract_name"),
+                "contract_version": activation.get("contract_version"),
+                "prompt": activation.get("prompt"),
+                "snapshot": digest_snapshot(snapshot),
+                "freshness_audit": _audit_summary(
+                    (activation.get("attach_bundle") or {}).get("freshness_audit")
+                ),
+                "deprecated": {
+                    "superseded_by": "startup_bundle",
+                    "note": (
+                        "Returns the activation prompt and a runtime digest. For the full "
+                        "brief call `startup_bundle`; for document text use `query_context`."
+                    ),
+                },
+            }
             unlock_startup_gate(ctx)
             return payload
 
@@ -697,13 +761,28 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             ctx: Context | None = None,
         ) -> dict:
             require_startup_gate(ctx, tool_name="capture_snapshot", domain=domain)
-            return capture_runtime_snapshot(
+            captured = capture_runtime_snapshot(
                 manifest(),
                 domain_id=domain,
                 agent=_normalize_agent(agent),
                 title=title,
                 focus=focus,
             )
+            # Agents are told to capture before a handoff or a context switch —
+            # exactly when context is scarcest. Echoing the whole stored snapshot
+            # back (~30 KB: the embedded ledger copy, document excerpts, and every
+            # normalized entity with its full source_refs list) spends that budget
+            # on data the caller just supplied or can read back on demand. What a
+            # caller needs here is confirmation: the id, where it landed, and what
+            # was written. The CLI still prints the full payload.
+            payload = digest_snapshot(captured)
+            entities = payload.get("normalized_entities")
+            if isinstance(entities, list):
+                payload["normalized_entities"] = {
+                    "count": len(entities),
+                    "ids": [entity.get("id") for entity in entities],
+                }
+            return payload
 
         @register_tool(
             writes=True,

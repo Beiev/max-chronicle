@@ -95,7 +95,7 @@ Read tools work immediately; write tools open after one `startup_bundle` call pe
 | `query_memory` | Primary recall. RRF fusion over full-text, vector, and recency channels. |
 | `query_context` | Broader sweep that also reads Markdown sources and an optional Mem0 dump. |
 | `recent_events` | Cheap latest-N feed for situational awareness. |
-| `state_at` | Reconstruct what was true around a timestamp. |
+| `state_at` | Reconstruct what was true around a timestamp. Snapshots come back digested; `detail="full"` returns the stored payload verbatim. |
 | `sources_audit` | Source coverage, freshness, and trust metadata. |
 | `record_event` | Write a durable event and archive linked source files. |
 | `capture_snapshot` | Capture live runtime state and refresh Markdown projections. |
@@ -104,6 +104,16 @@ Read tools work immediately; write tools open after one `startup_bundle` call pe
 
 `activate_agent` is still registered as a deprecated alias of `startup_bundle` so existing
 agents keep working; new integrations should call `startup_bundle`.
+
+**Replies are sized for the caller.** A tool answers with what the caller needs,
+not with an echo of what it already holds. `state_at` and `activate_agent` digest
+the snapshots they return — capture-time copies of the ledger and of semantic
+recall are replaced by a count, because live recall serves that data better and
+more currently — and `capture_snapshot` answers with a receipt (id, artifacts
+written, projection hashes) rather than replaying the snapshot it just stored.
+This matters because the calls an agent makes at session start and before a
+handoff are the ones where its remaining context is scarcest. The CLI still
+prints the unabridged payloads.
 
 ### Operational behaviour
 

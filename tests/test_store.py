@@ -535,3 +535,127 @@ def test_load_manifest_cached_reparses_only_after_change(chronicle_sandbox, monk
     runtime_context.load_manifest_cached(chronicle_sandbox.manifest_path)
     assert calls["n"] == 2
     runtime_context._manifest_cache.clear()
+
+
+# --------------------------------------------------------------------------
+# state_at / timeline_state snapshot digesting
+# --------------------------------------------------------------------------
+
+
+def _snapshot_with_bulk(config, *, captured_at_utc: str) -> None:
+    """Store a snapshot shaped like the real ones: light meta plus heavy copies."""
+    from max_chronicle.store import open_connection
+
+    payload = {
+        "id": "snap-bulk",
+        "domain": "global",
+        "title": "Scheduled daily capture",
+        "agent": "chronicle-launchd",
+        "captured_at_local": "2026-09-08T23:44:41+02:00",
+        "repos": [{"path": "/tmp/repo", "branch": "main"}],
+        "recent_ledger": [{"text": "x" * 400} for _ in range(8)],
+        "mem0_snapshot_hits": {"q": [{"memory": "y" * 400}]},
+        "source_excerpts": [{"id": "status", "content": "z" * 800}],
+    }
+    with open_connection(config) as connection:
+        connection.execute(
+            "INSERT INTO snapshots "
+            "(id, captured_at_utc, captured_at_local, timezone, agent, domain, title, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "snap-bulk",
+                captured_at_utc,
+                payload["captured_at_local"],
+                "Europe/Warsaw",
+                payload["agent"],
+                "global",
+                payload["title"],
+                json.dumps(payload),
+            ),
+        )
+        connection.commit()
+
+
+def test_state_at_digests_snapshot_bulk_by_default(chronicle_sandbox, loaded_manifest) -> None:
+    """A two-snapshot state_at used to return 62 KB and blow an agent's context.
+
+    The bulk is capture-time copies of the ledger and of semantic recall —
+    stale duplicates of what recent_events and query_memory serve live.
+    """
+    from max_chronicle.service import _config, reconstruct_timeline
+
+    config = _config(loaded_manifest)
+    _snapshot_with_bulk(config, captured_at_utc="2026-09-08T21:44:41Z")
+
+    payload = reconstruct_timeline(
+        loaded_manifest,
+        timestamp=datetime(2026, 9, 8, 21, 45, tzinfo=timezone.utc),
+        domain="global",
+        limit=1,
+    )
+
+    snapshot = payload["nearest_snapshots"][0]
+    assert "recent_ledger" not in snapshot
+    assert "mem0_snapshot_hits" not in snapshot
+    assert "source_excerpts" not in snapshot
+    assert snapshot["omitted"]["counts"] == {
+        "recent_ledger": 8,
+        "mem0_snapshot_hits": 1,
+        "source_excerpts": 1,
+    }
+    assert "detail" in snapshot["omitted"]["hint"]
+
+
+def test_state_at_digest_keeps_the_fields_the_cli_prints(chronicle_sandbox, loaded_manifest) -> None:
+    from max_chronicle.service import _config, reconstruct_timeline
+
+    config = _config(loaded_manifest)
+    _snapshot_with_bulk(config, captured_at_utc="2026-09-08T21:44:41Z")
+
+    payload = reconstruct_timeline(
+        loaded_manifest,
+        timestamp=datetime(2026, 9, 8, 21, 45, tzinfo=timezone.utc),
+        domain="global",
+        limit=1,
+    )
+
+    snapshot = payload["nearest_snapshots"][0]
+    for field in ("captured_at_local", "title", "domain", "agent", "delta_seconds", "repos"):
+        assert field in snapshot, f"CLI reads {field} off each snapshot row"
+
+
+def test_state_at_full_detail_returns_the_stored_payload(chronicle_sandbox, loaded_manifest) -> None:
+    """Nothing is lost — the whole snapshot is still reachable on request."""
+    from max_chronicle.service import _config, reconstruct_timeline
+
+    config = _config(loaded_manifest)
+    _snapshot_with_bulk(config, captured_at_utc="2026-09-08T21:44:41Z")
+
+    digest = reconstruct_timeline(
+        loaded_manifest,
+        timestamp=datetime(2026, 9, 8, 21, 45, tzinfo=timezone.utc),
+        domain="global",
+        limit=1,
+    )
+    full = reconstruct_timeline(
+        loaded_manifest,
+        timestamp=datetime(2026, 9, 8, 21, 45, tzinfo=timezone.utc),
+        domain="global",
+        limit=1,
+        detail="full",
+    )
+
+    assert len(full["nearest_snapshots"][0]["recent_ledger"]) == 8
+    assert len(json.dumps(full)) > 4 * len(json.dumps(digest))
+
+
+def test_state_at_rejects_an_unknown_detail_level(chronicle_sandbox, loaded_manifest) -> None:
+    from max_chronicle.service import reconstruct_timeline
+
+    with pytest.raises(ValueError, match="detail"):
+        reconstruct_timeline(
+            loaded_manifest,
+            timestamp=datetime(2026, 9, 8, 21, 45, tzinfo=timezone.utc),
+            domain="global",
+            detail="verbose",
+        )
