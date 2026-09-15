@@ -31,3 +31,12 @@ jobs:
         # under tmp_path. No network, no Ollama, no Mem0 — the optional bridge
         # tests skip when that operator tooling is absent.
         run: python -m pytest -q
+      - name: Build distributions
+        run: python -m build
+      - name: Verify installed wheel outside checkout
+        run: |
+          python -m venv "$RUNNER_TEMP/chronicle-wheel"
+          "$RUNNER_TEMP/chronicle-wheel/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/chronicle-wheel/bin/chronicle" init --root "$RUNNER_TEMP/memory"
+          "$RUNNER_TEMP/chronicle-wheel/bin/chronicle" --help

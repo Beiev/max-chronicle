@@ -516,7 +516,7 @@ def build_runtime_snapshot(
         "recent_ledger": recent_events[:8],
         "mem0_dump": mem0_meta(manifest),
         "mem0_snapshot_hits": mem0_hits,
-        "portfolio_assets": summarize_asset_manifest(expand_path(paths["portfolio_asset_manifest"])),
+        "portfolio_assets": summarize_asset_manifest(expand_path(paths["portfolio_asset_manifest"])) if paths.get("portfolio_asset_manifest") else {},
         "repos": repos,
     }
 
@@ -564,9 +564,9 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "- Before context switches, handoff, or thread end, capture a timestamped snapshot.",
         "- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later.",
         "",
-        "Current priorities:",
-        "- Portfolio v1.0 is the main gate. LinkedIn depends on it.",
-        "- Chronicle hardening → production is the active P2 track.",
+        "Current task:",
+        f"- Focus: {snapshot.get('focus') or 'Read current project context before choosing work.'}",
+        "- Read current priorities from the configured sources; historical events may describe superseded decisions.",
         "",
         "Portfolio asset state:",
         f"- Projects tracked: {portfolio.get('projects_total', 'unknown')}",

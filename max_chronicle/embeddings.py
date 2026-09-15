@@ -49,6 +49,10 @@ def cosine(a: list[float], b: list[float]) -> float:
 
     Returns 0.0 when either vector is zero-length (degenerate embedding).
     """
+    if len(a) != len(b):
+        raise ValueError("Embedding dimensions do not match")
+    if not all(math.isfinite(x) for x in (*a, *b)):
+        raise ValueError("Embedding contains non-finite values")
     dot = sum(x * y for x, y in zip(a, b))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(y * y for y in b))
@@ -60,6 +64,15 @@ def cosine(a: list[float], b: list[float]) -> float:
 # ---------------------------------------------------------------------------
 # Ollama embedding call
 # ---------------------------------------------------------------------------
+
+
+def event_embedding_text(event: dict[str, Any]) -> str:
+    parts = [event.get(key) for key in ("project", "text", "why")]
+    if event.get("fact"):
+        parts.extend(event["fact"].get(key) for key in ("slot", "value"))
+    if event.get("checkpoint"):
+        parts.append(event["checkpoint"].get("goal"))
+    return " ".join(part for part in parts if part).strip()
 
 
 def embed_text(text: str, *, timeout: float = 3.0) -> list[float] | None:
@@ -91,6 +104,11 @@ def embed_text(text: str, *, timeout: float = 3.0) -> list[float] | None:
         embedding = parsed.get("embedding")
         if not isinstance(embedding, list) or len(embedding) == 0:
             return None
-        return [float(x) for x in embedding]
+        vector = [float(x) for x in embedding]
+        if len(vector) != EMBED_DIM or not all(math.isfinite(x) for x in vector):
+            return None
+        if not any(vector):
+            return None
+        return vector
     except Exception:  # noqa: BLE001 — intentional blanket catch
         return None

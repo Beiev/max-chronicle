@@ -104,10 +104,10 @@ def test_migrate_is_idempotent(chronicle_sandbox) -> None:
     )
     first_payload = json.loads(first.stdout)
     second_payload = json.loads(second.stdout)
-    assert len(first_payload["applied"]) == 9
+    assert len(first_payload["applied"]) == 10
     assert second_payload["applied"] == []
-    assert first_payload["summary"]["user_version"] == 9
-    assert second_payload["summary"]["user_version"] == 9
+    assert first_payload["summary"]["user_version"] == 10
+    assert second_payload["summary"]["user_version"] == 10
 
 
 def test_repair_stale_runs_cli_reports_and_marks_both_run_tables(chronicle_sandbox, loaded_manifest) -> None:
@@ -419,7 +419,7 @@ def test_backup_manifest_hash_matches_post_maintenance_db_hash(chronicle_sandbox
     assert manifest_payload["restore_check"] == result["restore_check"]
 
 
-def test_backup_uses_hardlinks_for_artifacts(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+def test_backup_artifacts_are_independent_of_source(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
     chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
     artifact_source = chronicle_sandbox.status_root / "chronicle-artifacts" / "snapshots" / "shared.json"
     artifact_source.parent.mkdir(parents=True, exist_ok=True)
@@ -430,9 +430,28 @@ def test_backup_uses_hardlinks_for_artifacts(chronicle_sandbox, loaded_manifest,
 
     assert result["status"] == "ok"
     assert backup_artifact.exists()
-    assert backup_artifact.stat().st_ino == artifact_source.stat().st_ino
-    assert result["artifact_files_copied"] == 0
-    assert result["artifact_copy_strategy"]["hardlinked"] >= 1
+    assert backup_artifact.stat().st_ino != artifact_source.stat().st_ino
+    artifact_source.write_text("source changed", encoding="utf-8")
+    assert backup_artifact.read_text() == '{"hello":"world"}\n'
+    assert result["artifact_files_copied"] >= 1
+
+
+def test_restore_verifies_contents_after_relocation(chronicle_sandbox, loaded_manifest, loaded_automation, tmp_path) -> None:
+    import shutil
+    from max_chronicle.native_automation import _restore_check
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    source = chronicle_sandbox.status_root / "chronicle-artifacts" / "proof.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("original proof")
+    result = run_backup(loaded_manifest, loaded_automation, force=True)
+    relocated = tmp_path / "relocated"
+    shutil.copytree(result["backup_path"], relocated)
+    source.unlink()
+    assert _restore_check(relocated / "chronicle.db", backup_path=relocated)["ok"]
+    (relocated / "chronicle-artifacts" / "proof.txt").write_text("corrupt! proof")
+    check = _restore_check(relocated / "chronicle.db", backup_path=relocated)
+    assert not check["ok"]
+    assert not check["artifact_hashes_ok"]
 
 
 def test_backup_falls_back_to_copy_when_hardlink_unavailable(monkeypatch, chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
@@ -1392,3 +1411,25 @@ def test_backup_registers_manifest_artifact_so_weekly_restore_drill_passes(
     assert not wal_path.exists() or wal_path.stat().st_size == 0, (
         "manifest rows stranded in the backup WAL — copying chronicle.db alone would lose them"
     )
+
+
+def test_backup_reports_intentional_purge_without_claiming_file_is_archived(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+):
+    from max_chronicle.store import store_artifact_from_path
+
+    source = chronicle_sandbox.status_root / "retired-evidence.txt"
+    source.write_text("Explicitly removed historical evidence")
+    config = config_from_manifest(loaded_manifest)
+    artifact = store_artifact_from_path(config, source_path=source, artifact_type="event-source")
+    Path(artifact["storage_path"]).unlink()
+    with open_connection(config) as connection, connection:
+        connection.execute(
+            "UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.storage_mode','purged') WHERE id=?",
+            (artifact["id"],),
+        )
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    result = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+    assert result["status"] == "ok"
+    assert result["restore_check"]["intentionally_purged_artifacts"] == 1
+    assert result["restore_check"]["artifact_hashes_ok"] is True

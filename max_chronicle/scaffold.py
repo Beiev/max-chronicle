@@ -69,273 +69,37 @@ def _write_executable(
 
 
 def _manifest_template(root: Path, timezone_name: str) -> str:
-    workspaces_root = root / "workspaces"
-    docs_root = root / "docs"
-    runtime_root = root / "runtime"
-    return f"""version = 1
-title = "Chronicle Workspace"
-
-[settings]
-timezone = "{timezone_name}"
-
-[paths]
-status_root = "{_path(root)}"
-ledger_file = "{_path(root / 'ssot-ledger.jsonl')}"
-snapshot_file = "{_path(root / 'chronicle-snapshots.jsonl')}"
-chronicle_db = "{_path(root / 'chronicle.db')}"
-chronicle_artifact_dir = "{_path(root / 'chronicle-artifacts')}"
-chronicle_package_root = "{_path(root)}"
-mem0_dump = "{_path(root / 'mem0-dump.json')}"
-mem0_bridge = "{_path(root / 'scripts' / 'mem0_bridge.py')}"
-env_file = "{_path(root / '.env')}"
-workspace_root = "{_path(workspaces_root)}"
-portfolio_asset_manifest = "{_path(runtime_root / 'portfolio' / 'asset-manifest.ts')}"
-portfolio_repo = "{_path(workspaces_root / 'portfolio')}"
-render_repo = "{_path(workspaces_root / 'renderkit')}"
-media_sorter_repo = "{_path(workspaces_root / 'media-sorter')}"
-
-[[lanes]]
-id = "work"
-label = "Work"
-sensitive = false
-default_enabled = true
-
-[[lanes]]
-id = "agents"
-label = "Agents"
-sensitive = false
-default_enabled = true
-
-[[lanes]]
-id = "world"
-label = "World"
-sensitive = false
-default_enabled = true
-
-[[lanes]]
-id = "career_market"
-label = "Career Market"
-sensitive = false
-default_enabled = true
-
-[[lanes]]
-id = "companies"
-label = "Companies"
-sensitive = false
-default_enabled = true
-
-[[lanes]]
-id = "life_admin"
-label = "Life Admin"
-sensitive = true
-default_enabled = false
-
-[[lanes]]
-id = "decisions"
-label = "Decisions"
-sensitive = false
-default_enabled = true
-
-[[lanes]]
-id = "vectors"
-label = "Vectors"
-sensitive = false
-default_enabled = true
-
-[[runtime_sources]]
-id = "portfolio_asset_manifest"
-label = "Portfolio Asset Manifest"
-path_key = "portfolio_asset_manifest"
-lane = "work"
-trust_tier = "canonical"
-owner = "chronicle"
-questions_it_can_answer = ["What asset readiness or missing-media signals exist right now?"]
-questions_it_cannot_answer = ["Anything outside the portfolio/media pipeline."]
-
-[freshness.attach_sources.status]
-live_hours = 12
-recent_hours = 72
-stale_hours = 168
-
-[freshness.attach_sources.priorities]
-live_hours = 24
-recent_hours = 96
-stale_hours = 240
-
-[freshness.attach_sources.job_search]
-live_hours = 12
-recent_hours = 72
-stale_hours = 168
-
-[freshness.attach_sources.memory_system]
-recent_hours = 240
-stale_hours = 1440
-
-[freshness.attach_sources.chronicle_protocol]
-recent_hours = 240
-stale_hours = 1440
-
-[freshness.attach_sources.chronicle_adr]
-recent_hours = 720
-stale_hours = 2160
-
-[freshness.attach_sources.chronicle_schema]
-recent_hours = 720
-stale_hours = 2160
-
-[freshness.attach_sources.chronicle_checklist]
-recent_hours = 720
-stale_hours = 2160
-
-[freshness.semantic_recall.mem0_dump]
-live_hours = 18
-recent_hours = 30
-stale_hours = 54
-
-[freshness.runtime_evidence.portfolio_asset_manifest]
-recent_hours = 168
-stale_hours = 720
-
-[[sources]]
-id = "status"
-label = "Status"
-path = "{_path(root / 'status.md')}"
-kind = "markdown"
-role = "ssot"
-trust_tier = "operator_curated"
-priority = 100
-headings = [
-  "Active Projects",
-  "Decisions Log",
-  "Priorities",
-  "Blockers / Waiting",
-]
-
-[[sources]]
-id = "priorities"
-label = "Priorities"
-path = "{_path(root / 'priorities.md')}"
-kind = "markdown"
-role = "strategy"
-trust_tier = "operator_curated"
-priority = 90
-headings = [
-  "Strategic Context",
-  "Priority Stack (ordered)",
-  "Anti-Patterns",
-  "Key Constraints",
-]
-
-[[sources]]
-id = "job_search"
-label = "Pipeline Status"
-path = "{_path(root / 'job-search-status.md')}"
-kind = "markdown"
-role = "pipeline_metrics"
-trust_tier = "operator_curated"
-priority = 80
-
-[[sources]]
-id = "memory_system"
-label = "Memory System"
-path = "{_path(root / 'MEMORY_SYSTEM.md')}"
-kind = "markdown"
-role = "memory_policy"
-trust_tier = "operator_curated"
-priority = 65
-headings = [
-  "1. Truth Model",
-  "2. Main Layers",
-  "5. How Optional Integrations Work",
-  "7. How Activation Works",
-]
-
-[[sources]]
-id = "chronicle_protocol"
-label = "Chronicle Protocol"
-path = "{_path(root / 'CHRONICLE_PROTOCOL.md')}"
-kind = "markdown"
-role = "timeline_protocol"
-trust_tier = "reference"
-priority = 60
-headings = [
-  "Command Surface",
-  "Data Model",
-  "Operational Constraint",
-]
-
-[[sources]]
-id = "chronicle_adr"
-label = "Chronicle ADR 0001"
-path = "{_path(docs_root / 'ADR-0001-canonical-memory.md')}"
-kind = "markdown"
-role = "architecture"
-trust_tier = "reference"
-priority = 55
-
-[[sources]]
-id = "chronicle_schema"
-label = "Chronicle Schema v1"
-path = "{_path(docs_root / 'SCHEMA_V1.md')}"
-kind = "markdown"
-role = "schema"
-trust_tier = "reference"
-priority = 54
-
-[[sources]]
-id = "chronicle_checklist"
-label = "Chronicle Implementation Checklist"
-path = "{_path(docs_root / 'IMPLEMENTATION_CHECKLIST.md')}"
-kind = "markdown"
-role = "implementation_plan"
-trust_tier = "reference"
-priority = 53
-
-[[domains]]
-id = "global"
-label = "Whole System"
-source_ids = ["status", "priorities", "job_search", "memory_system", "chronicle_protocol"]
-mem0_queries = [
-  "current priorities blockers system state",
-  "recent durable decisions",
-  "active queue or project status",
-]
-
-[[domains]]
-id = "portfolio"
-label = "Shipping / Delivery"
-source_ids = ["status", "priorities", "memory_system", "chronicle_protocol"]
-mem0_queries = [
-  "shipping blockers and missing assets",
-  "portfolio proof of work",
-  "what is ready to publish",
-]
-
-[[domains]]
-id = "job_search"
-label = "Pipeline / Outreach"
-source_ids = ["status", "priorities", "job_search", "chronicle_protocol"]
-mem0_queries = [
-  "job search pipeline leads outreach",
-  "active queue status",
-  "who is ready next",
-]
-
-[[domains]]
-id = "memory"
-label = "Memory Architecture"
-source_ids = ["memory_system", "chronicle_protocol", "chronicle_adr", "chronicle_schema", "chronicle_checklist", "status"]
-mem0_queries = [
-  "memory architecture and constraints",
-  "L1 L2 L3 memory rules",
-  "durable truth vs derived recall",
-]
-"""
+    """A fresh installation has no invented projects or external feeds."""
+    paths = {
+        "status_root": root, "chronicle_db": root / "chronicle.db",
+        "chronicle_artifact_dir": root / "chronicle-artifacts",
+        "chronicle_package_root": root, "ledger_file": root / "ssot-ledger.jsonl",
+        "snapshot_file": root / "chronicle-snapshots.jsonl",
+        "mem0_dump": root / "mem0-dump.json", "mem0_bridge": root / "scripts/mem0_bridge.py",
+        "workspace_root": root / "workspaces",
+    }
+    lines = ["version = 1", 'title = "Chronicle Workspace"', "", "[settings]",
+             f"timezone = {json.dumps(timezone_name)}", "", "[paths]"]
+    lines.extend(f"{key} = {json.dumps(str(value))}" for key, value in paths.items())
+    sources = [
+        ("status", "Status", "status.md", "ssot"),
+        ("priorities", "Priorities", "priorities.md", "strategy"),
+        ("memory_system", "Memory System", "MEMORY_SYSTEM.md", "memory_policy"),
+        ("chronicle_protocol", "Agent Protocol", "CHRONICLE_PROTOCOL.md", "timeline_protocol"),
+    ]
+    for source_id, label, path, role in sources:
+        lines.extend(["", "[[sources]]", f'id = "{source_id}"', f'label = "{label}"',
+                      f"path = {json.dumps(str(root / path))}", 'kind = "markdown"',
+                      f'role = "{role}"', 'trust_tier = "operator_curated"', 'priority = 80'])
+    for domain, label in [("global", "Shared Memory"), ("memory", "Memory Architecture")]:
+        lines.extend(["", "[[domains]]", f'id = "{domain}"', f'label = "{label}"',
+                      'source_ids = ["status", "priorities", "memory_system", "chronicle_protocol"]',
+                      "mem0_queries = []"])
+    return "\n".join(lines) + "\n"
 
 
 def _automation_template(root: Path) -> str:
     runtime_root = root / "runtime"
-    workspaces_root = root / "workspaces"
     return f"""version = 1
 title = "Chronicle Native Automation"
 
@@ -361,18 +125,6 @@ artifact_store_warn_gb = 6
 [[repos]]
 slug = "status"
 path = "{_path(root)}"
-
-[[repos]]
-slug = "portfolio"
-path = "{_path(workspaces_root / 'portfolio')}"
-
-[[repos]]
-slug = "renderkit"
-path = "{_path(workspaces_root / 'renderkit')}"
-
-[[repos]]
-slug = "media-sorter"
-path = "{_path(workspaces_root / 'media-sorter')}"
 
 [jobs.daily_capture]
 hour = 2
@@ -521,6 +273,18 @@ chronicle-mcp --profile chronicler
 3. `mem0-dump.json` is optional derived recall.
 4. `chronicle-snapshots.jsonl` and `ssot-ledger.jsonl` are compatibility logs.
 
+## Shared Agent Memory
+
+Use a stable project and task_id across sessions and agents. startup_bundle returns
+current facts, the latest checkpoint, changes, and a cursor. Pass that cursor as
+since to resume the change feed. A record is an attributed assertion; inspect its
+evidence and whether its kind is observed, decision, or assumption.
+
+record_event accepts request_id (reuse unchanged on retry), session_id, task_id,
+checkpoint (goal, completed, verification, open_questions, next_steps), and fact
+(slot, value, kind, optional supersedes). Changing a fact requires the current
+fact ID. Missing evidence is reported in the receipt; it is not archived content.
+
 ## Operational Constraint
 
 - Startup/activation should happen before mutating Chronicle from MCP.
@@ -531,7 +295,11 @@ chronicle-mcp --profile chronicler
 def _runbook_template() -> str:
     return """# Agent Runbook
 
-- Add agent-specific procedures here.
+- Start with startup_bundle(project=..., task_id=...).
+- Search with query_memory before making assumptions.
+- Record significant decisions and evidence with request_id for safe retries.
+- Record a checkpoint before handoff; include verification, unknowns, and next steps.
+- Explicit facts use slot/value/kind; replacing a fact requires its current ID.
 - Keep operational rules short and explicit.
 - Prefer linking to durable docs over duplicating policy everywhere.
 """
@@ -546,7 +314,7 @@ Derived recall systems may assist retrieval, but they must not redefine truth.
 
 
 def _schema_template() -> str:
-    return """# Schema v1
+    return """# Schema v10
 
 - events
 - snapshots
@@ -554,8 +322,9 @@ def _schema_template() -> str:
 - automation_runs
 - hook_events
 - normalized_entities
-- scenario_runs
-- lens_runs
+- event_observations (agent identity, request receipts, checkpoints)
+- facts / episodes / fact_observations / fact_supersessions
+- event_embeddings (optional local vector index)
 """
 
 
@@ -672,12 +441,6 @@ def scaffold_workspace(
     for path, payload in json_files.items():
         _write_json(path, payload, created=created, skipped=skipped, force=force)
 
-    text_files = {
-        resolved_root / "runtime" / "portfolio" / "asset-manifest.ts": "export const assetManifest = {};\n",
-    }
-    for path, content in text_files.items():
-        _write_text(path, content, created=created, skipped=skipped, force=force)
-
     for directory in (
         resolved_root / "chronicle-artifacts",
         resolved_root / "backups",
@@ -687,9 +450,6 @@ def scaffold_workspace(
         resolved_root / "runtime" / "launch-agents",
         resolved_root / "runtime" / "launchd",
         resolved_root / "workspaces",
-        resolved_root / "workspaces" / "portfolio",
-        resolved_root / "workspaces" / "renderkit",
-        resolved_root / "workspaces" / "media-sorter",
         resolved_root / "scripts",
     ):
         directory.mkdir(parents=True, exist_ok=True)

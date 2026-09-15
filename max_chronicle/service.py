@@ -24,16 +24,15 @@ from .config import (
     feature_enabled,
 )
 from .db import database_summary
+from .recall import query_memory
 from .projections import render_job_search_status, render_status_generated_block, update_status_file
 from .runtime_context import (
     append_jsonl,
     build_runtime_snapshot,
     expand_path,
     file_meta,
-    load_manifest,
     mem0_meta,
     normalize_heading,
-    parse_markdown_sections,
     read_json,
     read_jsonl,
     read_source_content,
@@ -52,7 +51,6 @@ from .store import (
     config_from_manifest,
     DEFAULT_STALE_RUN_TTL_HOURS,
     entity_alias_stats,
-    fetch_all_event_embeddings,
     fetch_event,
     fetch_event_ids_without_embedding,
     fetch_latest_projection_run,
@@ -63,11 +61,9 @@ from .store import (
     fetch_project_events,
     fetch_recent_events,
     fetch_relations_for_entity,
-    find_entity_alias_by_key,
     find_event_by_content_hash_recent,
     finish_ingest_run,
     link_artifact,
-    list_entity_aliases,
     mark_missing_normalized_entities_inactive,
     mark_stale_running_runs,
     merge_normalized_entities,
@@ -75,7 +71,6 @@ from .store import (
     persist_staged_artifact,
     search_events,
     stage_artifact_from_path,
-    set_entity_alias_status,
     start_ingest_run,
     store_artifact_from_path,
     store_event,
@@ -86,7 +81,6 @@ from .store import (
     update_event_mem0_state,
     update_event_memory_guard,
     upsert_normalized_entity,
-    upsert_relation,
     write_transaction,
 )
 
@@ -569,6 +563,9 @@ def _find_recent_exact_duplicate(
             (existing.get("domain") or "global") == entry["domain"]
             and (existing.get("category") or "note") == entry["category"]
             and (existing.get("project") or "") == (entry.get("project") or "")
+            and existing.get("task_id") == entry.get("task_id")
+            and existing.get("checkpoint") == entry.get("checkpoint")
+            and existing.get("fact") == entry.get("fact")
             and (existing.get("text") or "").strip() == entry["text"]
             and (existing.get("why") or None) == entry.get("why")
         ):
@@ -1570,6 +1567,9 @@ def build_startup_bundle(
     capture: bool = False,
     limit: int = 3,
     compact: bool = False,
+    project: str | None = None,
+    task_id: str | None = None,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """Build a startup brief bundle for an agent, assembled directly without nesting attach_bundle.
 
@@ -1589,6 +1589,11 @@ def build_startup_bundle(
     Returns:
         Startup bundle dict targeting ~50K full / ~30K compact.
     """
+    from .memory import task_context as read_task_context
+    if domain_id not in manifest["domain_map"]:
+        raise ValueError(f"Unknown domain {domain_id!r}; use a manifest domain and project/task_id for task scope")
+    context = read_task_context(manifest, domain=domain_id, project=project,
+                                task_id=task_id, since=since, limit=limit)
     # 1. Resolve snapshot (reuse or capture)
     snapshot = _resolve_activation_snapshot(
         manifest,
@@ -1602,13 +1607,38 @@ def build_startup_bundle(
     # 2. Fetch recent events directly
     config = _config(manifest)
     recent_events = fetch_recent_events(config, limit=limit, domain=domain_id)
-    if not recent_events:
+    recall_status = None
+    if focus:
+        recall = query_memory(manifest, query=focus, domain=domain_id, project=project,
+                              task_id=task_id, limit=limit)
+        recall_status = {key: recall[key] for key in ("degraded", "channel_errors", "vector_coverage")}
+        recent_events = [event for hit in recall["results"]
+                         if (event := fetch_event(config, event_id=hit["event_id"])) is not None]
+        if not (project or task_id):
+            matching = {event["id"] for event in recent_events}
+            context["changes"] = [change for change in context["changes"] if change["event_id"] in matching]
+            context["current_facts"] = [fact for fact in context["current_facts"] if fact["event_id"] in matching]
+            if context["checkpoint"] and context["checkpoint"]["event_id"] not in matching:
+                context["checkpoint"] = None
+    elif project or task_id:
+        recent_events = []
+        seen = set()
+        for change in reversed(context["changes"]):
+            if change["event_id"] not in seen:
+                event = fetch_event(config, event_id=change["event_id"])
+                if event:
+                    recent_events.append(event)
+                    seen.add(change["event_id"])
+    if not recent_events and not (focus or project or task_id):
         recent_events = _filter_events_by_visibility(
             snapshot.get("recent_ledger", [])[:limit]
         )
 
     # 3. Build enriched sources (full content or truncated)
     sources = _build_startup_sources(manifest, domain_id, compact=compact)
+    if compact and (focus or project or task_id):
+        sources = [{key: value for key, value in source.items()
+                    if key not in {"content", "content_truncated"}} for source in sources]
 
     # 4. Freshness audit → compact source health
     freshness_audit = build_freshness_audit(manifest, domain_id=domain_id)
@@ -1616,6 +1646,10 @@ def build_startup_bundle(
 
     # 5. Runtime view (compact extract from snapshot)
     runtime = _build_startup_runtime_view(snapshot)
+    if compact and (project or task_id or focus):
+        runtime["portfolio"] = {}
+        runtime["repos"] = [repo for repo in runtime["repos"]
+                            if project and Path(repo.get("path") or "").name == project]
 
     # 6. Normalized entities → compact digest
     normalized_entities = fetch_normalized_entities(config, limit=200)
@@ -1629,9 +1663,15 @@ def build_startup_bundle(
     entity_digest = _build_startup_entity_digest(
         normalized_entities, compact=compact
     )
+    if compact and (project or task_id or focus):
+        entity_digest = [entity for entity in entity_digest
+                         if project and project.casefold() in {
+                             str(name).casefold() for name in
+                             [entity.get("canonical_name"), *entity.get("aliases", [])]
+                         }]
 
     # 8. Mem0 hits (from snapshot, no duplication)
-    mem0_dump_hits = snapshot.get("mem0_snapshot_hits", {})
+    mem0_dump_hits = {} if (focus or project or task_id) else snapshot.get("mem0_snapshot_hits", {})
 
     # 9. DB summary
     with open_connection(config) as connection:
@@ -1642,7 +1682,11 @@ def build_startup_bundle(
         "contract_name": ACTIVATION_CONTRACT_NAME,
         "contract_version": ACTIVATION_CONTRACT_VERSION,
         "startup_bundle_schema_version": STARTUP_BUNDLE_SCHEMA_VERSION,
-        "generated_at": snapshot.get("captured_at_utc"),
+        "generated_at": utc_now(),
+        "snapshot_at": snapshot.get("captured_at_utc"),
+        "focus": focus,
+        "task_context": context,
+        "recall_status": recall_status,
         "domain": {
             "id": domain_id,
             "label": domain_config["label"],
@@ -2027,13 +2071,15 @@ def record_event(
     # Pop private test/injection keys before any serialization path sees them.
     _embed_fn_override = entry.pop("_embed_fn", None)
     normalized_entry = _normalize_record_entry(entry)
+    from .memory import validate_entry, request_receipt, record_observation
+    validate_entry(normalized_entry)
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
     resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind)
     if resolved_mem0_status is not None:
         normalized_entry["mem0_status"] = resolved_mem0_status
     config = _config(manifest)
 
-    if source_kind == "chronicle_mcp":
+    if source_kind == "chronicle_mcp" and not (normalized_entry.get("checkpoint") or normalized_entry.get("fact")):
         memory_guard = evaluate_memory_guard(config, normalized_entry, source_kind=source_kind)
         normalized_entry["memory_guard"] = memory_guard
         if memory_guard["verdict"] == "local_only":
@@ -2052,6 +2098,13 @@ def record_event(
         project=normalized_entry.get("project"),
         why=normalized_entry.get("why"),
     )
+    if normalized_entry.get("task_id"):
+        content_hash = _sha256_text(content_hash + ":" + normalized_entry["task_id"])
+    if normalized_entry.get("checkpoint") or normalized_entry.get("fact"):
+        content_hash = _sha256_text(content_hash + json.dumps(
+            [normalized_entry.get("checkpoint"), normalized_entry.get("fact")],
+            ensure_ascii=False, sort_keys=True,
+        ))
     normalized_entry["content_hash"] = content_hash
 
     hash_dedup_active = (
@@ -2074,16 +2127,11 @@ def record_event(
     embed_dim: int | None = None
     if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
         try:
-            from .embeddings import embed_text as _embed_text_default, EMBED_DIM, EMBED_MODEL
+            from .embeddings import embed_text as _embed_text_default, event_embedding_text, EMBED_DIM, EMBED_MODEL
             # _embed_fn_override is popped from entry before normalization
             # so it never reaches payload_json.
             _embed_fn = _embed_fn_override or _embed_text_default
-            title_part = normalized_entry.get("project") or ""
-            text_part = normalized_entry.get("text") or ""
-            why_part = normalized_entry.get("why") or ""
-            embed_input = " ".join(
-                part for part in [title_part, text_part, why_part] if part
-            ).strip()
+            embed_input = event_embedding_text(normalized_entry)
             if embed_input:
                 embedding_vec = _embed_fn(embed_input)
                 embed_model, embed_dim = EMBED_MODEL, EMBED_DIM
@@ -2094,6 +2142,7 @@ def record_event(
     # copying a 25MB file must not hold SQLite's single write lock. Staging is
     # idempotent, so a rollback leaves at most an unreferenced blob.
     staged_artifacts: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
     if not skip_generic_source_archives:
         for source_file in entry.get("source_files") or []:
             path = Path(source_file).expanduser()
@@ -2105,6 +2154,9 @@ def record_event(
             )
             if staged is not None:
                 staged_artifacts.append(staged)
+                evidence.append({"path": str(path), "status": staged["metadata"].get("storage_mode", "archived"), "sha256": staged["sha256"]})
+            else:
+                evidence.append({"path": str(path), "status": "missing" if not path.is_file() else "skipped"})
 
     # One BEGIN IMMEDIATE transaction for dedup lookup + event + embedding +
     # artifacts + links: a crash mid-way can no longer leave a half-recorded
@@ -2112,57 +2164,27 @@ def record_event(
     # deadlock that bypasses busy_timeout.
     artifacts_written = 0
     with write_transaction(config) as connection:
+        prior_request = request_receipt(connection, normalized_entry)
+        if prior_request is not None:
+            previous = fetch_event(config, event_id=prior_request["event_id"], connection=connection)
+            return {**previous, "chronicle_status": "existing", "chronicle_db_path": str(config.db_path),
+                    "chronicle_error": None, "artifacts_written": 0,
+                    "observation_id": prior_request["observation_id"], "fact_id": prior_request["fact_id"],
+                    "evidence": prior_request["evidence"], "dedupe_status": "request_id_match"}
+        existing = None
         if dedupe:
-            existing = _find_recent_exact_duplicate(
-                config,
-                normalized_entry,
-                window_hours=dedupe_window_hours,
-                connection=connection,
-            )
-            if existing is not None:
-                existing["chronicle_status"] = "existing"
-                existing["chronicle_db_path"] = str(config.db_path)
-                existing["chronicle_error"] = None
-                existing["dedupe_status"] = "exact_duplicate"
-                existing["dedupe_window_hours"] = dedupe_window_hours
-                existing["artifacts_written"] = 0
-                return existing
+            existing = _find_recent_exact_duplicate(config, normalized_entry,
+                window_hours=dedupe_window_hours, connection=connection)
         elif hash_dedup_active:
-            # v8: find + insert inside one transaction so a concurrent writer
-            # cannot slip past the lookup. Window filters on occurred_at_utc
-            # (event-time axis); since occurred_at_utc is caller controlled,
-            # callers that backfill with a historical occurred_at opt out of
-            # the 24h guard by design.
-            existing_row = find_event_by_content_hash_recent(
-                config,
-                content_hash=content_hash,
-                window_hours=hash_dedup_window,
-                connection=connection,
-            )
+            existing_row = find_event_by_content_hash_recent(config, content_hash=content_hash,
+                window_hours=hash_dedup_window, connection=connection)
             if existing_row is not None:
-                # Rehydrate via fetch_event so downstream sees the full
-                # event shape ('recorded_at', 'project', mem0 fields).
-                rehydrated = fetch_event(
-                    config,
-                    event_id=existing_row["id"],
-                    connection=connection,
-                )
-                if rehydrated is not None:
-                    rehydrated["chronicle_status"] = "existing"
-                    rehydrated["chronicle_db_path"] = str(config.db_path)
-                    rehydrated["chronicle_error"] = None
-                    rehydrated["dedupe_status"] = "content_hash_match"
-                    rehydrated["dedupe_window_hours"] = hash_dedup_window
-                    rehydrated["artifacts_written"] = 0
-                    return rehydrated
-                # Row vanished between find and fetch — fall through and insert.
-        stored = store_event(
-            config,
-            normalized_entry,
-            source_kind=source_kind,
-            imported_from=imported_from,
-            connection=connection,
-        )
+                existing = fetch_event(config, event_id=existing_row["id"], connection=connection)
+        stored = existing or store_event(config, normalized_entry, source_kind=source_kind,
+                                        imported_from=imported_from, connection=connection)
+        if existing:
+            stored["dedupe_status"] = "exact_duplicate" if dedupe else "content_hash_match"
+            stored["dedupe_window_hours"] = dedupe_window_hours if dedupe else hash_dedup_window
         if embedding_vec is not None and embed_model is not None and embed_dim is not None:
             store_event_embedding(
                 config,
@@ -2190,14 +2212,18 @@ def record_event(
                 connection=connection,
             )
             artifacts_written += 1
-    stored["chronicle_status"] = "stored"
+        observation = record_observation(connection, normalized_entry, stored["id"], evidence)
+    stored["observation_id"] = observation["observation_id"]
+    stored["fact_id"] = observation["fact_id"]
+    stored["evidence"] = evidence
+    stored["chronicle_status"] = "existing" if existing else "stored"
     stored["chronicle_db_path"] = str(config.db_path)
     stored["chronicle_error"] = None
     category_fallback = normalized_entry.get("category_fallback")
     if category_fallback:
         stored["category_fallback"] = category_fallback
 
-    if append_compat:
+    if append_compat and not existing:
         ledger_row = dict(stored)
         ledger_row["source_files"] = entry.get("source_files") or []
         ledger_row["mem0_status"] = entry.get("mem0_status")
@@ -2604,35 +2630,6 @@ def _snapshot_artifact_specs(manifest: dict[str, Any], snapshot: dict[str, Any])
     return specs
 
 
-def _refresh_relations(config, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    relations: list[dict[str, Any]] = []
-    portfolio = snapshot.get("portfolio_assets", {})
-    missing_assets_total = portfolio.get("missing_assets_total")
-    rationale = (
-        f"Snapshot {snapshot.get('id')} captured portfolio state with missing_assets_total={missing_assets_total}."
-    )
-
-    relation_specs = [
-        ("project", "portfolio", "gates", "project", "linkedin", rationale),
-    ]
-
-    for from_type, from_name, relation_type, to_type, to_name, why in relation_specs:
-        _validate_relation(relation_type)
-        relations.append(
-            upsert_relation(
-                config,
-                from_entity_type=from_type,
-                from_entity_name=from_name,
-                relation_type=relation_type,
-                to_entity_type=to_type,
-                to_entity_name=to_name,
-                rationale=why,
-                metadata={"snapshot_id": snapshot.get("id")},
-            )
-        )
-    return relations
-
-
 def persist_snapshot(
     manifest: dict[str, Any],
     snapshot: dict[str, Any],
@@ -2646,19 +2643,22 @@ def persist_snapshot(
     stored["chronicle_db_path"] = str(config.db_path)
     stored["chronicle_error"] = None
 
+    side_effect_errors: dict[str, str] = {}
     if append_compat:
-        append_jsonl(_compat_path(manifest, "snapshot_file"), stored)
+        try:
+            append_jsonl(_compat_path(manifest, "snapshot_file"), stored)
+        except OSError as exc:
+            side_effect_errors["compat_snapshot"] = f"{type(exc).__name__}: {exc}"
 
-    run_id = start_ingest_run(
-        config,
-        adapter="runtime_snapshot",
-        source_ref=stored["id"],
-        metadata={"domain": stored.get("domain")},
-    )
+    run_id = None
     artifact_count = 0
     relation_count = 0
     normalized_entities: list[dict[str, Any]] = []
     try:
+        run_id = start_ingest_run(
+            config, adapter="runtime_snapshot", source_ref=stored["id"],
+            metadata={"domain": stored.get("domain")},
+        )
         for spec in _snapshot_artifact_specs(manifest, stored):
             artifact = store_artifact_from_path(
                 config,
@@ -2681,7 +2681,6 @@ def persist_snapshot(
             )
             artifact_count += 1
 
-        relation_count = len(_refresh_relations(config, stored))
         normalized_entities = materialize_normalized_entities(
             manifest,
             domain_id=stored.get("domain") or "global",
@@ -2700,25 +2699,28 @@ def persist_snapshot(
             },
         )
     except Exception as exc:
-        finish_ingest_run(
-            config,
-            run_id=run_id,
-            status="failed",
-            items_seen=len(_snapshot_artifact_specs(manifest, stored)),
-            items_written=artifact_count,
-            error_text=str(exc),
-        )
-        raise
+        side_effect_errors["evidence_ingest"] = f"{type(exc).__name__}: {exc}"
+        if run_id is not None:
+            try:
+                finish_ingest_run(config, run_id=run_id, status="failed",
+                                  items_seen=artifact_count, items_written=artifact_count,
+                                  error_text=str(exc))
+            except Exception as bookkeeping_exc:
+                side_effect_errors["ingest_bookkeeping"] = f"{type(bookkeeping_exc).__name__}: {bookkeeping_exc}"
 
     projections = []
     if render_generated:
         preferred_snapshot = stored if stored.get("domain") == "global" else None
-        projections = render_projections(manifest, snapshot=preferred_snapshot)
+        try:
+            projections = render_projections(manifest, snapshot=preferred_snapshot)
+        except Exception as exc:
+            side_effect_errors["projections"] = f"{type(exc).__name__}: {exc}"
 
     stored["artifacts_written"] = artifact_count
     stored["relations_written"] = relation_count
     stored["normalized_entities"] = normalized_entities
     stored["projection_runs"] = projections
+    stored["side_effect_errors"] = side_effect_errors
     return stored
 
 
@@ -3321,190 +3323,6 @@ def search_mem0_live_service(
 # Hybrid recall — query_memory (RRF-fused FTS + vector + temporal)
 # ---------------------------------------------------------------------------
 
-_RRF_K = 60
-
-
-def _rrf_score(ranks: list[int | None]) -> float:
-    """Reciprocal Rank Fusion score: sum 1/(k + rank) for each non-None rank."""
-    return sum(1.0 / (_RRF_K + r) for r in ranks if r is not None)
-
-
-def _event_row_to_recall_entry(
-    event: dict[str, Any],
-    timezone_name: str,
-) -> dict[str, Any]:
-    """Compact event dict for query_memory results."""
-    occurred_utc = event.get("recorded_at") or ""
-    occurred_local = ""
-    if occurred_utc:
-        try:
-            from zoneinfo import ZoneInfo
-            from .store import _parse_iso  # type: ignore[attr-defined]
-            occurred_local = (
-                _parse_iso(occurred_utc)
-                .astimezone(ZoneInfo(timezone_name))
-                .isoformat(timespec="seconds")
-            )
-        except Exception:  # noqa: BLE001
-            occurred_local = occurred_utc
-    return {
-        "event_id": event.get("id"),
-        "text": event.get("text") or "",
-        "category": event.get("category"),
-        "occurred_at_local": occurred_local,
-        "occurred_at_utc": occurred_utc,
-        "project": event.get("project"),
-    }
-
-
-def query_memory(
-    manifest: dict[str, Any],
-    *,
-    query: str,
-    domain: str | None = None,
-    limit: int = 10,
-) -> dict[str, Any]:
-    """Hybrid recall: RRF-fused FTS, vector, and temporal channels.
-
-    Channels:
-      (a) FTS5/BM25 — reuses search_events.
-      (b) VECTOR — cosine over fetch_all_event_embeddings; skipped if
-          embed_text returns None (Ollama down).
-      (c) TEMPORAL — recency rank over all events.
-
-    Fused via Reciprocal Rank Fusion (k=60).
-
-    Returns a dict with:
-      ``results``      — list of up to *limit* hits, ranked by rrf_score desc.
-      ``channels_used``— list of channel names that contributed.
-      ``degraded``     — True when the vector channel was skipped.
-      ``query``        — the original query string.
-    """
-    from .embeddings import cosine, embed_text, EMBED_DIM, EMBED_MODEL
-
-    config = _config(manifest)
-    tz = manifest.get("settings", {}).get("timezone", "UTC")
-
-    channels_used: list[str] = []
-    degraded = False
-
-    # ---- per-channel ranked lists: {event_id: rank (0-based)} ----
-
-    fts_ranks: dict[str, int] = {}
-    vector_sims: dict[str, float] = {}
-    temporal_ranks: dict[str, int] = {}
-    channel_errors: dict[str, str] = {}
-
-    # (a) FTS channel
-    try:
-        fts_hits = search_events(
-            config,
-            query=query,
-            limit=max(limit * 4, 40),
-            domain=domain,
-        )
-        for idx, hit in enumerate(fts_hits):
-            fts_ranks[hit["id"]] = idx
-        if fts_hits:
-            channels_used.append("fts")
-    except Exception as exc:  # noqa: BLE001
-        # A broken FTS index must not silently masquerade as a clean recall —
-        # flag degradation so callers can tell partial results from full ones.
-        degraded = True
-        channel_errors["fts"] = f"{type(exc).__name__}: {exc}"
-
-    # (b) VECTOR channel
-    try:
-        query_vec = embed_text(query)
-        if query_vec is None:
-            degraded = True
-        else:
-            all_embeddings = fetch_all_event_embeddings(config)
-            if all_embeddings:
-                scored = sorted(
-                    ((eid, cosine(query_vec, vec)) for eid, vec in all_embeddings),
-                    key=lambda t: t[1],
-                    reverse=True,
-                )
-                for idx, (eid, sim) in enumerate(scored[: max(limit * 4, 40)]):
-                    vector_sims[eid] = sim
-                channels_used.append("vector")
-    except Exception as exc:  # noqa: BLE001
-        degraded = True
-        channel_errors["vector"] = f"{type(exc).__name__}: {exc}"
-
-    # (c) TEMPORAL channel — all event IDs ranked by recency
-    try:
-        recent_pool = fetch_recent_events(
-            config,
-            limit=max(limit * 8, 80),
-            domain=domain,
-        )
-        for idx, ev in enumerate(recent_pool):
-            temporal_ranks[ev["id"]] = idx
-        if recent_pool:
-            channels_used.append("temporal")
-    except Exception as exc:  # noqa: BLE001
-        degraded = True
-        channel_errors["temporal"] = f"{type(exc).__name__}: {exc}"
-
-    # ---- RRF fusion ----
-    all_candidate_ids: set[str] = (
-        set(fts_ranks) | set(vector_sims) | set(temporal_ranks)
-    )
-
-    if not all_candidate_ids:
-        return {
-            "query": query,
-            "domain": domain,
-            "results": [],
-            "channels_used": channels_used,
-            "degraded": degraded,
-            "channel_errors": channel_errors,
-        }
-
-    scored_candidates: list[tuple[float, str]] = []
-    for eid in all_candidate_ids:
-        fts_r = fts_ranks.get(eid)
-        vec_r: int | None = None
-        if eid in vector_sims:
-            # Convert similarity to rank position within the vector list
-            vec_list = sorted(vector_sims, key=lambda k: vector_sims[k], reverse=True)
-            vec_r = vec_list.index(eid) if eid in vec_list else None
-        tmp_r = temporal_ranks.get(eid)
-        score = _rrf_score([fts_r, vec_r, tmp_r])
-        scored_candidates.append((score, eid))
-
-    scored_candidates.sort(key=lambda t: t[0], reverse=True)
-    # Build a lookup dict from the sorted list
-    score_by_id: dict[str, float] = {eid: score for score, eid in scored_candidates}
-    top_ids = [eid for _, eid in scored_candidates[:limit]]
-
-    # ---- hydrate events ----
-    results: list[dict[str, Any]] = []
-    for eid in top_ids:
-        event = fetch_event(config, event_id=eid)
-        if event is None:
-            continue
-        entry = _event_row_to_recall_entry(event, tz)
-        entry["rrf_score"] = round(score_by_id.get(eid, 0.0), 6)
-        entry["channels"] = {
-            "fts_rank": fts_ranks.get(eid),
-            "vector_similarity": round(vector_sims[eid], 6) if eid in vector_sims else None,
-            "recency_rank": temporal_ranks.get(eid),
-        }
-        results.append(entry)
-
-    return {
-        "query": query,
-        "domain": domain,
-        "results": results,
-        "channels_used": channels_used,
-        "degraded": degraded,
-        "channel_errors": channel_errors,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Embed backfill
 # ---------------------------------------------------------------------------
@@ -3520,7 +3338,7 @@ def embed_backfill(
     Returns counts: {embedded, skipped, failed}.
     Best-effort — individual failures do not abort the run.
     """
-    from .embeddings import embed_text, EMBED_DIM, EMBED_MODEL
+    from .embeddings import embed_text, event_embedding_text, EMBED_DIM, EMBED_MODEL
 
     config = _config(manifest)
     event_ids = fetch_event_ids_without_embedding(config)
@@ -3537,12 +3355,7 @@ def embed_backfill(
             if event is None:
                 skipped += 1
                 continue
-            title_part = event.get("project") or ""
-            text_part = event.get("text") or ""
-            why_part = event.get("why") or ""
-            embed_input = " ".join(
-                part for part in [title_part, text_part, why_part] if part
-            ).strip()
+            embed_input = event_embedding_text(event)
             if not embed_input:
                 skipped += 1
                 continue

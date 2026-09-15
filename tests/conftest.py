@@ -17,6 +17,12 @@ CHRONICLE_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "max_chronicle"
 
 
 @pytest.fixture(autouse=True)
+def _offline_embeddings(monkeypatch):
+    """Tests opt into explicit fake vectors; never contact an operator's Ollama."""
+    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda _: None)
+
+
+@pytest.fixture(autouse=True)
 def _reset_migration_cache():
     reset_migration_cache()
     yield

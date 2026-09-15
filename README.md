@@ -4,28 +4,17 @@
 [![python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Local-first durable memory for AI agents.
+**Local-first shared memory for AI agents.** Preserve decisions, evidence, and
+working state so another agent can continue a task without the previous chat.
 
-Max Chronicle is a Python package for multi-agent systems that need context to survive across sessions. It keeps canonical history in local SQLite, exposes that history through a CLI and MCP server, and can attach an optional Mem0 semantic recall layer. It is not a cloud service; the core system runs entirely on your machine.
+Chronicle stores attributed events and current assertions in SQLite. Agents use
+MCP or the CLI to search, record observations, and exchange checkpoints. Local
+vector search is optional; the core works without Ollama, Mem0, or paid APIs.
 
-Core capabilities include append-only events, point-in-time snapshots, hybrid local recall (BM25 + vectors + recency), normalized entities, situation models, fixed analytical lenses, and what-if scenario analysis.
+A stored assertion is not automatically a verified fact. Its author, evidence,
+and kind (`observed`, `decision`, or `assumption`) remain visible.
 
-## Why
-
-Agents are good at short-lived reasoning and bad at durable memory. Between sessions, threads, and tool calls, they lose state, repeat work, and blur truth with generated summaries.
-
-Max Chronicle fixes that by separating local truth from derived views: record durable events and snapshots into SQLite, project readable state into Markdown, and let the next agent resume from an explicit startup or activation bundle instead of starting from zero.
-
-## Quick Start
-
-Requirements:
-
-- Python 3.11+
-- `pip` or `uv`
-
-Optional: `pip install -e ".[pretty]"` for richer `chronicle browse` output.
-
-Install from the repository:
+## Quick start
 
 ```bash
 git clone https://github.com/Beiev/max-chronicle.git
@@ -33,154 +22,185 @@ cd max-chronicle
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-```
-
-Create a workspace and point Chronicle at it:
-
-```bash
 chronicle init --root ~/chronicle-workspace
 export CHRONICLE_ROOT=~/chronicle-workspace
-chronicle status
+chronicle startup --project demo --task-id ship --format json
 ```
 
-Optional smoke test:
+Keep the workspace separate from the source checkout. Initialization creates
+neutral configuration and starter documents, with no personal data or invented
+projects. See [installation](INSTALL.md).
 
-```bash
-chronicle startup --domain global --format json
+## Agent protocol
+
+Use the same `project` and `task_id` across agents. Domains are broad configured
+areas; they are not a substitute for project/task identity.
+
+1. **Start:** call `startup_bundle(project=..., task_id=..., focus=...)` once per
+   MCP session. It returns the current task context and unlocks writes.
+2. **Recall:** call `query_memory(query=..., project=..., task_id=...)`. Inspect
+   evidence and `degraded`; empty results mean no suitable evidence was found.
+3. **Record:** use `record_event` for significant decisions, actions, and findings.
+   Supply `why` and `source_files` where available. Reuse `request_id` unchanged
+   if delivery is uncertain; a changed request requires a new ID.
+4. **Hand off:** attach a `checkpoint` to `record_event` before a context switch.
+   Record what was actually verified and what remains unknown.
+5. **Resume:** the next agent reads `task_context.checkpoint`, `current_facts`, and
+   `changes`. Save `task_context.cursor`; pass it as `since` on the next startup.
+   If `has_more` is true, continue paging with the returned cursor.
+
+Task startup includes current facts from the project and the selected task.
+Their scope stays explicit; another task's facts are excluded. If `facts_has_more`
+is true, increase `limit` (up to 100) or use scoped recall to find a specific slot.
+
+### Example handoff
+
+MCP `record_event` arguments:
+
+```json
+{
+  "text": "Offline recall implemented; vector evaluation remains",
+  "why": "The next agent can continue from the verified lexical path",
+  "project": "demo",
+  "task_id": "ship",
+  "request_id": "demo-ship-checkpoint-1",
+  "checkpoint": {
+    "goal": "Ship reliable recall",
+    "completed": ["Implemented lexical search"],
+    "verification": ["Offline search test passed"],
+    "open_questions": ["Which vector threshold works for this corpus?"],
+    "next_steps": ["Evaluate vector precision on representative queries"]
+  }
+}
 ```
 
-## Core Concepts
+MCP assigns a session identity automatically. Independent confirmations preserve
+both authors and attachments even when the underlying event text is deduplicated.
+`chronicle_status` acknowledges the event; `observation_id` identifies this
+observation. `evidence` reports each attachment as archived, pointer-only, missing,
+or skipped. A pointer is not an archived copy.
 
-| Layer | Role |
-| --- | --- |
-| `chronicle.db` | Canonical truth. Local SQLite, schema v9. Stores append-only events, point-in-time snapshots, normalized entities, situation models, analytical lens runs, and scenario runs. |
-| Markdown projections | Readable operator-facing views derived from Chronicle. Useful for inspection, handoff, and versioned docs, but not the source of truth. |
-| Mem0 (optional) | External semantic recall, reached through an operator-supplied bridge script. Derived and non-authoritative. |
+### Current knowledge and corrections
 
-In practice: `chronicle.db` is truth, Markdown is projection, and Mem0 is recall.
+Supply an explicit `fact` object on `record_event`:
 
-## CLI Commands
+```json
+{"slot": "project.status", "value": "active", "kind": "observed"}
+```
 
-| Command | Purpose |
-| --- | --- |
-| `chronicle init --root <path>` | Create a fresh Chronicle workspace with database, manifest, automation config, and starter files. |
-| `chronicle status` | Report database health, migration state, and table counts. |
-| `chronicle record "text"` | Append a durable event to the truth store. |
-| `chronicle recent` | Show recent durable events. |
-| `chronicle timeline --at <iso-timestamp>` | Reconstruct nearby snapshots and events around a point in time. |
-| `chronicle capture-runtime --domain <id>` | Capture a runtime snapshot and refresh derived state. |
-| `chronicle startup --domain <id>` | Build a compact startup bundle for a new agent session. |
-| `chronicle activate --domain <id>` | Build the activation contract and prompt for an agent session. |
-| `chronicle query "text"` | Search Chronicle, active source docs, and optional Mem0 recall. |
+The receipt includes `fact_id`. To change that scoped slot, include its current
+ID in the next assertion:
 
-Maintenance commands: `normalize-entities`, `embed-backfill`, `query-memory`, `browse`,
-`audit`, `doctor`, `backup`, and `repair-stale-runs`. Run `chronicle --help` for the full list.
+```json
+{"slot": "project.status", "value": "paused", "kind": "decision", "supersedes": "<current-fact-id>"}
+```
 
-## MCP Server
+Chronicle retains the old assertion and its evidence. Stale replacements fail
+with an actionable error. Current recall excludes superseded assertions; historical
+queries retain the event trail. Unstructured prose is never automatically promoted
+into a fact, and assumptions are not silently converted into verified knowledge.
 
-Max Chronicle ships an MCP server for agent integration, over stdio or streamable HTTP.
+## MCP integration
 
-- `chronicle-mcp-readonly` exposes read-only resources and tools.
-- `chronicle-mcp-chronicler` exposes the full chronicler surface, including writes.
-- `chronicle-mcp --profile readonly|chronicler --transport stdio|streamable-http` is the generic entrypoint.
-  For HTTP, `MCP_HOST` and `MCP_PORT` select the bind address.
+Start `chronicle-mcp-chronicler` as a direct child process of the client. A typical
+MCP configuration uses an absolute installed command and workspace path:
 
-### Tool surface
+```json
+{
+  "mcpServers": {
+    "chronicle": {
+      "command": "/absolute/path/to/.venv/bin/chronicle-mcp-chronicler",
+      "env": {"CHRONICLE_ROOT": "/absolute/path/to/chronicle-workspace"}
+    }
+  }
+}
+```
 
-Read tools work immediately; write tools open after one `startup_bundle` call per session.
+Use your client's equivalent configuration format. Stdio starts with the client
+and does not require a separately running HTTP service. For supervised HTTP, use
+`chronicle-mcp --transport streamable-http`; `MCP_HOST`/`MCP_PORT` set its address.
+`GET /health` checks service and database availability; `sources_audit` and startup
+source health describe freshness. These are different checks.
 
 | Tool | Purpose |
 | --- | --- |
-| `startup_bundle` | Session entry point: returns the startup brief and unlocks the write surface. |
-| `query_memory` | Primary recall. RRF fusion over full-text, vector, and recency channels. |
-| `query_context` | Broader sweep that also reads Markdown sources and an optional Mem0 dump. |
-| `recent_events` | Cheap latest-N feed for situational awareness. |
-| `state_at` | Reconstruct what was true around a timestamp. Snapshots come back digested; `detail="full"` returns the stored payload verbatim. |
+| `startup_bundle` | Task context, checkpoint, current facts, change cursor; unlock writes. |
+| `query_memory` | Scoped lexical/vector recall with provenance and coverage. |
+| `query_context` | Broader search through source documents and optional Mem0 dump. |
+| `recent_events` | Recent event history. |
+| `state_at` | Historical snapshots/events; `detail="full"` restores the full payload. |
 | `sources_audit` | Source coverage, freshness, and trust metadata. |
-| `record_event` | Write a durable event and archive linked source files. |
-| `capture_snapshot` | Capture live runtime state and refresh Markdown projections. |
-| `entity_admin` | Entity maintenance: `report`, `normalize`, `alias`, `merge`. |
-| `search_mem0_live` | Optional live semantic search. Requires an operator-supplied Mem0 bridge script, which this package does not ship; without it the tool reports `degraded` instead of failing. |
+| `record_event` | Attributed observation, evidence, optional checkpoint or explicit fact. |
+| `capture_snapshot` | Archive runtime state and update readable projections. |
+| `entity_admin` | Report, normalize, alias, or merge entities. |
+| `search_mem0_live` | Optional external semantic mirror through an operator-supplied bridge. |
 
-`activate_agent` is still registered as a deprecated alias of `startup_bundle` so existing
-agents keep working; new integrations should call `startup_bundle`.
+`chronicle-mcp-readonly` exposes only read surfaces. The deprecated `activate_agent`
+alias remains compatible. Failures set MCP `isError` and carry a JSON envelope
+with `error_type`, `retryable`, and `hint`; follow that hint. A committed snapshot
+can separately report `side_effect_errors` for failed evidence/projection outputs.
 
-**Replies are sized for the caller.** A tool answers with what the caller needs,
-not with an echo of what it already holds. `state_at` and `activate_agent` digest
-the snapshots they return — capture-time copies of the ledger and of semantic
-recall are replaced by a count, because live recall serves that data better and
-more currently — and `capture_snapshot` answers with a receipt (id, artifacts
-written, projection hashes) rather than replaying the snapshot it just stored.
-This matters because the calls an agent makes at session start and before a
-handoff are the ones where its remaining context is scarcest. The CLI still
-prints the unabridged payloads.
+## Recall and durability
 
-### Operational behaviour
+- **Lexical:** SQLite FTS5/BM25 over event text and explicit current fact values.
+- **Vector:** optional Ollama `nomic-embed-text` index. Model, dimension, scope,
+  and visibility are checked before ranking. `vector_coverage` discloses gaps;
+  `chronicle embed-backfill` repairs missing/incompatible index rows.
+  If native scheduling is enabled, daily capture also retries up to 10 missing
+  or incompatible embeddings per run. Disabling event embeddings disables this repair.
+- **Recency:** reorders relevant candidates; it never supplies unrelated answers.
+- **Threshold:** `CHRONICLE_VECTOR_MIN_SIMILARITY` defaults to `0.65`. Evaluate it
+  on your own corpus; cosine and reciprocal-rank scores are not confidence values.
+- **Writes:** SQLite WAL with full commit synchronization; events, observations,
+  facts, and evidence links commit together.
+- **Backups:** independent artifact copies, content-hash inventory, database
+  integrity checks, and verification after relocation. Legacy backups disclose
+  incomplete inventory coverage. Choose a separate backup device for disk failure.
+  Explicitly purged artifacts are counted separately; they are not claimed as restorable.
 
-- **Tool bodies run off the event loop.** Handlers execute in worker threads with
-  separate read and write limiters, so one slow call (a git capture, an embedding
-  request, a cold subprocess) cannot freeze other sessions.
-- **Failures are unambiguous.** A failing tool raises, so the call is flagged
-  `isError`, and the message carries a machine-readable envelope after the
-  FastMCP prefix: `{"status": "error", "error_type", "retryable", "hint"}`.
-  `startup_required` and `db_locked` are retryable — follow the hint and retry.
-- **Health endpoint.** Under HTTP transport, `GET /health` returns
-  `{status, db_ok, uptime_s, version, pid, profile}` and answers independently of
-  MCP session state, which makes it usable as a liveness probe for a supervisor.
+## CLI
 
-## Recall
-
-`query_memory` fuses three channels with reciprocal rank fusion:
-
-- **Full-text** — SQLite FTS5 over event text.
-- **Vector** — local embeddings (`nomic-embed-text` via Ollama by default).
-- **Recency** — a temporal prior over recent events.
-
-The vector channel is optional. With no embedding backend reachable, recall stays
-online on full-text plus recency and reports `degraded: true` with the channels it
-actually used, instead of failing the query.
-
-## Configuration
-
-Per-installation identity lives in the manifest, not in code:
-
-```toml
-[settings]
-timezone = "Europe/Warsaw"
-mem0_collection = "chronicle_personal"   # Mem0 collection the outbox targets
-operator = "Ada Lovelace"                # shown in agent-facing prompts
+```bash
+chronicle record "Selected local storage" --project demo --task-id ship \
+  --agent agent-a --request-id decision-1 --category decision --why "Works offline"
+chronicle record "Ready for review" --project demo --task-id ship \
+  --checkpoint-file checkpoint.json --request-id handoff-1
+chronicle startup --project demo --task-id ship --focus "Continue review" --format json
+chronicle query-memory "local storage" --project demo --task-id ship --format json
+chronicle timeline --at "2026-09-15T12:00:00Z"
+chronicle backup --force
 ```
 
-Automation (optional, macOS launchd) takes its namespace from
-`CHRONICLE_AUTOMATION.toml`:
+`--fact-file` accepts the assertion JSON above. Startup defaults to compact source
+metadata; `--full` includes full source content. Run `chronicle --help` for optional
+automation and maintenance commands.
 
-```toml
-[paths]
-launchd_label_prefix = "com.example"
-```
-
-## Architecture
+## Architecture and development
 
 ```text
-agents / CLI / MCP clients
-          |
-          v
-   Max Chronicle service
-          |
-          +--> chronicle.db
-          |    SQLite truth store, schema v9
-          |    events | snapshots | entities
-          |    situation models | lenses | scenarios
-          |
-          +--> Markdown projections
-          |    readable derived state
-          |
-          +--> Mem0 (optional, external bridge)
-               derived semantic recall
+Agents / CLI / MCP
+        |
+   service.py                 record + startup coordination
+        |--- memory.py       observations, checkpoints, current assertions
+        |--- recall.py       scoped lexical/vector ranking
+        |--- store.py        SQLite transactions and archived evidence
+        |
+   SQLite (schema 10) + content-addressed files
+        |--- Markdown projections
+        |--- optional Mem0 mirror
 ```
 
-Queries combine local Chronicle data, readable source projections, and optional semantic recall. The database remains authoritative; projections and recall layers do not write truth back into Chronicle.
+[Agent development guide](AGENTS.md) · [Schema](max_chronicle/docs/SCHEMA_V1.md) ·
+[Requirements](max_chronicle/docs/ROADMAP-ULTIMATE-MEMORY.md)
 
-## License
+```bash
+pip install -e '.[dev]'
+python -m pytest -q
+python -m build
+```
 
-MIT
+Tests use synthetic temporary workspaces. The cross-agent tests launch separate
+MCP clients and verify handoff without shared conversation history. Private
+workspaces, logs, credentials, databases, and artifacts never belong in a release.
+
+MIT licensed.

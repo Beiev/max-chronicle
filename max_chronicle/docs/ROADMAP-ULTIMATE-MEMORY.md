@@ -1,245 +1,144 @@
-# Ultimate Memory Roadmap
-> Status: archived on 2026-03-29
-> Created: 2026-03-16
-> Baseline: Chronicle is already stable and working. This roadmap is historical context only.
-
-Chronicle was declared finished on 2026-03-29.
-
-No further roadmap phases are active.
-
-Future work is maintenance-only unless bugs are found.
-
-The phase breakdown below is preserved for design history, not as an active execution plan.
-
-## Goal
-
-Build a local-first memory system that stays trustworthy, current, inspectable, and universally attachable for any future agent.
-
-Success means:
-- any agent can attach through one stable contract
-- canonical truth stays in Chronicle without ambiguity
-- context retrieval prefers fresh and trustworthy evidence
-- stale, duplicate, or low-signal memory is surfaced and controlled
-- time-travel reconstruction stays reliable years later
-
-## Decision Rules
-
-Prioritize only work that improves at least one of these:
-- universal agent interoperability
-- data freshness
-- data cleanliness and dedupe
-- source trust and evidence quality
-- retrieval quality and sorting
-- long-term durability and restore confidence
-
-Do not prioritize work that adds new surfaces without strengthening those properties.
-
-## Confirmed Bottlenecks
-
-### 1. Split universal contract
-
-Today `max-chronicle activate` still routes through `ssot_hub.py`, while the canonical service layer, MCP server, projections, and automation live in `max_chronicle`.
-
-Why this matters:
-- two attachment paths increase drift risk
-- future agents can receive slightly different behavior depending on entrypoint
-- improvements to ranking, freshness, and validation must be implemented twice or will diverge
-
-### 2. Freshness is observed, but not yet enforced
-
-Chronicle captures source mtimes and runtime state, but freshness is not yet a first-class guardrail in retrieval and projections.
-
-Why this matters:
-- an attached agent can read old `mem0-dump.json` or stale generated views without strong warning
-- current ranking does not penalize stale evidence enough
-- the system knows "when data was seen" better than it currently uses
-
-### 3. Trustworthiness is implicit, not modeled
-
-The manifest defines sources and priorities, but there is no explicit trust/freshness score used everywhere in query, activation, projection, and future retrieval.
-
-Why this matters:
-- reliable sources and derivative summaries are not consistently separated
-- future expansion to more connectors will create noise unless trust is formalized
-- sorting quality depends too much on simple textual match
-
-### 4. Event/entity governance is still loose
-
-Categories, entity types, and relation semantics are only partially validated. Duplicate meaning can still enter via multiple write paths.
-
-Why this matters:
-- low-governance timelines get noisier every month
-- semantic sync quality depends on stable categories and entities
-- universal reuse requires predictable data contracts
-
-### 5. Snapshot capture still has coupled side effects
-
-Runtime capture also triggers projections. That is convenient, but it ties archival truth to operator-facing file generation.
-
-Why this matters:
-- universal agents should be able to capture state without accidentally mutating docs unless requested
-- projection failures should not weaken canonical capture
-- freshness workflows become harder to reason about
-
-### 6. Long-term durability needs more proof, not more features
-
-Backups and audits exist, but the system still needs stronger restore drills, corruption checks, and invariant monitoring.
-
-Why this matters:
-- "works now" is not enough for a multi-year memory system
-- long-lived systems fail at restore time, not at insert time
-
-## Prioritized Plan
-
-## Phase A — Unify The Agent Contract
-
-Priority: highest
-
-Ship:
-- move activation, query, and timeline fully behind `max_chronicle` service primitives
-- keep `ssot_hub.py` as a thin compatibility shell, not a second logic layer
-- version the activation contract
-- add one machine-readable "attach bundle" for agents: current snapshot, recent events, source freshness, trust hints, and operating rules
-
-Why this is first:
-- it removes the main drift vector
-- every future improvement becomes universal automatically
-
-Exit criteria:
-- `max-chronicle`, `chronicle`, and `chronicle-mcp` read from the same service path for activation/query/timeline
-- legacy JSONL fallback is compatibility-only and clearly isolated
-
-## Phase B — Make Freshness A First-Class Retrieval Signal
-
-Priority: highest
-
-Ship:
-- define freshness classes for sources: live, recent, stale, archival
-- add freshness weighting in `query_context`, activation assembly, and future ranking
-- emit explicit stale-source warnings in MCP resources and activation prompts
-- add audit checks for stale projections, stale mem0 dump, and stale external sources
-
-Why this is real leverage:
-- improves answer quality without adding more data
-- reduces silent use of old context
-
-Exit criteria:
-- every retrieval response can explain how fresh its winning evidence is
-- stale data is visible and penalized by default
-
-## Phase C — Add Source Trust And Evidence Ranking
-
-Priority: high
-
-Ship:
-- define trust tiers in the manifest and persist them into retrieval results
-- distinguish canonical, primary runtime, derived projection, and semantic recall sources
-- rank retrieval by exactness + freshness + trust + domain relevance
-- prefer raw evidence paths over summaries when they conflict
-
-Why this matters:
-- "good sorting" depends on more than keyword hits
-- it prevents derived layers from outranking truth
-
-Exit criteria:
-- query results show source class and ranking basis
-- lower-trust summaries no longer outrank fresher canonical evidence
-
-## Phase D — Tighten Data Hygiene And Governance
-
-Priority: high
-
-Ship:
-- formal category registry for durable events
-- stronger entity and relation validation
-- dedupe rules for Chronicle writes and Chronicle -> Mem0 sync
-- explicit rules for what is allowed into snapshots vs events vs projections vs Mem0
-- reconciliation jobs that flag duplicate meaning across Chronicle, projections, and Mem0
-
-Why this matters:
-- this is what keeps the system clean after six months, not after one demo
-
-Exit criteria:
-- new writes are predictable and easier to lint
-- duplicate or malformed durable memory gets caught automatically
-
-## Phase E — Decouple Capture From Projection
-
-Priority: medium-high
-
-Ship:
-- separate "capture truth" from "render operator views"
-- keep a convenience combined command, but make the primitives distinct
-- ensure projection failure never marks canonical capture as failed
-- store projection freshness and lineage more explicitly
-
-Why this matters:
-- reduces accidental side effects for future agents
-- improves operational reasoning and rollback safety
-
-Exit criteria:
-- snapshots can be captured without mutating markdown
-- projection generation is an explicit secondary step
-
-## Phase F — Harden Multi-Agent Interoperability
-
-Priority: medium-high
-
-Ship:
-- add stable MCP resource names for current attach state, domain attach state, and health
-- return more structured retrieval payloads for agents, not only human-readable text
-- include contract version, source freshness, and trust metadata in agent-facing outputs
-- create a minimal external-agent integration guide with examples for MCP and CLI attachment
-
-Why this matters:
-- universal systems fail when the contract is implicit
-- future agents should not need repo archaeology
-
-Exit criteria:
-- a new agent can attach using only the MCP contract and docs without custom glue
-
-## Phase G — Prove Durability Operationally
-
-Priority: medium
-
-Ship:
-- scheduled restore drills with recorded evidence
-- checksum verification for DB and artifact store
-- invariant audit: orphaned artifacts, broken links, invalid JSON payloads, projection lag, stale source lag
-- clearer "system health" status for Chronicle itself
-
-Why this matters:
-- this is the difference between a useful system and a dependable one
-
-Exit criteria:
-- restore confidence is measured, not assumed
-- durability regressions create visible events
-
-## Not A Priority Right Now
-
-These are feature-shaped, but not current bottlenecks:
-- moving from SQLite to Postgres
-- adding a heavy graph UI
-- adding more LLM summarization layers
-- broad auto-tagging without stronger governance first
-- cross-agent write concurrency until single-writer discipline is actually insufficient
-- replacing Mem0 just because it is imperfect
-
-## Recommended Delivery Order
-
-1. Phase A — Unify the agent contract
-2. Phase B — Make freshness first-class
-3. Phase C — Add source trust and evidence ranking
-4. Phase D — Tighten data hygiene and governance
-5. Phase E — Decouple capture from projection
-6. Phase F — Harden multi-agent interoperability
-7. Phase G — Prove durability operationally
-
-## Immediate Next Moves
-
-If work starts now, the first concrete implementation slice should be:
-- refactor activation/query/timeline so `ssot_hub.py` delegates into `max_chronicle`
-- add explicit `source_class`, `trust_tier`, and `freshness_status` to retrieval outputs
-- add one Chronicle audit for stale sources and stale projections
-
-This gives the highest leverage with the lowest risk of feature drift.
+# Shared Agent Memory Specification
+
+## Metadata
+
+**Author:** Codex
+**Date:** 2026-09-15
+**Status:** Implemented and validated
+- Reviewers: project maintainer (approved the review proposals)
+
+## Context
+
+Chronicle preserves events, but a new agent must also recover the right task
+context and distinguish current decisions from older assertions. Search must
+not substitute unrelated recent activity for evidence. Independent confirmations
+must survive deduplication, and backups must prove evidence is restorable.
+
+Keep SQLite, CLI, and MCP. Keep private workspaces outside the public package.
+Existing entrypoints remain compatible; new fields are additive.
+
+## Functional Requirements
+
+- FR-1: Recall MUST apply domain, project, task, visibility, model, and dimension
+  constraints before ranking. Recency MUST only reorder relevant candidates.
+- FR-2: Recall MUST return no results when no eligible evidence matches and MUST
+  disclose unavailable or incomplete vector coverage.
+- FR-3: Writes MUST preserve independent observations, actor/session/task identity,
+  and evidence. Request IDs MUST make retries idempotent and reject changed input.
+- FR-4: Receipts MUST distinguish durable event success from missing/pointer-only
+  evidence and failed derived output.
+- FR-5: Startup MUST accept project/task/focus and return relevant evidence,
+  current facts, the latest checkpoint, changes since a cursor, and a next cursor.
+  Checkpoints MUST retain goal, completed work, verification, unknowns, and next steps.
+- FR-6: Explicit facts MUST retain provenance and replacement history. Replacing
+  a fact MUST name the expected current revision; stale updates MUST fail.
+  Assumptions MUST remain distinguishable from observed facts and decisions.
+- FR-7: Durable writes MUST use full SQLite synchronization. Restore checks MUST
+  verify archived content hashes and work without the original source workspace.
+- FR-8: Agent docs MUST describe the implemented contract. Built distributions MUST
+  exclude personal data. Local health MUST distinguish availability from data health.
+
+## Non-Functional Requirements
+
+- NFR-1: Core workflows MUST work without Ollama, Mem0, or paid calls; Python 3.11+
+  remains supported. New required external services: zero.
+- NFR-2: Existing entrypoints MUST remain available. Migration MUST retain all old
+  events and pass foreign-key checks with zero violations.
+- NFR-3: Public tests MUST use synthetic temporary workspaces. Task context MUST
+  be bounded to the requested item limit (1–100); history is explicitly paginated.
+
+## Acceptance Criteria
+
+### AC-1: (FR-1, FR-2)
+
+Given unrelated/hidden records, when querying another topic
+  or scope, then none appear merely because they are recent or vector-indexed.
+### AC-2: (FR-1, FR-2, NFR-1)
+
+Given missing/incompatible vectors, when searching,
+  then lexical recall works and vector degradation is explained.
+### AC-3: (FR-3)
+
+Given two agents confirming one decision with different evidence,
+  when both record it, then both observations and attachments remain retrievable.
+### AC-4: (FR-3)
+
+Given a committed request ID, when retried, then no duplicate is
+  created; changed content under that ID is rejected.
+### AC-5: (FR-4)
+
+Given missing evidence or a failed compatibility write, when
+  recording, then the receipt distinguishes durable memory from incomplete output.
+### AC-6: (FR-5, NFR-3)
+
+Given separate tasks, when starting each task, then its
+  context/checkpoint/cursor are scoped correctly and changes can be paginated.
+### AC-7: (FR-5)
+
+Given a checkpoint by agent A, when agent B starts without chat
+  history, then B recovers goal, verified results, unknowns, and next steps.
+### AC-8: (FR-6)
+
+Given an active fact, when explicitly replaced, then current recall
+  returns its replacement, history retains both, and stale replacement is rejected.
+### AC-9: (FR-7)
+
+Given altered/missing backup evidence, when restoring, then validation
+  fails; an intact relocated copy passes without the original workspace.
+### AC-10: (FR-8, NFR-2)
+
+Given a built package in a clean environment, when initialized
+  and used through CLI/MCP, then the documented workflow works without personal paths.
+### AC-11: (NFR-1, NFR-2)
+
+Given the old suite and an old database, when upgrading,
+  then compatibility tests and migration integrity checks pass.
+
+## Edge Cases
+
+- EC-1: Ollama unavailable, empty index, wrong model/dimension, invalid vectors.
+- EC-2: No matching knowledge, competing assertions, stale revision, empty task.
+- EC-3: Concurrent retries, duplicate prose from a new agent, missing files.
+- EC-4: Unmounted target, corrupt artifacts, relocated backup, legacy backups.
+- EC-5: Projection/compatibility failure after a canonical commit.
+
+## API Contracts
+
+MCP uses `POST /mcp`; liveness uses `GET /health`. Existing tools remain. Startup and recall gain optional `project` and `task_id`;
+startup also gains `since`. Recording gains optional `request_id`, `session_id`,
+`task_id`, `checkpoint`, and `fact`. Validation uses the existing error envelope.
+
+```typescript
+interface Checkpoint {
+  goal: string; completed: string[]; verification: string[];
+  open_questions: string[]; next_steps: string[];
+};
+interface Fact {
+  slot: string; value: string;
+  kind: "observed" | "decision" | "assumption";
+  supersedes?: string;
+};
+interface Receipt {
+  id: string; chronicle_status: "stored" | "existing";
+  observation_id?: string; fact_id?: string;
+  evidence?: {path: string; status: string}[];
+};
+```
+
+## Data Models
+
+| Model | Fields and constraints |
+| --- | --- |
+| Observation | UUID, event FK, optional unique request ID, request hash, actor, session/task/project, time, immutable payload |
+| Checkpoint | Validated observation payload; requires project and task identity |
+| Fact | Existing facts/episodes/observations/transactions/supersessions tables; scoped explicit replacement |
+| Cursor | Opaque continuation position bound to domain/project/task; includes new observations of old events |
+| Artifact | Existing hash and link; per-file receipt and verified backup inventory |
+
+## Out of Scope
+
+- OS-1: Automatic collection from all chats/apps. Capture stays explicit; connectors
+  can adopt the protocol without indiscriminate personal data ingestion.
+- OS-2: New orchestration platform, UI, or vector database.
+- OS-3: Automatically guessing truth or resolving conflicting human decisions.
+- OS-4: Publishing private configuration, credentials, or runtime history.

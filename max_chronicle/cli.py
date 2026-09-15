@@ -49,9 +49,7 @@ from .scaffold import scaffold_workspace
 from .store import (
     DEFAULT_STALE_RUN_TTL_HOURS,
     config_from_manifest,
-    fetch_project_events,
     fetch_recent_events,
-    fetch_relations_for_entity,
     parse_when,
     store_snapshot,
 )
@@ -226,6 +224,11 @@ def cmd_record(args: argparse.Namespace) -> int:
         "domain": args.domain,
         "category": args.category,
         "project": args.project,
+        "task_id": args.task_id,
+        "session_id": args.session_id,
+        "request_id": args.request_id,
+        "checkpoint": json.loads(Path(args.checkpoint_file).read_text()) if args.checkpoint_file else None,
+        "fact": json.loads(Path(args.fact_file).read_text()) if args.fact_file else None,
         "text": args.text,
         "why": args.why,
         "source_files": args.source_file or [],
@@ -341,6 +344,10 @@ def cmd_startup(args: argparse.Namespace) -> int:
         focus=args.focus,
         capture=args.capture,
         limit=args.limit,
+        project=args.project,
+        task_id=args.task_id,
+        since=args.since,
+        compact=not args.full,
     )
     if args.format == "json":
         return _print_json(payload)
@@ -673,6 +680,8 @@ def cmd_query_memory(args: argparse.Namespace) -> int:
         query=args.query,
         domain=args.domain,
         limit=args.limit,
+        project=args.project,
+        task_id=args.task_id,
     )
     if args.format == "json":
         return _print_json(payload)
@@ -821,6 +830,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_startup.add_argument("--agent", default="codex", help="Agent name")
     p_startup.add_argument("--title", default=None, help="Optional snapshot title")
     p_startup.add_argument("--focus", default=None, help="Optional focus string")
+    p_startup.add_argument("--project", default=None, help="Project slug shared by cooperating agents")
+    p_startup.add_argument("--task-id", default=None, help="Stable task ID within the project")
+    p_startup.add_argument("--since", default=None, help="Cursor from a previous task_context response")
+    p_startup.add_argument("--full", action="store_true", help="Include full source content")
     p_startup.add_argument("--capture", action="store_true", help="Capture a fresh runtime snapshot before building the bundle")
     p_startup.add_argument("--limit", type=int, default=3, help="Number of recent events to include")
     p_startup.add_argument("--format", choices=["text", "json"], default="text")
@@ -857,6 +870,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_record.add_argument("--domain", default="global", help="Domain id")
     p_record.add_argument("--category", default=None, help="Event category")
     p_record.add_argument("--project", default=None, help="Project key")
+    p_record.add_argument("--task-id", default=None, help="Stable task ID within project")
+    p_record.add_argument("--session-id", default=None, help="Originating agent session ID")
+    p_record.add_argument("--request-id", default=None, help="Unique write ID reused unchanged on retries")
+    p_record.add_argument("--checkpoint-file", default=None, help="JSON handoff: goal, completed, verification, open_questions, next_steps")
+    p_record.add_argument("--fact-file", default=None, help="JSON assertion: slot, value, kind, optional supersedes")
     p_record.add_argument("--why", default=None, help="Reason or context")
     p_record.add_argument("--source-file", action="append", help="Source file path")
     p_record.add_argument("--mem0-status", default="queued", help="Mem0 state for outbox tracking")
@@ -1032,6 +1050,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_query_memory.add_argument("query", help="Natural-language search string")
     p_query_memory.add_argument("--domain", default=None, help="Optional Chronicle domain filter")
+    p_query_memory.add_argument("--project", default=None, help="Project slug")
+    p_query_memory.add_argument("--task-id", default=None, help="Task ID within project")
     p_query_memory.add_argument("--limit", type=int, default=10, help="Maximum results to return")
     p_query_memory.add_argument("--format", choices=["text", "json"], default="text")
     p_query_memory.set_defaults(handler=cmd_query_memory)
