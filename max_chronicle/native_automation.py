@@ -19,9 +19,9 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .automation import AutomationConfig, ensure_automation_dirs, load_automation_config, load_env_file, repo_by_slug, repo_slug_for_path
-from .config import default_automation_path
+from .config import default_automation_path, feature_enabled
 from .runtime_context import expand_path, read_json, utc_now
-from .service import backfill_mem0_queue, build_freshness_audit, capture_runtime_snapshot, record_event, repair_mem0_state
+from .service import backfill_mem0_queue, build_freshness_audit, capture_runtime_snapshot, embed_backfill, record_event, repair_mem0_state, ENV_FEATURE_EVENT_EMBEDDINGS
 from .store import (
     config_from_manifest,
     count_mem0_outbox,
@@ -31,17 +31,14 @@ from .store import (
     fetch_curation_run,
     fetch_events_between,
     fetch_hook_event,
-    fetch_latest_automation_run,
     fetch_latest_backup_run,
     fetch_latest_curation_run,
-    fetch_latest_hook_event,
     fetch_latest_projection_run,
     fetch_latest_snapshot,
     fetch_mem0_outbox_entries,
     finish_automation_run,
     finish_backup_run,
     finish_curation_run,
-    has_snapshot_for_local_date,
     link_artifact,
     link_event_external_ref,
     open_connection,
@@ -1126,14 +1123,12 @@ def _copy_tree_incremental(source_root: Path, target_root: Path) -> tuple[int, i
                 continue
             if target_path.is_file():
                 target_path.unlink()
-        try:
-            os.link(source_path, target_path)
-            strategy["hardlinked"] += 1
-        except OSError:
-            shutil.copy2(source_path, target_path)
-            copied_files += 1
-            copied_bytes += source_size
-            strategy["copied"] += 1
+        # A hardlink shares corruption and later source writes with the backup.
+        # Use independent files even when both roots are on the same volume.
+        shutil.copy2(source_path, target_path)
+        copied_files += 1
+        copied_bytes += source_size
+        strategy["copied"] += 1
     return copied_files, copied_bytes, strategy
 
 
@@ -1469,10 +1464,37 @@ def _upsert_backup_manifest_in_db(
         )
 
 
-def _restore_check(source_db: Path, *, backup_path: Path | None = None, require_manifest: bool = True) -> dict[str, Any]:
+def _hash_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _artifact_inventory(root: Path) -> dict[str, str]:
+    return {str(path.relative_to(root)): _hash_file(path)
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def _restore_check(source_db: Path, *, backup_path: Path | None = None,
+                   require_manifest: bool = True,
+                   artifact_inventory: dict[str, str] | None = None,
+                   source_artifact_root: Path | None = None) -> dict[str, Any]:
     backup_root = backup_path or source_db.parent
     manifest_path = backup_root / "backup-manifest.json"
     artifact_root = backup_root / "chronicle-artifacts"
+    manifest_data: dict[str, Any] = {}
+    manifest_error = None
+    if manifest_path.exists():
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest_data, dict):
+                raise ValueError("manifest must be an object")
+        except (OSError, ValueError) as exc:
+            manifest_data = {}
+            manifest_error = str(exc)
+    if artifact_inventory is None:
+        artifact_inventory = manifest_data.get("artifact_inventory")
+    if source_artifact_root is None and manifest_data.get("source_artifact_root"):
+        source_artifact_root = Path(manifest_data["source_artifact_root"])
     with tempfile.TemporaryDirectory(prefix="chronicle-restore-") as tmp_dir:
         restored_path = Path(tmp_dir) / "chronicle.db"
         with sqlite3.connect(f"file:{source_db}?mode=ro", uri=True) as source_connection:
@@ -1500,17 +1522,24 @@ def _restore_check(source_db: Path, *, backup_path: Path | None = None, require_
                 LIMIT 1
                 """
             ).fetchone()
+            archived_artifacts = connection.execute(
+                """SELECT storage_path, sha256 FROM artifacts WHERE artifact_type != 'backup-manifest'
+                AND COALESCE(json_extract(metadata_json,'$.storage_mode'),'') != 'purged'"""
+            ).fetchall()
+            purged_artifacts = connection.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE json_extract(metadata_json,'$.storage_mode')='purged'"
+            ).fetchone()[0]
             manifest_artifacts = 0
             manifest_links = 0
             if latest_backup_run is not None:
                 manifest_artifacts = connection.execute(
                     """
-                    SELECT COUNT(*)
-                    FROM artifacts
-                    WHERE artifact_type = 'backup-manifest'
-                      AND storage_path = ?
+                    SELECT COUNT(*) FROM artifacts a
+                    JOIN artifact_links l ON l.artifact_id = a.id
+                    WHERE a.artifact_type = 'backup-manifest'
+                      AND l.target_type = 'backup_run' AND l.target_id = ?
                     """,
-                    (str(manifest_path),),
+                    (latest_backup_run["id"],),
                 ).fetchone()[0]
                 manifest_links = connection.execute(
                     """
@@ -1526,15 +1555,54 @@ def _restore_check(source_db: Path, *, backup_path: Path | None = None, require_
         expected_artifact_files = int(latest_backup_run["artifact_files"]) if latest_backup_run is not None else 0
         backup_manifest_present = manifest_path.exists()
         backup_manifest_declared = bool(
-            latest_backup_run is not None and latest_backup_run["manifest_path"] == str(manifest_path)
+            latest_backup_run is not None
+            and Path(latest_backup_run["manifest_path"] or "").name == "backup-manifest.json"
         )
         artifact_tree_complete = artifact_tree_files == expected_artifact_files
+        # Older backups have no complete inventory. Verify every registered
+        # archive they do describe, and disclose the weaker coverage explicitly.
+        inventory_complete = artifact_inventory is not None
+        registered_hashes = {}
+        for row in archived_artifacts:
+            path = Path(row["storage_path"])
+            if source_artifact_root and path.is_relative_to(source_artifact_root):
+                registered_hashes[str(path.relative_to(source_artifact_root))] = row["sha256"]
+            elif "chronicle-artifacts" in path.parts:
+                relative = Path(*path.parts[path.parts.index("chronicle-artifacts") + 1:])
+                registered_hashes[str(relative)] = row["sha256"]
+        if artifact_inventory is None:
+            artifact_inventory = registered_hashes
+        invalid_artifacts = []
+        if not isinstance(artifact_inventory, dict):
+            invalid_artifacts.append("invalid_inventory")
+            artifact_inventory = {}
+        for relative, expected_hash in registered_hashes.items():
+            if artifact_inventory.get(relative) != expected_hash:
+                invalid_artifacts.append(relative)
+        for relative, expected_hash in artifact_inventory.items():
+            path = artifact_root / relative
+            try:
+                valid = (not Path(relative).is_absolute()
+                         and path.resolve().is_relative_to(artifact_root.resolve())
+                         and not path.is_symlink() and path.is_file()
+                         and _hash_file(path) == expected_hash)
+            except (OSError, ValueError):
+                valid = False
+            if not valid:
+                invalid_artifacts.append(relative)
+        if inventory_complete and len(artifact_inventory) != artifact_tree_files:
+            invalid_artifacts.append("inventory_file_count_mismatch")
+        db_hash_ok = (not manifest_data.get("db_sha256")
+                      or _hash_file(source_db) == manifest_data["db_sha256"])
         ok = (
             quick_check == "ok"
             and integrity == "ok"
             and not foreign_key_violations
             and running_backup_runs == 0
             and artifact_tree_complete
+            and not invalid_artifacts
+            and db_hash_ok
+            and manifest_error is None
         )
         if require_manifest:
             ok = ok and backup_manifest_present and backup_manifest_declared and manifest_artifacts > 0 and manifest_links > 0
@@ -1557,6 +1625,13 @@ def _restore_check(source_db: Path, *, backup_path: Path | None = None, require_
             "artifact_tree_files": artifact_tree_files,
             "artifact_tree_expected_files": expected_artifact_files,
             "artifact_tree_complete": artifact_tree_complete,
+            "artifact_hashes_ok": not invalid_artifacts,
+            "artifact_hashes_checked": len(artifact_inventory),
+            "artifact_inventory_complete": inventory_complete,
+            "intentionally_purged_artifacts": purged_artifacts,
+            "invalid_artifacts": invalid_artifacts[:20],
+            "db_hash_ok": db_hash_ok,
+            "manifest_error": manifest_error,
             "ok": ok,
         }
 
@@ -1706,6 +1781,8 @@ def run_backup(
                 "artifact_files_copied": artifact_files_copied,
                 "artifact_bytes_copied": artifact_bytes_copied,
                 "artifact_copy_strategy": artifact_copy_strategy,
+                "artifact_inventory": _artifact_inventory(artifact_target),
+                "source_artifact_root": str(config.artifact_dir),
                 "latest_snapshot_id": latest_snapshot.get("id") if latest_snapshot else None,
                 "maintenance": maintenance,
                 "run_id": run_id,
@@ -1756,7 +1833,11 @@ def run_backup(
         restore_details=None,
         error_text=None,
     )
-    restore_result = _restore_check(backup_db, backup_path=backup_path, require_manifest=False)
+    restore_result = _restore_check(
+        backup_db, backup_path=backup_path, require_manifest=False,
+        artifact_inventory=manifest_payload["artifact_inventory"],
+        source_artifact_root=config.artifact_dir,
+    )
     restore_finished_at_utc = utc_now()
     _upsert_backup_run_in_db(
         backup_db,
@@ -2273,14 +2354,23 @@ def run_automation_job(
                 limit=automation.guards.mem0_sync_batch_size,
                 trigger_source=trigger_source,
             )
+            # Repair a bounded slice after an embedding outage. Local capture
+            # remains successful even while the optional index is unavailable.
+            embedding_repair = {"status": "disabled"}
+            if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS):
+                try:
+                    embedding_repair = embed_backfill(manifest, limit=10)
+                except Exception as exc:
+                    embedding_repair = {"status": "degraded", "error": str(exc)}
             finish_automation_run(
                 config,
                 run_id=run_id,
                 status="ok",
-                details={"sync": sync},
+                details={"sync": sync, "embedding_repair": embedding_repair},
                 snapshot_id=snapshot["id"],
             )
-            return {"status": "ok", "run_id": run_id, "snapshot_id": snapshot["id"], "sync": sync}
+            return {"status": "ok", "run_id": run_id, "snapshot_id": snapshot["id"],
+                    "sync": sync, "embedding_repair": embedding_repair}
 
         return _dispatch(daily_key, _daily_capture)
 

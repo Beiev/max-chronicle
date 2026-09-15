@@ -62,7 +62,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
         if attempt < CONNECT_WAL_RETRIES:
             time.sleep(0.02 * (2 ** attempt) + random.uniform(0.0, 0.03))
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA synchronous = NORMAL")
+    connection.execute("PRAGMA synchronous = FULL")
     return connection
 
 

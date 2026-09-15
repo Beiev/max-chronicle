@@ -1,0 +1,8 @@
+include README.md INSTALL.md AGENTS.md LICENSE
+recursive-include max_chronicle *.py *.sql *.md
+recursive-include tests *.py
+global-exclude *.pyc *.db *.db-wal *.db-shm *.jsonl .env .env.*
+prune chronicle-artifacts
+prune daybooks
+prune logs
+prune backups

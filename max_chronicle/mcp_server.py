@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import weakref
+import uuid
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
@@ -54,6 +55,7 @@ from .store import (
     fetch_recent_events,
     open_connection,
 )
+from .memory import Checkpoint, FactInput
 
 READ_ONLY_PROFILE = "readonly"
 CHRONICLER_PROFILE = "chronicler"
@@ -81,7 +83,11 @@ CAPTURE_ARG = Annotated[
     bool,
     Field(description="Capture a fresh runtime snapshot before building the bundle."),
 ]
-LIMIT_ARG = Annotated[int, Field(description="Maximum number of recent items or hits to include.")]
+LIMIT_ARG = Annotated[int, Field(ge=1, le=100, description="Maximum number of recent items or hits (1–100).")]
+TASK_ARG = Annotated[str | None, Field(description="Stable task ID within project. Requires project; reuse it across agents and sessions.")]
+SESSION_ARG = Annotated[str | None, Field(description="Originating session ID; defaults to the current MCP session identity.")]
+REQUEST_ARG = Annotated[str | None, Field(description="Unique write request ID. Reuse unchanged on retries; changed input requires a new ID.")]
+CURSOR_ARG = Annotated[str | None, Field(description="Cursor from task_context.cursor to read changes since a previous startup in the same scope.")]
 COMPACT_ARG = Annotated[bool, Field(description="Return the compact startup bundle variant.")]
 TIMESTAMP_ARG = Annotated[str, Field(description="ISO timestamp to reconstruct around.")]
 WINDOW_HOURS_ARG = Annotated[int, Field(description="Search window in hours around the timestamp.")]
@@ -327,7 +333,22 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     # bodies run in worker threads now, so mutations go through a lock.
     gate_lock = threading.Lock()
     unlocked_sessions: weakref.WeakSet = weakref.WeakSet()
+    identities: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+    fallback_identity = {"session_id": str(uuid.uuid4()), "agent": "mcp"}
     sessionless_unlocked = False
+
+    def session_identity(ctx: Context | None, agent: str = "mcp") -> dict:
+        session = _gate_session(ctx)
+        with gate_lock:
+            if session is None:
+                identity = fallback_identity
+            else:
+                if session not in identities:
+                    identities[session] = {"session_id": str(uuid.uuid4()), "agent": "mcp"}
+                identity = identities[session]
+            if agent != "mcp":
+                identity["agent"] = _normalize_agent(agent)
+            return dict(identity)
 
     def unlock_startup_gate(ctx: Context | None) -> None:
         nonlocal sessionless_unlocked
@@ -357,8 +378,13 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "and unlocks the write surface (read tools work without it but do not unlock). "
             "Recall: `query_memory` is the primary search; `query_context` adds status-markdown and "
             "mem0-dump context; `recent_events` is the cheap latest-N feed; `state_at` reconstructs "
-            "a moment in time. Write durable facts with `record_event`; entity maintenance lives "
-            "under `entity_admin`. A failing tool raises, so the call is flagged isError and the "
+            "a moment in time. Write durable facts with `record_event`; use `entity_admin` for entity maintenance. "
+            "Task handoffs: Use the same project/task_id across agents. Startup returns "
+            "task_context (checkpoint, current_facts, changes, cursor); since resumes its change feed. "
+            "Record a checkpoint at handoff with completed work, actual verification, unknowns, and next steps. "
+            "Use request_id for write retries and fact.supersedes to replace an explicit current fact. "
+            "A database record is an attributed assertion, not proof of correctness; inspect evidence and fact.kind. "
+            "A failing tool raises, so the call is flagged isError and the "
             "message carries a JSON envelope after the FastMCP prefix — parse from the first '{': "
             "`status`, `error_type`, `retryable`, `hint`. Follow the hint instead of giving up. "
             "Renamed 2026-08-13 (older agents may hold the previous names): "
@@ -543,6 +569,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         capture: CAPTURE_ARG = False,
         limit: LIMIT_ARG = 3,
         compact: COMPACT_ARG = True,
+        project: PROJECT_ARG = None,
+        task_id: TASK_ARG = None,
+        since: CURSOR_ARG = None,
         ctx: Context | None = None,
     ) -> dict:
         effective_capture = capture if profile == CHRONICLER_PROFILE else False
@@ -555,7 +584,11 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             capture=effective_capture,
             limit=limit,
             compact=compact,
+            project=project,
+            task_id=task_id,
+            since=since,
         )
+        payload.update(session_identity(ctx, agent))
         unlock_startup_gate(ctx)
         return payload
 
@@ -633,8 +666,11 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         query: QUERY_ARG,
         domain: OPTIONAL_DOMAIN_ARG = None,
         limit: LIMIT_ARG = 10,
+        project: PROJECT_ARG = None,
+        task_id: TASK_ARG = None,
     ) -> dict:
-        return query_memory(manifest(), query=query, domain=domain, limit=limit)
+        return query_memory(manifest(), query=query, domain=domain, limit=limit,
+                            project=project, task_id=task_id)
 
     @register_tool(
         writes=False,
@@ -717,13 +753,24 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             project: PROJECT_ARG = None,
             agent: AGENT_ARG = "mcp",
             source_files: SOURCE_FILES_ARG = None,
+            task_id: TASK_ARG = None,
+            session_id: SESSION_ARG = None,
+            request_id: REQUEST_ARG = None,
+            checkpoint: Annotated[Checkpoint | None, Field(description="Structured handoff for the next agent; requires project/task_id.")] = None,
+            fact: Annotated[FactInput | None, Field(description="Explicit current assertion. Changing a slot requires the previous fact ID in supersedes.")] = None,
             ctx: Context | None = None,
         ) -> dict:
             require_startup_gate(ctx, tool_name="record_event", domain=domain)
+            identity = session_identity(ctx, agent)
             return record_event(
                 manifest(),
                 {
-                    "agent": _normalize_agent(agent),
+                    "agent": identity["agent"],
+                    "task_id": task_id,
+                    "session_id": session_id or identity["session_id"],
+                    "request_id": request_id,
+                    "checkpoint": checkpoint.model_dump() if checkpoint else None,
+                    "fact": fact.model_dump() if fact else None,
                     "domain": domain,
                     "category": category,
                     "project": project,

@@ -264,6 +264,42 @@ class TestRecordEventEmbedding:
 
 
 class TestQueryMemory:
+    def test_no_match_does_not_return_recent_activity(self, loaded_manifest) -> None:
+        _store_event(loaded_manifest, "Website release completed")
+        with patch("max_chronicle.embeddings.embed_text", return_value=None):
+            result = service.query_memory(loaded_manifest, query="unicorn reactor")
+        assert result["results"] == []
+
+    def test_vector_recall_enforces_scope_and_visibility(self, loaded_manifest) -> None:
+        config = config_from_manifest(loaded_manifest)
+        hidden = _store_event(loaded_manifest, "Internal scratch", domain="memory",
+                              memory_guard={"visibility": "raw_only"})
+        elsewhere = _store_event(loaded_manifest, "Other project", project="beta")
+        for event in [hidden, elsewhere]:
+            store_event_embedding(config, event["id"], _make_vec(0), "nomic-embed-text", EMBED_DIM)
+        with patch("max_chronicle.embeddings.embed_text", return_value=_make_vec(0)):
+            result = service.query_memory(loaded_manifest, query="unicorn reactor",
+                                          domain="global", project="alpha")
+        assert result["results"] == []
+
+    def test_incompatible_vectors_are_excluded_and_reported(self, loaded_manifest) -> None:
+        config = config_from_manifest(loaded_manifest)
+        event = _store_event(loaded_manifest, "Unique decision")
+        store_event_embedding(config, event["id"], _make_vec(0), "another-model", EMBED_DIM)
+        with patch("max_chronicle.embeddings.embed_text", return_value=_make_vec(0)):
+            result = service.query_memory(loaded_manifest, query="unicorn reactor")
+        assert result["results"] == []
+        assert result["degraded"] is True
+        assert result["vector_coverage"]["compatible"] == 0
+
+    def test_low_similarity_is_not_evidence(self, loaded_manifest) -> None:
+        config = config_from_manifest(loaded_manifest)
+        event = _store_event(loaded_manifest, "Unrelated evidence")
+        store_event_embedding(config, event["id"], [-x for x in _make_vec(0)], "nomic-embed-text", EMBED_DIM)
+        with patch("max_chronicle.embeddings.embed_text", return_value=_make_vec(0)):
+            result = service.query_memory(loaded_manifest, query="unicorn reactor")
+        assert result["results"] == []
+
     def _seed_events(self, manifest: dict) -> list[dict]:
         """Store three events with known text for testing."""
         ev1 = _store_event(manifest, "Chronicle memory system upgrade shipped")
@@ -483,12 +519,12 @@ class TestEmbedBackfillCli:
 
 
 # ---------------------------------------------------------------------------
-# 6. Migration idempotence updated to 9
+# 6. Migration idempotence updated to 10
 # ---------------------------------------------------------------------------
 
 
-def test_migrate_is_idempotent_v9(chronicle_sandbox) -> None:
-    """Applying migrations twice results in exactly 9 applied, user_version=9."""
+def test_migrate_is_idempotent_v10(chronicle_sandbox) -> None:
+    """Applying migrations twice results in exactly 10 applied, user_version=10."""
     first = _cli(
         "--db",
         str(chronicle_sandbox.chronicle_db),
@@ -509,7 +545,17 @@ def test_migrate_is_idempotent_v9(chronicle_sandbox) -> None:
     )
     first_payload = json.loads(first.stdout)
     second_payload = json.loads(second.stdout)
-    assert len(first_payload["applied"]) == 9, first_payload["applied"]
+    assert len(first_payload["applied"]) == 10, first_payload["applied"]
     assert second_payload["applied"] == []
-    assert first_payload["summary"]["user_version"] == 9
-    assert second_payload["summary"]["user_version"] == 9
+    assert first_payload["summary"]["user_version"] == 10
+    assert second_payload["summary"]["user_version"] == 10
+
+
+def test_weak_positive_vector_match_does_not_answer_unrelated_query(loaded_manifest, monkeypatch):
+    monkeypatch.delenv("CHRONICLE_VECTOR_MIN_SIMILARITY", raising=False)
+    event = _store_event(loaded_manifest, "Ordinary project update")
+    stored_vector = [0.6, 0.8] + [0.0] * (EMBED_DIM - 2)
+    store_event_embedding(config_from_manifest(loaded_manifest), event["id"], stored_vector,
+                          "nomic-embed-text", EMBED_DIM)
+    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda _: [1.0] + [0.0] * (EMBED_DIM - 1))
+    assert service.query_memory(loaded_manifest, query="unicornquantumzxy987")["results"] == []

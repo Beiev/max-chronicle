@@ -46,7 +46,8 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
     artifact_settings = manifest.get("artifacts", {})
     db_value = paths.get("chronicle_db")
     db_path = Path(db_value).expanduser() if db_value else None
-    config = default_config(db_path)
+    status_root = Path(paths["status_root"]).expanduser() if paths.get("status_root") else None
+    config = default_config(db_path, status_root=status_root)
     settings = manifest.get("settings", {})
     timezone_name = settings.get("timezone") or config.timezone
     mem0_collection = str(settings.get("mem0_collection") or config.mem0_collection)
@@ -1512,6 +1513,10 @@ def _event_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
 
     return {
         "id": row["id"],
+        "task_id": payload.get("task_id"),
+        "session_id": payload.get("session_id"),
+        "checkpoint": payload.get("checkpoint"),
+        "fact": payload.get("fact"),
         "recorded_at": row["occurred_at_utc"],
         "agent": payload.get("agent") or row["actor"],
         "branch": payload.get("branch"),
@@ -1653,6 +1658,9 @@ def search_events(
     limit: int = 10,
     domain: str | None = None,
     visibility: str = "default",
+    project: str | None = None,
+    task_id: str | None = None,
+    current_only: bool = False,
 ) -> list[dict[str, Any]]:
     resolved_visibility = _normalize_event_visibility(visibility)
     fts_query = _fts_query(query)
@@ -1684,12 +1692,64 @@ def search_events(
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
               AND events_fts MATCH ?
               AND """ + _event_domain_where_clause("e") + """
+              AND (? IS NULL OR e.title = ?)
+              AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
+              AND (? = 0 OR NOT EXISTS (SELECT 1 FROM facts f
+                  WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
+                  OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
+                      AND json_extract(obs.payload_json,'$.fact_id')=f.id))))
             ORDER BY rank
             LIMIT ?
             """,
-            (resolved_visibility, fts_query, domain, domain, domain, limit),
+            (resolved_visibility, fts_query, domain, domain, domain,
+             project, project, task_id, task_id, current_only, limit),
         ).fetchall()
     return [_event_row_to_entry(row) for row in rows]
+
+
+def search_fact_events(
+    config: ChronicleConfig, *, query: str, limit: int = 40,
+    domain: str | None = None, project: str | None = None,
+    task_id: str | None = None,
+) -> list[str]:
+    """Search current explicit values as well as the prose of their event."""
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            """SELECT e.id FROM facts_fts
+            JOIN current_facts f ON f.row_id=facts_fts.rowid
+            JOIN events e ON e.id=json_extract(f.attributes_json,'$.event_id')
+            WHERE facts_fts MATCH ?
+              AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+              AND """ + _event_domain_where_clause("e") + """
+              AND (? IS NULL OR e.title=?)
+              AND (? IS NULL OR json_extract(e.payload_json,'$.task_id')=?)
+            ORDER BY bm25(facts_fts),e.id LIMIT ?""",
+            (_fts_query(query), domain, domain, domain, project, project, task_id, task_id, limit),
+        ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def fetch_recall_pool(
+    config: ChronicleConfig, *, domain: str | None = None,
+    project: str | None = None, task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Scope eligible events before vector ranking; include missing index rows."""
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            """SELECT e.id, e.occurred_at_utc, ee.model, ee.dim, ee.vector
+            FROM events e LEFT JOIN event_embeddings ee ON ee.event_id = e.id
+            WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
+              AND """ + _event_domain_where_clause("e") + """
+              AND (? IS NULL OR e.title = ?)
+              AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
+              AND NOT EXISTS (SELECT 1 FROM facts f
+                  WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
+                  OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
+                      AND json_extract(obs.payload_json,'$.fact_id')=f.id)))
+            ORDER BY e.occurred_at_utc DESC, e.id
+            """, (domain, domain, domain, project, project, task_id, task_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def fetch_events_between(
@@ -3773,6 +3833,10 @@ def store_event_embedding(
     Idempotent — calling twice with the same event_id replaces the row.
     """
     from .embeddings import pack_vector  # local import avoids circular at module load
+    import math
+
+    if len(vector) != dim or not vector or not all(math.isfinite(x) for x in vector) or not any(vector):
+        raise ValueError("Embedding must have the declared dimension and finite, nonzero values")
 
     blob = pack_vector(vector)
     now = utc_now()
@@ -3812,15 +3876,16 @@ def fetch_all_event_embeddings(
 
 
 def fetch_event_ids_without_embedding(config: ChronicleConfig) -> list[str]:
-    """Return event IDs that have no row in event_embeddings."""
+    """Return missing or incompatible rows so backfill can repair model changes."""
+    from .embeddings import EMBED_MODEL, EMBED_DIM
     with open_connection(config) as connection:
         rows = connection.execute(
             """
             SELECT e.id
             FROM events AS e
             LEFT JOIN event_embeddings AS ee ON ee.event_id = e.id
-            WHERE ee.event_id IS NULL
+            WHERE ee.event_id IS NULL OR ee.model != ? OR ee.dim != ? OR length(ee.vector) != ?
             ORDER BY e.occurred_at_utc DESC
-            """
+            """, (EMBED_MODEL, EMBED_DIM, EMBED_DIM * 4),
         ).fetchall()
     return [row["id"] for row in rows]

@@ -1,11 +1,11 @@
-# Chronicle Schema v1
-> Updated: 2026-03-30 with migration v7 operational state.
+# Chronicle Schema
+> Current: schema 10. The filename is retained for existing links.
 
 ## Purpose
 
 `chronicle.db` is the canonical local database for durable events, snapshots, entities, ingest runs, and Mem0 sync state.
 
-Schema v1 is intentionally boring:
+The core storage model:
 
 - append-only events and snapshots
 - generic entities and relations
@@ -16,9 +16,9 @@ Schema v1 is intentionally boring:
 
 Current operational database version:
 
-- `PRAGMA user_version = 9`
-- latest applied migration: `0009_event_embeddings.sql`
-- next migration number to reserve: `0010`
+- `PRAGMA user_version = 10`
+- latest applied migration: `0010_agent_observations.sql`
+- next migration number: `0011`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
@@ -178,3 +178,23 @@ Current import sources:
 This is bootstrap only.
 
 Long-term writes should target Chronicle directly, not JSONL first.
+
+## Shared agent memory (migration 0010)
+
+`event_observations` retains each independent author/session/task observation of
+an event, its evidence receipt, and optional checkpoint. A monotonic `seq` powers
+scope-bound continuation cursors; old events are backfilled without changing IDs.
+`request_id` is unique and bound to request content. A reconnect may change the
+transport session while replaying the same committed request.
+
+Explicit assertions use the existing `episodes`, `facts`, `fact_observations`,
+`fact_transactions`, `fact_supersessions`, and `fact_mutation_log` tables. A fact
+slot belongs to domain/project/task scope. Replacements require the current ID;
+the old row is retired and linked to its replacement. `current_facts` is a view,
+not a separately rewritten truth store. `attributes_json.kind` distinguishes
+observations, decisions, and assumptions.
+
+Events, observations, fact mutations, and artifact links share one transaction.
+Lexical/vector recall excludes superseded fact events, while historical reads
+retain them. Legacy analytical tables are retained for historical compatibility;
+the current tool surface does not produce speculative scenarios.

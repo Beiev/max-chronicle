@@ -1,4 +1,7 @@
 # Memory V2 Plan
+
+> Historical design; analytical features described below are inactive.
+> For the current contract see [Shared agent memory](ROADMAP-ULTIMATE-MEMORY.md).
 > Status: proposed
 > Date: 2026-03-21
 > Scope: Chronicle-centered memory evolution

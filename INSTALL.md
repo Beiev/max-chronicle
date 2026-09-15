@@ -3,7 +3,7 @@
 This repository now supports a safe two-layer install model:
 
 - `core`: Chronicle CLI, SQLite truth store, MCP server, SSOT docs, snapshots, projections
-- `optional`: Mem0 bridge, launchd automation, external runtime feeds, repo hooks, model-backed canaries
+- `optional`: Mem0 bridge, launchd automation, external runtime feeds, repo hooks
 
 The goal is to let someone install Chronicle without inheriting your personal machine layout.
 
@@ -55,11 +55,10 @@ The generated workspace is intentionally additive and local. It does not modify 
 
 These are not required for the core system to work:
 
-- Mem0 / vector recall
+- Mem0 mirror and local Ollama vector recall
 - launchd scheduling
 - external digest feeds
 - repo hook automation
-- MiniMax canaries
 
 Fresh installs can leave those placeholders as-is until the core capture/query flow works.
 
@@ -92,3 +91,10 @@ Then share the generated artifact from `dist/`.
 4. Customize `SSOT_MANIFEST.toml`.
 5. Customize `CHRONICLE_AUTOMATION.toml`.
 6. Only then enable optional integrations.
+
+## Agent handoff
+
+Start with `chronicle startup --project demo --task-id ship --format json`.
+See README for checkpoints, explicit facts, request IDs, and MCP configuration.
+Build distributions from the public source checkout, with the private workspace
+kept in a separate directory.
