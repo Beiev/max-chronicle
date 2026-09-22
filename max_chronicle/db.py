@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+import os
 import random
 import re
 import sqlite3
 import time
+import uuid
 
 from .config import ChronicleConfig
 
@@ -17,6 +19,10 @@ APPLICATION_ID = 0x4348524E  # CHRN
 MIGRATION_LOCK_RETRIES = 5
 MIGRATION_LOCK_RETRY_BASE_SECONDS = 0.05
 CONNECT_WAL_RETRIES = 8
+# A pre-migration backup runs while the upgrader holds the write lock; bound
+# it so a stuck source cannot hold every other writer forever.
+MIGRATION_BACKUP_TIMEOUT_SECONDS = 120.0
+MIGRATION_BACKUP_PAGES_PER_STEP = 256
 
 
 class MigrationError(RuntimeError):
@@ -44,10 +50,20 @@ class SchemaState:
 
     applied: frozenset[int]
     known: tuple[MigrationFile, ...]
+    has_objects: bool = False
+    application_id: int = 0
 
     @property
     def fresh(self) -> bool:
-        return not self.applied
+        """Empty: nothing in the file yet, so initialising it changes no one's data."""
+        return not self.applied and not self.has_objects
+
+    @property
+    def foreign(self) -> bool:
+        """Some other application's database: objects without Chronicle history."""
+        if self.application_id not in (0, APPLICATION_ID):
+            return True
+        return not self.applied and self.has_objects
 
     @property
     def pending(self) -> tuple[MigrationFile, ...]:
@@ -210,40 +226,45 @@ def _execute_sql_script_in_transaction(connection: sqlite3.Connection, sql: str)
         raise sqlite3.OperationalError("incomplete SQL migration statement")
 
 
-def apply_migrations(connection: sqlite3.Connection, config: ChronicleConfig) -> list[MigrationFile]:
+def _apply_pending_locked(connection: sqlite3.Connection, config: ChronicleConfig) -> list[MigrationFile]:
+    """Apply missing migrations inside the caller's write transaction."""
     applied_now: list[MigrationFile] = []
+    ensure_migration_table(connection)
+    applied_versions = {
+        row["version"]
+        for row in connection.execute("SELECT version FROM schema_migrations")
+    }
 
+    connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+
+    for migration in _load_migration_files(config):
+        if migration.version in applied_versions:
+            continue
+        sql = migration.path.read_text(encoding="utf-8")
+        prehook = _MIGRATION_PREHOOKS.get(migration.version)
+        if prehook is not None:
+            prehook(connection)
+        _execute_sql_script_in_transaction(connection, sql)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_utc)
+            VALUES (?, ?, ?)
+            """,
+            (migration.version, migration.name, utc_now()),
+        )
+        inserted = int(connection.execute("SELECT changes()").fetchone()[0])
+        applied_versions.add(migration.version)
+        if inserted:
+            applied_now.append(migration)
+    latest_version = max(applied_versions, default=0)
+    connection.execute(f"PRAGMA user_version = {latest_version}")
+    return applied_now
+
+
+def apply_migrations(connection: sqlite3.Connection, config: ChronicleConfig) -> list[MigrationFile]:
     _begin_immediate_with_retry(connection)
     try:
-        ensure_migration_table(connection)
-        applied_versions = {
-            row["version"]
-            for row in connection.execute("SELECT version FROM schema_migrations")
-        }
-
-        connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
-
-        for migration in _load_migration_files(config):
-            if migration.version in applied_versions:
-                continue
-            sql = migration.path.read_text(encoding="utf-8")
-            prehook = _MIGRATION_PREHOOKS.get(migration.version)
-            if prehook is not None:
-                prehook(connection)
-            _execute_sql_script_in_transaction(connection, sql)
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO schema_migrations(version, name, applied_at_utc)
-                VALUES (?, ?, ?)
-                """,
-                (migration.version, migration.name, utc_now()),
-            )
-            inserted = int(connection.execute("SELECT changes()").fetchone()[0])
-            applied_versions.add(migration.version)
-            if inserted:
-                applied_now.append(migration)
-        latest_version = max(applied_versions, default=0)
-        connection.execute(f"PRAGMA user_version = {latest_version}")
+        applied_now = _apply_pending_locked(connection, config)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -261,39 +282,32 @@ def read_schema_state(connection: sqlite3.Connection, config: ChronicleConfig) -
         if has_table
         else frozenset()
     )
-    return SchemaState(applied=applied, known=tuple(_load_migration_files(config)))
+    has_objects = (
+        connection.execute("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1").fetchone()
+        is not None
+    )
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    return SchemaState(
+        applied=applied,
+        known=tuple(_load_migration_files(config)),
+        has_objects=has_objects,
+        application_id=application_id,
+    )
 
 
-def backup_database(connection: sqlite3.Connection, db_path: Path, *, label: str) -> Path:
-    """Copy the database next to itself with SQLite's online backup API."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    target = db_path.with_name(f"{db_path.name}.bak-{label}-{stamp}")
-    destination = sqlite3.connect(target)
-    try:
-        connection.backup(destination)
-    finally:
-        destination.close()
-    return target
-
-
-def ensure_schema(
-    connection: sqlite3.Connection,
+def check_schema_policy(
+    state: SchemaState,
     config: ChronicleConfig,
     *,
     allow_upgrade: bool,
-    backup: bool = True,
-) -> SchemaPreparation:
-    """Bring the schema to this code's version under an explicit policy.
-
-    A brand-new database is always initialised. An existing database with
-    pending migrations upgrades only when the caller allows it, after an
-    online backup; otherwise it raises SchemaMigrationRequired, so a stray
-    process (another checkout, an old job, a test aimed at the wrong root)
-    cannot change a live schema just by connecting. A database carrying
-    migrations this code does not know raises SchemaAheadOfCode: writing with
-    an older picture of the schema is unsafe.
-    """
-    state = read_schema_state(connection, config)
+    allow_init: bool = True,
+) -> None:
+    """Raise unless this caller may use the database in `state` as it is or bring it current."""
+    if state.foreign:
+        raise MigrationError(
+            f"{config.db_path} is not a Chronicle database (it has other objects or application id "
+            f"{state.application_id:#x} and no Chronicle migration history); refusing to modify it."
+        )
     if state.unknown:
         raise SchemaAheadOfCode(
             f"{config.db_path} carries migrations this code does not know "
@@ -302,23 +316,99 @@ def ensure_schema(
             "Upgrade max-chronicle before using this database."
         )
     if not state.pending:
-        return SchemaPreparation(state_before=state, applied=(), backup_path=None)
-    if not state.fresh and not allow_upgrade:
+        return
+    if state.fresh:
+        if not allow_init:
+            raise SchemaMigrationRequired(
+                f"{config.db_path} is not initialised. Run `chronicle migrate` (or `chronicle init`)."
+            )
+        return
+    if not allow_upgrade:
         raise SchemaMigrationRequired(
             f"{config.db_path} is at schema v{state.current_version}; this code expects "
             f"v{state.target_version} (pending: "
             f"{', '.join(f'{item.version:04d}' for item in state.pending)}). Run `chronicle migrate`, "
-            "which backs the database up first, or restart the Chronicle server, which migrates on start."
+            "which backs the database up first, or restart the server with `chronicle-mcp --migrate`."
         )
-    backup_path = None
-    if backup and not state.fresh:
-        backup_path = backup_database(
-            connection,
-            config.db_path,
-            label=f"premigrate-v{state.current_version}-v{state.target_version}",
-        )
-    applied = apply_migrations(connection, config)
+
+
+def _backup_database(db_path: Path, *, label: str) -> Path:
+    """Copy the committed database next to itself through its own connection.
+
+    Called while the upgrader holds the write lock, so no writer can commit
+    between this copy and the migration. The name is unique and created
+    exclusively: two upgraders can never share, or overwrite, one backup.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target = db_path.with_name(f"{db_path.name}.bak-{label}-{stamp}-{uuid.uuid4().hex[:8]}")
+    os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    deadline = time.monotonic() + MIGRATION_BACKUP_TIMEOUT_SECONDS
+
+    def _within_deadline(_status: int, _remaining: int, _total: int) -> None:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"backup of {db_path} did not finish within {MIGRATION_BACKUP_TIMEOUT_SECONDS:.0f}s"
+            )
+
+    source = sqlite3.connect(db_path)
+    try:
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination, pages=MIGRATION_BACKUP_PAGES_PER_STEP, progress=_within_deadline)
+        finally:
+            destination.close()
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        source.close()
+    return target
+
+
+def ensure_schema(
+    connection: sqlite3.Connection,
+    config: ChronicleConfig,
+    *,
+    allow_upgrade: bool,
+    allow_init: bool = True,
+) -> SchemaPreparation:
+    """Bring the schema to this code's version under an explicit policy.
+
+    An empty database initialises (unless allow_init is off). An existing
+    database with pending migrations upgrades only when the caller allows it,
+    after an online backup; otherwise it raises SchemaMigrationRequired, so a
+    stray process (another checkout, an old job, a test aimed at the wrong
+    root) cannot change a live schema just by connecting. A database carrying
+    migrations this code does not know raises SchemaAheadOfCode, and another
+    application's SQLite file is refused outright.
+
+    The decision, the backup and the upgrade all happen under one write lock:
+    concurrent upgraders serialise, and the second one finds nothing to do.
+    """
+    _begin_immediate_with_retry(connection)
+    try:
+        state = read_schema_state(connection, config)
+        check_schema_policy(state, config, allow_upgrade=allow_upgrade, allow_init=allow_init)
+        if not state.pending:
+            connection.rollback()
+            return SchemaPreparation(state_before=state, applied=(), backup_path=None)
+        backup_path = None
+        if not state.fresh:
+            backup_path = _backup_database(
+                config.db_path,
+                label=f"premigrate-v{state.current_version}-v{state.target_version}",
+            )
+        applied = _apply_pending_locked(connection, config)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
     return SchemaPreparation(state_before=state, applied=tuple(applied), backup_path=backup_path)
+
+
+def schema_target_version(config: ChronicleConfig) -> int:
+    """The newest migration this code ships for `config`."""
+    return max((item.version for item in _load_migration_files(config)), default=0)
 
 
 def table_count(connection: sqlite3.Connection, table_name: str) -> int:

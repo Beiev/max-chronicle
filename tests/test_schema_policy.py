@@ -2,7 +2,8 @@
 
 A process that merely opens a database (a job, a hook, another checkout, a
 test aimed at the wrong root) must not upgrade a live schema. Upgrades run
-through `chronicle migrate` or server start, after an online backup.
+through `chronicle migrate` or `chronicle-mcp --migrate`, after an online
+backup taken under the same write lock as the upgrade.
 """
 
 from __future__ import annotations
@@ -15,10 +16,12 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import threading
 
 import pytest
 
 from max_chronicle import cli
+import max_chronicle.db as db_module
 import max_chronicle.mcp_server as mcp_server_module
 from max_chronicle.config import MIGRATIONS_DIR, ChronicleConfigError, default_config, resolve_status_root
 from max_chronicle.db import (
@@ -42,16 +45,16 @@ def _config(db_path: Path, migrations_dir: Path = MIGRATIONS_DIR):
 def _migrations_up_to(tmp_path: Path, last_version: int) -> Path:
     """The migration set an older release shipped."""
     target = tmp_path / f"migrations-v{last_version}"
-    target.mkdir()
+    target.mkdir(exist_ok=True)
     for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
         if int(path.name[:4]) <= last_version:
             shutil.copy2(path, target / path.name)
     return target
 
 
-def _older_database(tmp_path: Path) -> Path:
+def _older_database(tmp_path: Path, db_path: Path | None = None) -> Path:
     """A database built by the previous release: every migration but the last."""
-    db_path = tmp_path / "chronicle.db"
+    db_path = db_path or tmp_path / "chronicle.db"
     with open_connection(_config(db_path, _migrations_up_to(tmp_path, LATEST_VERSION - 1))):
         pass
     reset_migration_cache()
@@ -67,10 +70,10 @@ def _backups(db_path: Path) -> list[Path]:
     return sorted(db_path.parent.glob(f"{db_path.name}.bak-*"))
 
 
-def _run_cli(monkeypatch, capsys, *argv: str) -> dict:
+def _run_cli(monkeypatch, capsys, *argv: str) -> tuple[int, dict]:
     monkeypatch.setattr(sys, "argv", ["chronicle", *argv])
-    assert cli.main() == 0
-    return json.loads(capsys.readouterr().out)
+    exit_code = cli.main()
+    return exit_code, json.loads(capsys.readouterr().out)
 
 
 def test_new_database_initialises_on_first_connect(tmp_path) -> None:
@@ -112,8 +115,9 @@ def test_auto_migrate_opt_in_upgrades_after_an_online_backup(tmp_path, monkeypat
 def test_migrate_command_upgrades_and_reports_the_backup(tmp_path, monkeypatch, capsys) -> None:
     db_path = _older_database(tmp_path)
 
-    payload = _run_cli(monkeypatch, capsys, "--db", str(db_path), "migrate")
+    exit_code, payload = _run_cli(monkeypatch, capsys, "--db", str(db_path), "migrate")
 
+    assert exit_code == 0
     assert [item["version"] for item in payload["applied"]] == [LATEST_VERSION]
     assert payload["backup_path"] == str(_backups(db_path)[0])
     assert _schema_version(Path(payload["backup_path"])) == LATEST_VERSION - 1
@@ -123,8 +127,9 @@ def test_migrate_command_upgrades_and_reports_the_backup(tmp_path, monkeypatch, 
 def test_status_reports_a_pending_schema_without_migrating(tmp_path, monkeypatch, capsys) -> None:
     db_path = _older_database(tmp_path)
 
-    payload = _run_cli(monkeypatch, capsys, "--db", str(db_path), "status")
+    exit_code, payload = _run_cli(monkeypatch, capsys, "--db", str(db_path), "status")
 
+    assert exit_code == cli.EXIT_SCHEMA_ACTION
     assert payload["schema"]["pending"] == [LATEST_VERSION]
     assert payload["schema"]["current_version"] == LATEST_VERSION - 1
     assert payload["summary"] is None
@@ -132,19 +137,76 @@ def test_status_reports_a_pending_schema_without_migrating(tmp_path, monkeypatch
     assert _schema_version(db_path) == LATEST_VERSION - 1
 
 
-def test_database_newer_than_this_code_is_refused(tmp_path) -> None:
-    db_path = tmp_path / "chronicle.db"
-    with open_connection(_config(db_path)):
-        pass
-    reset_migration_cache()
-    older_code = _config(db_path, _migrations_up_to(tmp_path, LATEST_VERSION - 1))
+def test_concurrent_upgraders_serialise_and_share_one_backup(tmp_path) -> None:
+    db_path = _older_database(tmp_path)
+    config = _config(db_path)
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    errors: list[BaseException] = []
 
-    with pytest.raises(SchemaAheadOfCode):
-        with open_connection(older_code):
-            pass
-    with pytest.raises(SchemaAheadOfCode):
-        prepare_database(older_code, allow_upgrade=True)
+    def upgrader() -> None:
+        connection = connect(db_path)
+        try:
+            barrier.wait()
+            results.append(ensure_schema(connection, config, allow_upgrade=True))
+        except BaseException as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=upgrader) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    applied = [[item.version for item in result.applied] for result in results]
+    assert sorted(applied) == [[], [LATEST_VERSION]]
+    [backup] = _backups(db_path)
+    assert _schema_version(backup) == LATEST_VERSION - 1
     assert _schema_version(db_path) == LATEST_VERSION
+
+
+def test_backup_names_never_collide(tmp_path) -> None:
+    db_path = _older_database(tmp_path)
+
+    first = db_module._backup_database(db_path, label="premigrate-v9-v10")
+    second = db_module._backup_database(db_path, label="premigrate-v9-v10")
+
+    assert first != second
+    assert _schema_version(first) == _schema_version(second) == LATEST_VERSION - 1
+
+
+def test_another_applications_sqlite_file_is_left_untouched(tmp_path) -> None:
+    db_path = tmp_path / "notes.db"
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE notes(body TEXT)")
+        connection.commit()
+    config = _config(db_path)
+
+    with closing(connect(db_path)) as connection:
+        with pytest.raises(MigrationError, match="not a Chronicle database"):
+            ensure_schema(connection, config, allow_upgrade=True)
+
+    with closing(sqlite3.connect(db_path)) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+    assert tables == {"notes"}
+    assert application_id == 0
+
+
+def test_a_swapped_older_file_is_caught_on_the_next_connection(tmp_path) -> None:
+    db_path = tmp_path / "chronicle.db"
+    config = _config(db_path)
+    with open_connection(config):
+        pass
+    older = _older_database(tmp_path, tmp_path / "older.db")
+    shutil.copy2(older, db_path)  # e.g. a restore, while this process keeps running
+
+    with pytest.raises(SchemaMigrationRequired):
+        with open_connection(config):
+            pass
 
 
 def test_duplicate_migration_numbers_are_rejected(tmp_path) -> None:
@@ -162,7 +224,22 @@ def test_duplicate_migration_numbers_are_rejected(tmp_path) -> None:
     assert "0001_second.sql" in str(excinfo.value)
 
 
-def test_server_start_upgrades_but_a_read_only_start_only_checks(tmp_path) -> None:
+def test_database_newer_than_this_code_is_refused(tmp_path) -> None:
+    db_path = tmp_path / "chronicle.db"
+    with open_connection(_config(db_path)):
+        pass
+    reset_migration_cache()
+    older_code = _config(db_path, _migrations_up_to(tmp_path, LATEST_VERSION - 1))
+
+    with pytest.raises(SchemaAheadOfCode):
+        with open_connection(older_code):
+            pass
+    with pytest.raises(SchemaAheadOfCode):
+        prepare_database(older_code, allow_upgrade=True)
+    assert _schema_version(db_path) == LATEST_VERSION
+
+
+def test_server_start_upgrades_only_when_asked(tmp_path) -> None:
     db_path = _older_database(tmp_path)
     config = _config(db_path)
 
@@ -176,6 +253,39 @@ def test_server_start_upgrades_but_a_read_only_start_only_checks(tmp_path) -> No
     assert _schema_version(db_path) == LATEST_VERSION
 
 
+def test_read_only_start_never_creates_or_changes_a_database(tmp_path) -> None:
+    missing = _config(tmp_path / "missing.db")
+    with pytest.raises(SchemaMigrationRequired, match="never creates"):
+        prepare_database(missing, allow_upgrade=True, read_only=True)
+    assert not missing.db_path.exists()
+
+    db_path = _older_database(tmp_path)
+    with pytest.raises(SchemaMigrationRequired):
+        prepare_database(_config(db_path), allow_upgrade=True, read_only=True)
+    assert _schema_version(db_path) == LATEST_VERSION - 1
+    assert _backups(db_path) == []
+
+
+def _outdated_sandbox_database(chronicle_sandbox, tmp_path) -> Path:
+    config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{config.db_path}{suffix}").unlink(missing_ok=True)
+    return _older_database(tmp_path, config.db_path)
+
+
+def test_server_without_migrate_refuses_an_outdated_schema(chronicle_sandbox, tmp_path, monkeypatch, caplog) -> None:
+    db_path = _outdated_sandbox_database(chronicle_sandbox, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path)])
+
+    with caplog.at_level(logging.ERROR, logger="max_chronicle.mcp"):
+        exit_code = mcp_server_module._main()
+
+    assert exit_code == 1
+    assert "SchemaMigrationRequired" in caplog.text
+    assert "--migrate" in caplog.text
+    assert _schema_version(db_path) == LATEST_VERSION - 1
+
+
 def test_server_refuses_to_start_against_a_newer_schema(chronicle_sandbox, monkeypatch, caplog) -> None:
     config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
     with open_connection(config) as connection:
@@ -184,7 +294,9 @@ def test_server_refuses_to_start_against_a_newer_schema(chronicle_sandbox, monke
         )
         connection.commit()
     reset_migration_cache()
-    monkeypatch.setattr(sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path)])
+    monkeypatch.setattr(
+        sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path), "--migrate"]
+    )
 
     with caplog.at_level(logging.ERROR, logger="max_chronicle.mcp"):
         exit_code = mcp_server_module._main()
@@ -201,6 +313,32 @@ def test_require_root_refuses_the_implicit_fallback(tmp_path, monkeypatch) -> No
     assert resolve_status_root(manifest_path=tmp_path / "SSOT_MANIFEST.toml") == tmp_path
     monkeypatch.setenv("CHRONICLE_ROOT", str(tmp_path))
     assert resolve_status_root() == tmp_path
+
+
+def test_require_root_keeps_help_and_explicit_flags_working(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CHRONICLE_REQUIRE_ROOT", "1")
+
+    for argv, main in ((["chronicle", "--help"], cli.main), (["chronicle-mcp", "--help"], mcp_server_module._main)):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 0
+    capsys.readouterr()
+
+    exit_code, payload = _run_cli(
+        monkeypatch,
+        capsys,
+        "--db",
+        str(tmp_path / "chronicle.db"),
+        "--manifest",
+        str(tmp_path / "SSOT_MANIFEST.toml"),
+        "status",
+    )
+    assert exit_code == 0 and payload["exists"] is False
+
+    exit_code, payload = _run_cli(monkeypatch, capsys, "status")
+    assert exit_code == cli.EXIT_CONFIG_ERROR
+    assert payload["error_type"] == "ChronicleConfigError"
 
 
 def test_the_test_run_cannot_reach_a_real_workspace(tmp_path_factory) -> None:

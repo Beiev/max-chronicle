@@ -342,6 +342,7 @@ def _gitignore_template() -> str:
     return """chronicle.db
 chronicle.db-shm
 chronicle.db-wal
+chronicle.db.bak-*
 chronicle-artifacts/
 chronicle-snapshots.jsonl
 ssot-ledger.jsonl

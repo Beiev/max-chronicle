@@ -25,22 +25,39 @@ from .config import (
     ensure_runtime_dirs,
     feature_enabled,
 )
-from .db import SchemaPreparation, connect, ensure_schema, utc_now
+from .db import (
+    SchemaMigrationRequired,
+    SchemaPreparation,
+    check_schema_policy,
+    connect,
+    ensure_schema,
+    read_schema_state,
+    schema_target_version,
+    utc_now,
+)
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
 DEFAULT_STALE_RUN_TTL_HOURS = 6
 STALE_RUN_STATUS = "stale_failed"
 
-# Per-process memo of DB paths whose migrations were already applied in this
-# interpreter. The schema check is idempotent but runs a table scan + glob on
-# every call; skipping it on subsequent connects reclaims most of the overhead
-# that the long-lived MCP daemon pays on each tool invocation.
-_MIGRATIONS_APPLIED: set[Path] = set()
+# Per-process cache of each migrations directory's target version. Every
+# connection still confirms its database is current with one PRAGMA, so a
+# file swapped underneath a long-lived process (a restore, another checkout)
+# is caught on its next connection instead of being trusted from memory.
+_TARGET_VERSIONS: dict[Path, int] = {}
 
 
 def reset_migration_cache() -> None:
-    _MIGRATIONS_APPLIED.clear()
+    _TARGET_VERSIONS.clear()
+
+
+def target_schema_version(config: ChronicleConfig) -> int:
+    target = _TARGET_VERSIONS.get(config.migrations_dir)
+    if target is None:
+        target = schema_target_version(config)
+        _TARGET_VERSIONS[config.migrations_dir] = target
+    return target
 
 
 def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
@@ -111,7 +128,8 @@ def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
     ensure_runtime_dirs(config)
     connection = connect(config.db_path)
     try:
-        if config.db_path not in _MIGRATIONS_APPLIED:
+        current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if current != target_schema_version(config):
             # A new database initialises here; an existing one that is behind
             # this code raises unless CHRONICLE_AUTO_MIGRATE opts back in.
             ensure_schema(
@@ -119,26 +137,42 @@ def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
                 config,
                 allow_upgrade=feature_enabled(ENV_CHRONICLE_AUTO_MIGRATE, default=False),
             )
-            _MIGRATIONS_APPLIED.add(config.db_path)
         yield connection
     finally:
         connection.close()
 
 
-def prepare_database(config: ChronicleConfig, *, allow_upgrade: bool) -> SchemaPreparation:
-    """Initialise or upgrade the schema once, up front (server start).
+def prepare_database(
+    config: ChronicleConfig,
+    *,
+    allow_upgrade: bool,
+    read_only: bool = False,
+) -> SchemaPreparation:
+    """Check, initialise or upgrade the schema up front (server start).
 
-    Upgrading an existing database takes an online backup first. Afterwards
-    this process's connections skip the check entirely.
+    Upgrading an existing database takes an online backup first. A read-only
+    caller never creates or changes a database: a missing, empty or outdated
+    one is an error it reports instead of quietly serving an empty store.
     """
+    if read_only:
+        if not config.db_path.exists():
+            raise SchemaMigrationRequired(
+                f"No database at {config.db_path}; a read-only server never creates one. "
+                "Run `chronicle migrate` first."
+            )
+        connection = connect(config.db_path)
+        try:
+            state = read_schema_state(connection, config)
+        finally:
+            connection.close()
+        check_schema_policy(state, config, allow_upgrade=False, allow_init=False)
+        return SchemaPreparation(state_before=state, applied=(), backup_path=None)
     ensure_runtime_dirs(config)
     connection = connect(config.db_path)
     try:
-        prepared = ensure_schema(connection, config, allow_upgrade=allow_upgrade)
+        return ensure_schema(connection, config, allow_upgrade=allow_upgrade)
     finally:
         connection.close()
-    _MIGRATIONS_APPLIED.add(config.db_path)
-    return prepared
 
 
 @contextmanager

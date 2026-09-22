@@ -56,6 +56,7 @@ from .store import (
     fetch_recent_events,
     open_connection,
     prepare_database,
+    target_schema_version,
 )
 from .memory import Checkpoint, FactInput
 
@@ -445,6 +446,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                 "db_path": str(config.db_path),
                 "manifest_path": str(resolved_manifest_path),
                 "schema_version": schema_version,
+                "target_schema_version": target_schema_version(config),
             }
 
         db_ok = False
@@ -986,7 +988,17 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve Max Chronicle over MCP.")
-    parser.add_argument("--manifest", type=Path, default=default_manifest_path(), help="Path to SSOT_MANIFEST.toml")
+    # Resolved in _main: computing it here made `--help` fail whenever the
+    # default workspace could not be resolved (CHRONICLE_REQUIRE_ROOT).
+    parser.add_argument("--manifest", type=Path, default=None, help="Path to SSOT_MANIFEST.toml (default: the workspace's)")
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help=(
+            "Upgrade a database that is behind this code at start, after an online backup. "
+            "Without it the server refuses to start on an outdated schema."
+        ),
+    )
     parser.add_argument(
         "--profile",
         choices=sorted(MCP_PROFILES),
@@ -1011,7 +1023,28 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
-    server = build_server(args.manifest, profile=args.profile)
+    # Prepare the schema before serving. Only a launcher that passes --migrate
+    # upgrades an outdated database (after an online backup): a stdio server
+    # started by some client from some checkout must not. A read-only server
+    # only checks. Serving against a wrong schema would fail every call, so
+    # refuse to start and say why.
+    read_only = args.profile == READ_ONLY_PROFILE
+    try:
+        manifest_path = args.manifest or default_manifest_path()
+        config = config_from_manifest(load_manifest(manifest_path))
+        prepared = prepare_database(config, allow_upgrade=args.migrate and not read_only, read_only=read_only)
+    except (ChronicleConfigError, MigrationError, sqlite3.Error, OSError, ValueError) as exc:
+        _LOGGER.error("chronicle-mcp cannot start: %s: %s", type(exc).__name__, exc)
+        return 1
+    if prepared.applied:
+        _LOGGER.warning(
+            "chronicle-mcp migrated %s from v%d to v%d; backup=%s",
+            config.db_path,
+            prepared.state_before.current_version,
+            max(item.version for item in prepared.applied),
+            prepared.backup_path,
+        )
+    server = build_server(manifest_path, profile=args.profile)
     endpoint = args.transport
     if args.transport in ("sse", "streamable-http"):
         host = os.environ.get("MCP_HOST", "127.0.0.1")
@@ -1033,24 +1066,6 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         server.settings.port = port
         server.settings.transport_security = TransportSecuritySettings(allowed_hosts=allowed_hosts)
         endpoint = f"{args.transport} {host}:{port}"
-    # Prepare the schema before serving. A chronicler server upgrades a database
-    # that is behind this code (after an online backup), which is how a deploy
-    # lands; a read-only server only checks. Serving against a wrong schema
-    # would fail every call anyway, so refuse to start and say why.
-    try:
-        config = config_from_manifest(load_manifest(args.manifest))
-        prepared = prepare_database(config, allow_upgrade=args.profile != READ_ONLY_PROFILE)
-    except (ChronicleConfigError, MigrationError, sqlite3.Error, OSError, ValueError) as exc:
-        _LOGGER.error("chronicle-mcp cannot start: %s: %s", type(exc).__name__, exc)
-        return 1
-    if prepared.applied:
-        _LOGGER.warning(
-            "chronicle-mcp migrated %s from v%d to v%d; backup=%s",
-            config.db_path,
-            prepared.state_before.current_version,
-            max(item.version for item in prepared.applied),
-            prepared.backup_path,
-        )
     # Startup banner: with no banner and WARNING-level logs, restarts were
     # invisible — an empty err.log looked like health when it proved nothing.
     _LOGGER.info(
@@ -1060,7 +1075,7 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         args.profile,
         endpoint,
         config.db_path,
-        args.manifest,
+        manifest_path,
         Path(__file__).resolve().parent,
     )
     server.run(transport=args.transport)
