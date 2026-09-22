@@ -158,6 +158,24 @@ can separately report `side_effect_errors` for failed evidence/projection output
   incomplete inventory coverage. Choose a separate backup device for disk failure.
   Explicitly purged artifacts are counted separately; they are not claimed as restorable.
 
+### Measuring recall
+
+`chronicle eval --golden questions.jsonl` asks each question through recall and
+scores the ranking: hit@1/5/10, recall@5 and MRR@10 on answerable questions,
+abstention on questions memory cannot answer, stale-over-current ordering on
+knowledge updates, and latency percentiles, overall and per category and language.
+
+```json
+{"id": "why-sqlite", "query": "why did we pick SQLite", "category": "rationale", "lang": "en", "expected": ["event:<id>"], "scope": {"project": "demo"}}
+{"id": "db-now", "query": "current database", "category": "knowledge_update", "expected": ["event:<new>"], "stale": ["event:<old>"]}
+{"id": "unknown", "query": "office wifi password", "category": "abstention", "expected": []}
+```
+
+Categories follow LongMemEval: `fact`, `rationale`, `knowledge_update`, `temporal`,
+`handoff`, `abstention`. `--json` prints the full report, `--out` saves it, and
+`--fail-under hit@5=0.6` exits 1 below a floor. The test suite runs a synthetic
+bilingual set (`tests/fixtures/eval/`) and pins which cases lexical recall passes.
+
 ## CLI
 
 ```bash
@@ -167,6 +185,7 @@ chronicle record "Ready for review" --project demo --task-id ship \
   --checkpoint-file checkpoint.json --request-id handoff-1
 chronicle startup --project demo --task-id ship --focus "Continue review" --format json
 chronicle query-memory "local storage" --project demo --task-id ship --format json
+chronicle eval --golden questions.jsonl --out results/baseline.json
 chronicle timeline --at "2026-09-15T12:00:00Z"
 chronicle backup --force
 ```

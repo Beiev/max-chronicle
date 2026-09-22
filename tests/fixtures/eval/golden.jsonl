@@ -1,0 +1,30 @@
+{"id": "fact-en-keywords", "query": "SQLite local store", "category": "fact", "lang": "en", "expected": ["event:E01"], "scope": {"project": "atlas"}}
+{"id": "fact-en-question", "query": "which database did we choose for the local store?", "category": "fact", "lang": "en", "expected": ["event:E01"], "scope": {"project": "atlas"}}
+{"id": "fact-ru-keywords", "query": "FastAPI Flask", "category": "fact", "lang": "ru", "expected": ["event:E02"]}
+{"id": "fact-ru-question", "query": "какой фреймворк выбрали для внутреннего API", "category": "fact", "lang": "ru", "expected": ["event:E02"]}
+{"id": "fact-ru-yo", "query": "отчёт за июль", "category": "fact", "lang": "ru", "expected": ["event:E05"]}
+{"id": "fact-ru-yo-as-e", "query": "отчет июль", "category": "fact", "lang": "ru", "expected": ["event:E05"]}
+{"id": "fact-ru-yo-other-word", "query": "ещё проверили бэкапы", "category": "fact", "lang": "ru", "expected": ["event:E24"]}
+{"id": "fact-uk-keywords", "query": "звіт тестування відео", "category": "fact", "lang": "uk", "expected": ["event:E06"]}
+{"id": "fact-en-backups-question", "query": "where do the nightly backups go", "category": "fact", "lang": "en", "expected": ["event:E12"]}
+{"id": "fact-ru-query-en-evidence", "query": "куда перенесли ночные бэкапы", "category": "fact", "lang": "ru>en", "expected": ["event:E12"]}
+{"id": "rationale-ru-keywords", "query": "Linear Jira дорожает", "category": "rationale", "lang": "ru", "expected": ["event:E19"]}
+{"id": "rationale-ru-question", "query": "почему перешли на Linear", "category": "rationale", "lang": "ru", "expected": ["event:E19"]}
+{"id": "rationale-en-question", "query": "why did we drop PixelForge-2", "category": "rationale", "lang": "en", "expected": ["event:E04"], "scope": {"project": "atlas"}}
+{"id": "rationale-en-query-ru-evidence", "query": "why did we give up on Kubernetes", "category": "rationale", "lang": "en>ru", "expected": ["event:E07"]}
+{"id": "rationale-uk-question", "query": "чому не публікуємо демо", "category": "rationale", "lang": "uk", "expected": ["event:E23"]}
+{"id": "rationale-en-steps", "query": "load test 10 runs", "category": "rationale", "lang": "en>ru", "expected": ["event:E11"]}
+{"id": "update-en-image-model", "query": "default image model", "category": "knowledge_update", "lang": "en", "expected": ["event:E04"], "stale": ["event:E03"], "scope": {"project": "atlas"}}
+{"id": "update-en-deploy-fact", "query": "deploy target", "category": "knowledge_update", "lang": "en", "expected": ["event:E16"], "stale": ["event:E15"], "scope": {"project": "atlas"}}
+{"id": "update-ru-image-model", "query": "какая модель изображений сейчас по умолчанию", "category": "knowledge_update", "lang": "ru>en", "expected": ["event:E04"], "stale": ["event:E03"], "scope": {"project": "atlas"}}
+{"id": "temporal-en-september-release", "query": "what did we release in September", "category": "temporal", "lang": "en", "expected": ["event:E21"]}
+{"id": "temporal-ru-august-decision", "query": "что решили в августе про Kubernetes", "category": "temporal", "lang": "ru", "expected": ["event:E07"]}
+{"id": "temporal-en-latest-audit", "query": "latest change to the weekly audit schedule", "category": "temporal", "lang": "en", "expected": ["event:E17"]}
+{"id": "handoff-en-keywords", "query": "daybook backfill", "category": "handoff", "lang": "en", "expected": ["event:E10"], "scope": {"project": "atlas", "task_id": "importer"}}
+{"id": "handoff-en-question", "query": "what are the next steps for the importer", "category": "handoff", "lang": "en", "expected": ["event:E10"], "scope": {"project": "atlas", "task_id": "importer"}}
+{"id": "handoff-ru-question", "query": "что осталось сделать по импортёру", "category": "handoff", "lang": "ru>en", "expected": ["event:E10"], "scope": {"project": "atlas", "task_id": "importer"}}
+{"id": "abstain-en-unrelated", "query": "what is the office wifi password", "category": "abstention", "lang": "en", "expected": []}
+{"id": "abstain-ru-unrelated", "query": "какой бюджет на рекламу в октябре", "category": "abstention", "lang": "ru", "expected": []}
+{"id": "abstain-en-near-miss", "query": "default video model", "category": "abstention", "lang": "en", "expected": [], "scope": {"project": "atlas"}}
+{"id": "abstain-ru-near-miss", "query": "почему отказались от Docker", "category": "abstention", "lang": "ru", "expected": []}
+{"id": "abstain-scope", "query": "Postgres analytics warehouse", "category": "abstention", "lang": "en", "expected": [], "scope": {"project": "atlas"}}
