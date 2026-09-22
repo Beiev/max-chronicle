@@ -1770,8 +1770,10 @@ def fetch_events_between(
     domain: str | None = None,
     limit: int = 500,
     visibility: str = "default",
+    exclude_source_kinds: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     resolved_visibility = _normalize_event_visibility(visibility)
+    excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
     with open_connection(config) as connection:
         rows = connection.execute(
             """
@@ -1797,13 +1799,56 @@ def fetch_events_between(
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?
-              AND """ + _event_domain_where_clause("e") + """
+              AND """ + _event_domain_where_clause("e") + excluded_sql + """
             ORDER BY e.occurred_at_utc ASC
             LIMIT ?
             """,
-            (resolved_visibility, start_utc, end_utc, domain, domain, domain, limit),
+            (resolved_visibility, start_utc, end_utc, domain, domain, domain, *excluded_params, limit),
         ).fetchall()
     return [_event_row_to_entry(row) for row in rows]
+
+
+def _source_kind_exclusion(source_kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    if not source_kinds:
+        return "", ()
+    placeholders = ", ".join("?" for _ in source_kinds)
+    return f"\n              AND COALESCE(e.source_kind, '') NOT IN ({placeholders})", tuple(source_kinds)
+
+
+def fingerprint_events_between(
+    config: ChronicleConfig,
+    *,
+    start_utc: str,
+    end_utc: str,
+    exclude_source_kinds: tuple[str, ...] = (),
+) -> tuple[int, str]:
+    """Count and sha256 of every visible event in a window, with no row limit.
+
+    A change signal that also moves when an event is edited, hidden or swapped
+    for another while the count stays the same.
+    """
+    excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
+    digest = hashlib.sha256()
+    count = 0
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            """
+            SELECT e.id, e.category, e.text, e.why
+            FROM events AS e
+            WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
+              AND e.occurred_at_utc >= ?
+              AND e.occurred_at_utc <= ?""" + excluded_sql + """
+            ORDER BY e.occurred_at_utc ASC, e.id ASC
+            """,
+            (start_utc, end_utc, *excluded_params),
+        )
+        for row in rows:
+            count += 1
+            for value in (row["id"], row["category"], row["text"], row["why"]):
+                digest.update((value or "").encode("utf-8"))
+                digest.update(b"\x1f")
+            digest.update(b"\x1e")
+    return count, digest.hexdigest()
 
 
 def start_ingest_run(
@@ -2728,7 +2773,9 @@ def start_curation_run(
     run_id = str(uuid.uuid4())
     started_at = utc_now()
     started_dt = _parse_iso(started_at)
-    with open_connection(config) as connection, connection:
+    # Read-then-write under the write lock: two claimers of one key serialise,
+    # and the second sees the first's running row instead of racing its INSERT.
+    with write_transaction(config) as connection:
         existing = connection.execute(
             """
             SELECT id, status, run_key, started_at_utc, payload_json
