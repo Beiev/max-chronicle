@@ -281,6 +281,16 @@ def _retire_stale_curation_run(
     )
 
 
+def _supersede_curation_run(connection: sqlite3.Connection, row: sqlite3.Row, *, marked_at_utc: str) -> None:
+    """Keep a finished run as history and free its run_key for a regeneration."""
+    payload = _load_json(row["payload_json"])
+    payload["superseded"] = {"at_utc": marked_at_utc, "original_run_key": row["run_key"]}
+    connection.execute(
+        "UPDATE curation_runs SET run_key = ?, payload_json = ? WHERE id = ?",
+        (f"{row['run_key']}:superseded:{row['id']}", _json(payload), row["id"]),
+    )
+
+
 def to_local_iso(timestamp: str, timezone_name: str) -> str:
     local_tz = ZoneInfo(timezone_name)
     return _parse_iso(timestamp).astimezone(local_tz).isoformat(timespec="seconds")
@@ -2707,7 +2717,14 @@ def start_curation_run(
     prompt_sha256: str | None = None,
     payload: dict[str, Any] | None = None,
     stale_ttl_hours: float | int = DEFAULT_STALE_RUN_TTL_HOURS,
+    supersede_finished: bool = False,
 ) -> tuple[str, bool]:
+    """Claim the (curation_type, run_key) lease for a new run.
+
+    A finished run normally keeps the key, so a repeat is a no-op. With
+    supersede_finished the finished row stays as history under a moved key
+    and a new run starts; a live running row still blocks.
+    """
     run_id = str(uuid.uuid4())
     started_at = utc_now()
     started_dt = _parse_iso(started_at)
@@ -2743,6 +2760,8 @@ def start_curation_run(
                     reason="stale_failed row retired before new run",
                     move_run_key=True,
                 )
+            elif supersede_finished:
+                _supersede_curation_run(connection, existing, marked_at_utc=started_at)
             else:
                 return existing["id"], False
         connection.execute(

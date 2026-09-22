@@ -77,6 +77,11 @@ MEM0_OUTBOX_PRUNE_AFTER_DAYS = 30
 MEM0_OUTBOX_PRUNE_BATCH = 5000
 WAL_CHECKPOINT_THRESHOLD_BYTES = 64 * 1024 * 1024
 DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
+# A daybook run also completes recent days whose daybook is missing or older
+# than their events, so a run delayed past midnight cannot lose a day.
+DAYBOOK_CATCHUP_DAYS = 3
+# The daybook's own summary events: never evidence of a day's activity.
+DAYBOOK_EVENT_CATEGORY = "daily_summary"
 DEFAULT_BACKUP_SPACE_MARGIN_BYTES = 512 * 1024 * 1024
 
 
@@ -976,16 +981,85 @@ def run_git_commit_hook(
     return {"status": "stored", "event_id": stored["id"], "hook_event": hook_row}
 
 
+def _daybook_unchanged(config, *, local_date: str, event_count: int) -> dict[str, Any] | None:
+    """Return the existing daybook run when regenerating it would change nothing."""
+    existing = fetch_curation_run(config, curation_type="daybook", run_key=local_date)
+    if existing is None:
+        return None
+    status = existing.get("status")
+    if status in {"ok", "failed_soft"} and existing["payload"].get("event_count") == event_count:
+        return existing
+    if status == "skipped" and event_count == 0:
+        return existing
+    return None
+
+
+def run_daybook_catchup(
+    manifest: dict[str, Any],
+    automation: AutomationConfig,
+    *,
+    trigger_source: str = "manual",
+    now: datetime | None = None,
+    lookback_days: int = DAYBOOK_CATCHUP_DAYS,
+) -> dict[str, Any]:
+    """Write today's daybook and repair recent completed days.
+
+    A run delayed past midnight (sleep, a late catch-up) used to summarise the
+    new, empty day and never the one that just ended. Here each of the last
+    `lookback_days` days, oldest first, gets a daybook if it has none or its
+    events changed since, then today does.
+    """
+    config = config_from_manifest(manifest)
+    today = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(config.timezone)).date()
+    days = [(today - timedelta(days=offset)).isoformat() for offset in range(lookback_days, -1, -1)]
+    results = {
+        day: run_daybook(manifest, automation, target_date=day, trigger_source=trigger_source, regenerate=True)
+        for day in days
+    }
+    statuses = {result["status"] for result in results.values()}
+    if "failed" in statuses:
+        status = "failed"
+    elif "failed_soft" in statuses:
+        status = "failed_soft"
+    elif "ok" in statuses:
+        status = "ok"
+    else:
+        status = "skipped"
+    written = [result["event_id"] for result in results.values() if result.get("event_id")]
+    return {"status": status, "days": results, "event_id": written[-1] if written else None}
+
+
 def run_daybook(
     manifest: dict[str, Any],
     automation: AutomationConfig,
     *,
     target_date: str | None = None,
     trigger_source: str = "manual",
+    regenerate: bool = False,
 ) -> dict[str, Any]:
+    """Write the daybook for one local day.
+
+    With regenerate, an existing daybook is rewritten when the day's events
+    changed since it was generated, and a skipped or failed attempt is
+    retried; an unchanged day stays a no-op ("existing").
+    """
     config = config_from_manifest(manifest)
     start_dt, end_dt = _local_day_bounds(config, target_date)
     local_date = start_dt.astimezone(ZoneInfo(config.timezone)).strftime("%Y-%m-%d")
+    events = [
+        event
+        for event in fetch_events_between(
+            config,
+            start_utc=start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            end_utc=end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            limit=1000,
+        )
+        if event.get("category") != DAYBOOK_EVENT_CATEGORY
+    ]
+    if regenerate:
+        unchanged = _daybook_unchanged(config, local_date=local_date, event_count=len(events))
+        if unchanged is not None:
+            return {"status": "existing", "run": unchanged, "reason": "unchanged"}
     run_id, created = start_curation_run(
         config,
         curation_type="daybook",
@@ -994,6 +1068,7 @@ def run_daybook(
         prompt_sha256=None,
         payload={"trigger_source": trigger_source},
         stale_ttl_hours=_stale_run_ttl_hours(automation),
+        supersede_finished=regenerate,
     )
     if not created:
         existing = fetch_curation_run(config, curation_type="daybook", run_key=local_date)
@@ -1001,12 +1076,6 @@ def run_daybook(
 
     failure_details: dict[str, Any] | None = None
     try:
-        events = fetch_events_between(
-            config,
-            start_utc=start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end_utc=end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            limit=1000,
-        )
         latest_backup = fetch_latest_backup_run(config, successful_only=True)
         latest_audit = fetch_latest_curation_run(config, curation_type="weekly_audit")
         snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
@@ -2376,17 +2445,20 @@ def run_automation_job(
 
     if job_name == "daybook":
         def _daybook(run_id: str) -> dict[str, Any]:
-            result = run_daybook(manifest, automation, trigger_source=trigger_source)
+            result = run_daybook_catchup(manifest, automation, trigger_source=trigger_source, now=local_now)
             finish_automation_run(
                 config,
                 run_id=run_id,
-                status=result["status"] if result["status"] != "existing" else "ok",
+                status=result["status"],
                 details=result,
                 event_id=result.get("event_id"),
             )
             return result | {"run_id": run_id}
 
-        return _dispatch(daily_key, _daybook)
+        # One row per invocation, not per day: a run after midnight used to
+        # claim the new day's key and turn that evening's scheduled run into a
+        # no-op. Which days need a daybook is decided per day, from events.
+        return _dispatch(f"{daily_key}T{local_now:%H%M%S}", _daybook)
 
     if job_name == "mem0-dump":
         def _mem0_dump(run_id: str) -> dict[str, Any]:
