@@ -26,7 +26,8 @@ from starlette.responses import JSONResponse
 
 from . import __version__
 
-from .config import default_manifest_path
+from .config import ChronicleConfigError, default_manifest_path
+from .db import MigrationError
 from .runtime_context import load_manifest, load_manifest_cached, parse_when
 from .service import (
     DEFAULT_QUERY_MODE,
@@ -54,6 +55,7 @@ from .store import (
     fetch_latest_snapshot,
     fetch_recent_events,
     open_connection,
+    prepare_database,
 )
 from .memory import Checkpoint, FactInput
 
@@ -434,17 +436,24 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         # Lives on the Starlette app, outside the MCP session machinery: it
         # answers even when sessions are wedged, and hangs together with the
         # event loop — exactly the signal the external watchdog polls for.
-        def _db_check() -> bool:
+        def _db_check() -> dict[str, Any]:
             config = config_from_manifest(manifest())
             with open_connection(config) as connection:
                 connection.execute("SELECT 1").fetchone()
-            return True
+                schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            return {
+                "db_path": str(config.db_path),
+                "manifest_path": str(resolved_manifest_path),
+                "schema_version": schema_version,
+            }
 
         db_ok = False
+        details: dict[str, Any] = {}
         error: str | None = None
         try:
             with anyio.fail_after(2.0):
-                db_ok = bool(await anyio.to_thread.run_sync(_db_check, abandon_on_cancel=True))
+                details = await anyio.to_thread.run_sync(_db_check, abandon_on_cancel=True)
+            db_ok = True
         except Exception as exc:  # noqa: BLE001 — health must always answer
             error = f"{type(exc).__name__}: {exc}"
         payload: dict[str, Any] = {
@@ -454,6 +463,10 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "version": __version__,
             "pid": os.getpid(),
             "profile": profile,
+            # Where the running code was imported from: a stale checkout on
+            # sys.path shadowing the installed release shows up here.
+            "module_path": str(Path(__file__).resolve().parent),
+            **details,
         }
         if error:
             payload["error"] = error
@@ -1020,20 +1033,35 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         server.settings.port = port
         server.settings.transport_security = TransportSecuritySettings(allowed_hosts=allowed_hosts)
         endpoint = f"{args.transport} {host}:{port}"
+    # Prepare the schema before serving. A chronicler server upgrades a database
+    # that is behind this code (after an online backup), which is how a deploy
+    # lands; a read-only server only checks. Serving against a wrong schema
+    # would fail every call anyway, so refuse to start and say why.
     try:
-        db_path = str(config_from_manifest(load_manifest(args.manifest)).db_path)
-    except Exception as exc:  # noqa: BLE001 — the banner must never block startup
-        db_path = f"<unresolved: {exc}>"
+        config = config_from_manifest(load_manifest(args.manifest))
+        prepared = prepare_database(config, allow_upgrade=args.profile != READ_ONLY_PROFILE)
+    except (ChronicleConfigError, MigrationError, sqlite3.Error, OSError, ValueError) as exc:
+        _LOGGER.error("chronicle-mcp cannot start: %s: %s", type(exc).__name__, exc)
+        return 1
+    if prepared.applied:
+        _LOGGER.warning(
+            "chronicle-mcp migrated %s from v%d to v%d; backup=%s",
+            config.db_path,
+            prepared.state_before.current_version,
+            max(item.version for item in prepared.applied),
+            prepared.backup_path,
+        )
     # Startup banner: with no banner and WARNING-level logs, restarts were
     # invisible — an empty err.log looked like health when it proved nothing.
     _LOGGER.info(
-        "chronicle-mcp starting: version=%s pid=%d profile=%s transport=%s db=%s manifest=%s",
+        "chronicle-mcp starting: version=%s pid=%d profile=%s transport=%s db=%s manifest=%s module=%s",
         __version__,
         os.getpid(),
         args.profile,
         endpoint,
-        db_path,
+        config.db_path,
         args.manifest,
+        Path(__file__).resolve().parent,
     )
     server.run(transport=args.transport)
     return 0

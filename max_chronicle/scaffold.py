@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import default_config
-from .db import apply_migrations, connect
+from .db import connect, ensure_schema
 
 
 def _detect_timezone() -> str:
@@ -467,8 +467,15 @@ def scaffold_workspace(
         automation_path=resolved_root / "CHRONICLE_AUTOMATION.toml",
         status_root=resolved_root,
     )
-    with connect(config.db_path) as connection:
-        apply_migrations(connection, config)
+    # `init` is an explicit command, so it may upgrade an existing workspace's
+    # schema (after a backup). sqlite3's own context manager only commits, so
+    # close the connection explicitly.
+    connection = connect(config.db_path)
+    try:
+        with connection:
+            ensure_schema(connection, config, allow_upgrade=True)
+    finally:
+        connection.close()
 
     return {
         "status": "ok",

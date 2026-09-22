@@ -119,8 +119,9 @@ MCP configuration uses an absolute installed command and workspace path:
 Use your client's equivalent configuration format. Stdio starts with the client
 and does not require a separately running HTTP service. For supervised HTTP, use
 `chronicle-mcp --transport streamable-http`; `MCP_HOST`/`MCP_PORT` set its address.
-`GET /health` checks service and database availability; `sources_audit` and startup
-source health describe freshness. These are different checks.
+`GET /health` checks service and database availability and names the database,
+manifest, schema version and installed code path that answered; `sources_audit` and
+startup source health describe freshness. These are different checks.
 
 | Tool | Purpose |
 | --- | --- |
@@ -153,6 +154,13 @@ can separately report `side_effect_errors` for failed evidence/projection output
   on your own corpus; cosine and reciprocal-rank scores are not confidence values.
 - **Writes:** SQLite WAL with full commit synchronization; events, observations,
   facts, and evidence links commit together.
+- **Schema changes:** a new database initialises on first use. An existing one is
+  never upgraded as a side effect of connecting: run `chronicle migrate` (it takes an
+  online backup first) or restart the chronicler MCP server, which migrates on start;
+  a read-only server only checks. A database newer than the installed code is refused.
+  `CHRONICLE_AUTO_MIGRATE=1` restores upgrade-on-connect. `CHRONICLE_REQUIRE_ROOT=1`
+  makes a launcher without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` fail instead of
+  falling back to `~/.max-chronicle`.
 - **Backups:** independent artifact copies, content-hash inventory, database
   integrity checks, and verification after relocation. Legacy backups disclose
   incomplete inventory coverage. Choose a separate backup device for disk failure.

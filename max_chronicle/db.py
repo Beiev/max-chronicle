@@ -19,11 +19,61 @@ MIGRATION_LOCK_RETRY_BASE_SECONDS = 0.05
 CONNECT_WAL_RETRIES = 8
 
 
+class MigrationError(RuntimeError):
+    """The migration files or the database schema are inconsistent."""
+
+
+class SchemaMigrationRequired(MigrationError):
+    """An existing database is behind this code and may not upgrade here."""
+
+
+class SchemaAheadOfCode(MigrationError):
+    """The database carries migrations that this code does not know."""
+
+
 @dataclass(frozen=True)
 class MigrationFile:
     version: int
     name: str
     path: Path
+
+
+@dataclass(frozen=True)
+class SchemaState:
+    """Applied migrations of a database against the migration files on disk."""
+
+    applied: frozenset[int]
+    known: tuple[MigrationFile, ...]
+
+    @property
+    def fresh(self) -> bool:
+        return not self.applied
+
+    @property
+    def pending(self) -> tuple[MigrationFile, ...]:
+        return tuple(item for item in self.known if item.version not in self.applied)
+
+    @property
+    def unknown(self) -> tuple[int, ...]:
+        known_versions = {item.version for item in self.known}
+        return tuple(sorted(version for version in self.applied if version not in known_versions))
+
+    @property
+    def current_version(self) -> int:
+        return max(self.applied, default=0)
+
+    @property
+    def target_version(self) -> int:
+        return max((item.version for item in self.known), default=0)
+
+
+@dataclass(frozen=True)
+class SchemaPreparation:
+    """Receipt of ensure_schema: what ran, and where the pre-upgrade copy is."""
+
+    state_before: SchemaState
+    applied: tuple[MigrationFile, ...]
+    backup_path: Path | None
 
 
 def utc_now() -> str:
@@ -80,13 +130,22 @@ def ensure_migration_table(connection: sqlite3.Connection) -> None:
 
 def _load_migration_files(config: ChronicleConfig) -> list[MigrationFile]:
     migrations: list[MigrationFile] = []
+    seen: dict[int, Path] = {}
     for path in sorted(config.migrations_dir.glob("*.sql")):
         match = MIGRATION_RE.match(path.name)
         if not match:
             continue
+        version = int(match.group("version"))
+        # Two files sharing a number used to apply the first and silently skip
+        # the second, since the version was already recorded as applied.
+        if version in seen:
+            raise MigrationError(
+                f"duplicate migration number {version:04d}: {seen[version].name} and {path.name}"
+            )
+        seen[version] = path
         migrations.append(
             MigrationFile(
-                version=int(match.group("version")),
+                version=version,
                 name=match.group("name").replace("_", " "),
                 path=path,
             )
@@ -190,6 +249,76 @@ def apply_migrations(connection: sqlite3.Connection, config: ChronicleConfig) ->
         connection.rollback()
         raise
     return applied_now
+
+
+def read_schema_state(connection: sqlite3.Connection, config: ChronicleConfig) -> SchemaState:
+    """Compare applied migrations with the files on disk, without writing."""
+    has_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ).fetchone()
+    applied = (
+        frozenset(int(row[0]) for row in connection.execute("SELECT version FROM schema_migrations"))
+        if has_table
+        else frozenset()
+    )
+    return SchemaState(applied=applied, known=tuple(_load_migration_files(config)))
+
+
+def backup_database(connection: sqlite3.Connection, db_path: Path, *, label: str) -> Path:
+    """Copy the database next to itself with SQLite's online backup API."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = db_path.with_name(f"{db_path.name}.bak-{label}-{stamp}")
+    destination = sqlite3.connect(target)
+    try:
+        connection.backup(destination)
+    finally:
+        destination.close()
+    return target
+
+
+def ensure_schema(
+    connection: sqlite3.Connection,
+    config: ChronicleConfig,
+    *,
+    allow_upgrade: bool,
+    backup: bool = True,
+) -> SchemaPreparation:
+    """Bring the schema to this code's version under an explicit policy.
+
+    A brand-new database is always initialised. An existing database with
+    pending migrations upgrades only when the caller allows it, after an
+    online backup; otherwise it raises SchemaMigrationRequired, so a stray
+    process (another checkout, an old job, a test aimed at the wrong root)
+    cannot change a live schema just by connecting. A database carrying
+    migrations this code does not know raises SchemaAheadOfCode: writing with
+    an older picture of the schema is unsafe.
+    """
+    state = read_schema_state(connection, config)
+    if state.unknown:
+        raise SchemaAheadOfCode(
+            f"{config.db_path} carries migrations this code does not know "
+            f"({', '.join(f'{version:04d}' for version in state.unknown)}); it is at "
+            f"v{state.current_version} and this code knows up to v{state.target_version}. "
+            "Upgrade max-chronicle before using this database."
+        )
+    if not state.pending:
+        return SchemaPreparation(state_before=state, applied=(), backup_path=None)
+    if not state.fresh and not allow_upgrade:
+        raise SchemaMigrationRequired(
+            f"{config.db_path} is at schema v{state.current_version}; this code expects "
+            f"v{state.target_version} (pending: "
+            f"{', '.join(f'{item.version:04d}' for item in state.pending)}). Run `chronicle migrate`, "
+            "which backs the database up first, or restart the Chronicle server, which migrates on start."
+        )
+    backup_path = None
+    if backup and not state.fresh:
+        backup_path = backup_database(
+            connection,
+            config.db_path,
+            label=f"premigrate-v{state.current_version}-v{state.target_version}",
+        )
+    applied = apply_migrations(connection, config)
+    return SchemaPreparation(state_before=state, applied=tuple(applied), backup_path=backup_path)
 
 
 def table_count(connection: sqlite3.Connection, table_name: str) -> int:

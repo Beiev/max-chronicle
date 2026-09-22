@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from .bootstrap import bootstrap_legacy
 from .browse import render_browse_help, render_daybook, render_entity_timeline, render_recent_events, render_search_results
 from .config import ChronicleConfig, default_config, ensure_runtime_dirs
-from .db import apply_migrations, connect, database_summary
+from .db import connect, database_summary, ensure_schema, read_schema_state
 from .native_automation import (
     doctor_launchd,
     install_git_hooks,
@@ -105,14 +105,15 @@ def _config_from_args(args: argparse.Namespace) -> ChronicleConfig:
 def cmd_migrate(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     with _connection(config) as connection:
-        applied = apply_migrations(connection, config)
+        prepared = ensure_schema(connection, config, allow_upgrade=True)
         summary = database_summary(connection)
     payload = {
         "db_path": str(config.db_path),
         "applied": [
             {"version": item.version, "name": item.name, "path": str(item.path)}
-            for item in applied
+            for item in prepared.applied
         ],
+        "backup_path": str(prepared.backup_path) if prepared.backup_path else None,
         "summary": summary,
     }
     return _print_json(payload)
@@ -121,7 +122,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 def cmd_import_legacy(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     with _connection(config) as connection:
-        apply_migrations(connection, config)
+        ensure_schema(connection, config, allow_upgrade=False)
         result = bootstrap_legacy(connection, config, queue_mem0=args.queue_mem0)
         summary = database_summary(connection)
     payload = {
@@ -142,14 +143,27 @@ def cmd_status(args: argparse.Namespace) -> int:
         }
         return _print_json(payload)
 
+    # Read-only on the schema: `status` used to apply pending migrations as a
+    # side effect, which made a diagnostic command an unannounced upgrade.
     with _connection(config) as connection:
-        apply_migrations(connection, config)
-        summary = database_summary(connection)
-    payload = {
+        state = read_schema_state(connection, config)
+        up_to_date = not state.pending and not state.unknown
+        summary = database_summary(connection) if up_to_date else None
+    payload: dict[str, object] = {
         "db_path": str(config.db_path),
         "exists": True,
+        "schema": {
+            "current_version": state.current_version,
+            "target_version": state.target_version,
+            "pending": [item.version for item in state.pending],
+            "unknown": list(state.unknown),
+        },
         "summary": summary,
     }
+    if state.unknown:
+        payload["message"] = "The database is newer than this code; upgrade max-chronicle."
+    elif state.pending:
+        payload["message"] = "The schema is behind this code; run `chronicle migrate` (it backs up first)."
     return _print_json(payload)
 
 
