@@ -1683,14 +1683,16 @@ def test_offload_limiters_are_scoped_per_event_loop(chronicle_sandbox) -> None:
     """
     import max_chronicle.mcp_server as mcp_server_module
 
-    async def exercise() -> int:
+    async def exercise() -> object:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
         await server.call_tool("recent_events", {"domain": "global", "limit": 1})
-        return id(mcp_server_module._get_limiter("read"))
+        return mcp_server_module._get_limiter("read")
 
+    # Hold both limiters: an id() of a collected object can be reused, which
+    # made this check fail at random when it compared ids.
     first = asyncio.run(exercise())
     second = asyncio.run(exercise())
-    assert first != second, "limiter leaked across event loops"
+    assert first is not second, "limiter leaked across event loops"
 
 
 def test_mcp_activate_agent_does_not_return_the_full_document_bundle(
