@@ -332,6 +332,22 @@ def _decode_cursor(value: str, scope: list) -> int:
     return cursor["seq"]
 
 
+def _scope_filter(domain: str | None, project: str | None, task_id: str | None) -> tuple[str, tuple]:
+    """Observations in scope, without quarantined ones (FR-1)."""
+    where = """(? IS NULL OR o.domain=?) AND (? IS NULL OR o.project=?) AND (? IS NULL OR o.task_id=?)
+        AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+        AND COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'"""
+    return where, (domain, domain, project, project, task_id, task_id)
+
+
+def open_tasks(
+    connection, *, domain: str | None = None, project: str | None = None, limit: int = OPEN_TASK_LIMIT
+) -> list[dict]:
+    """The open tasks in scope, newest checkpoint first (FR-12)."""
+    where, params = _scope_filter(domain, project, None)
+    return _open_tasks(connection, where, params, limit)
+
+
 def _open_tasks(connection, where: str, params: tuple, limit: int) -> list[dict]:
     """The latest checkpoint of each task in scope whose task.status fact is not closed (FR-12)."""
     closed = ",".join("?" for _ in CLOSED_TASK_STATUSES)
@@ -384,10 +400,7 @@ def task_context(
     scope = [domain, project, task_id]
     after = _decode_cursor(since, scope) if since else 0
     older_than = _decode_cursor(before, scope) if before else None
-    where = """(? IS NULL OR o.domain=?) AND (? IS NULL OR o.project=?) AND (? IS NULL OR o.task_id=?)
-        AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
-        AND COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'"""
-    params = (domain, domain, project, project, task_id, task_id)
+    where, params = _scope_filter(domain, project, task_id)
     config = config_from_manifest(manifest)
     with open_connection(config) as connection:
         rows = connection.execute(

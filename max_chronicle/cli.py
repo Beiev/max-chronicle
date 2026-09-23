@@ -11,6 +11,7 @@ from typing import Iterator
 from zoneinfo import ZoneInfo
 
 from .bootstrap import bootstrap_legacy
+from .brief import BRIEF_DEFAULT_CHARS, build_brief
 from .browse import render_browse_help, render_daybook, render_entity_timeline, render_recent_events, render_search_results
 from .config import (
     ENV_CHRONICLE_AUTO_MIGRATE,
@@ -368,6 +369,14 @@ def cmd_activate(args: argparse.Namespace) -> int:
         print(payload["prompt"])
         return 0
     return _print_json(payload)
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    brief = build_brief(load_manifest(args.manifest), cwd=args.cwd, project=args.project, max_chars=args.budget)
+    if args.format == "json":
+        return _print_json(brief)
+    print(brief["text"], end="")
+    return 0
 
 
 def cmd_startup(args: argparse.Namespace) -> int:
@@ -901,6 +910,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_activate.add_argument("--no-capture", action="store_true", help="Reuse the latest snapshot instead of capturing a new one")
     p_activate.add_argument("--format", choices=["prompt", "json", "bundle"], default="prompt")
     p_activate.set_defaults(handler=cmd_activate)
+
+    p_brief = sub.add_parser("brief", help="Print the compact read-only memory brief a new session starts with")
+    p_brief.add_argument("--cwd", default=None, help="Working directory; its name or a configured project root picks the project")
+    p_brief.add_argument("--project", default=None, help="Project slug (overrides --cwd)")
+    p_brief.add_argument("--budget", type=int, default=BRIEF_DEFAULT_CHARS, help="Maximum characters (1000-8000)")
+    p_brief.add_argument("--format", choices=["text", "json"], default="text")
+    p_brief.set_defaults(handler=cmd_brief)
 
     p_startup = sub.add_parser("startup", help="Build the Chronicle startup bundle directly from the native service")
     p_startup.add_argument("--domain", default="global", help="Domain id from the manifest")
