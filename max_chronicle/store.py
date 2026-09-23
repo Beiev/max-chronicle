@@ -4036,11 +4036,13 @@ def store_event_embedding(
     dim: int,
     *,
     connection: sqlite3.Connection | None = None,
+    replace: bool = True,
 ) -> None:
-    """Upsert the vector of *event_id* under *model_key*.
+    """Store the vector of *event_id* under *model_key*.
 
-    Packs *vector* as a float32 BLOB into event_vectors. Idempotent: storing
-    again for the same event and key replaces the row; other keys are kept.
+    Packs *vector* as a float32 BLOB into event_vectors. Storing again for the
+    same event and key replaces the row, or with ``replace=False`` keeps the
+    stored one; other keys are kept.
     """
     from .embeddings import FLOAT32_MAX, pack_vector  # local import avoids circular at module load
 
@@ -4056,10 +4058,10 @@ def store_event_embedding(
             """
             INSERT INTO event_vectors(event_id, model_key, dim, vector, created_at_utc)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(event_id, model_key) DO UPDATE SET
+            ON CONFLICT(event_id, model_key) DO """ + ("""UPDATE SET
                 dim            = excluded.dim,
                 vector         = excluded.vector,
-                created_at_utc = excluded.created_at_utc
+                created_at_utc = excluded.created_at_utc""" if replace else "NOTHING") + """
             """,
             (event_id, model_key, dim, blob, now),
         )
