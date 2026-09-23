@@ -118,9 +118,10 @@ MCP configuration uses an absolute installed command and workspace path:
 
 Use your client's equivalent configuration format. Stdio starts with the client
 and does not require a separately running HTTP service. For supervised HTTP, use
-`chronicle-mcp --transport streamable-http`; `MCP_HOST`/`MCP_PORT` set its address.
-`GET /health` checks service and database availability; `sources_audit` and startup
-source health describe freshness. These are different checks.
+`chronicle-mcp --transport streamable-http --migrate`; `MCP_HOST`/`MCP_PORT` set its address.
+`GET /health` checks service and database availability and names the database,
+manifest, schema version and installed code path that answered; `sources_audit` and
+startup source health describe freshness. These are different checks.
 
 | Tool | Purpose |
 | --- | --- |
@@ -153,6 +154,22 @@ can separately report `side_effect_errors` for failed evidence/projection output
   on your own corpus; cosine and reciprocal-rank scores are not confidence values.
 - **Writes:** SQLite WAL with full commit synchronization; events, observations,
   facts, and evidence links commit together.
+- **Schema changes:** an empty database initialises on first use. An existing one is
+  never upgraded as a side effect of connecting: run `chronicle migrate` or start the
+  server with `chronicle-mcp --migrate`; both take an online backup
+  (`chronicle.db.bak-premigrate-…`) under the same write lock as the upgrade. Without
+  `--migrate` a server refuses to start on an outdated schema (exit code 3), and a
+  read-only server never creates or changes a database. A database newer than the installed code, or
+  another application's SQLite file, is refused. After installing a release with new
+  migrations, migrate before scheduled jobs run: until then they exit with code 3.
+  `CHRONICLE_AUTO_MIGRATE=1` restores upgrade-on-connect for the CLI and library;
+  a server upgrades only with `--migrate`. `CHRONICLE_REQUIRE_ROOT=1`
+  makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
+  instead of falling back to `~/.max-chronicle`.
+- **Read-only servers:** SQLite reads a WAL database through its `-wal` and `-shm`
+  files, so even a read-only server creates them when they are missing. Next to a
+  live writer they already exist. To serve a copy from a read-only directory,
+  switch the copy to `PRAGMA journal_mode = DELETE` first.
 - **Backups:** independent artifact copies, content-hash inventory, database
   integrity checks, and verification after relocation. Legacy backups disclose
   incomplete inventory coverage. Choose a separate backup device for disk failure.
