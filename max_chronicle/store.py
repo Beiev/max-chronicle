@@ -19,26 +19,46 @@ from zoneinfo import ZoneInfo
 
 from .config import (
     DEFAULT_MEM0_COLLECTION,
+    ENV_CHRONICLE_AUTO_MIGRATE,
     ChronicleConfig,
     default_config,
     ensure_runtime_dirs,
+    feature_enabled,
 )
-from .db import apply_migrations, connect, utc_now
+from .db import (
+    APPLICATION_ID,
+    SchemaMigrationRequired,
+    SchemaPreparation,
+    check_schema_policy,
+    connect,
+    ensure_schema,
+    read_schema_state,
+    schema_target_version,
+    utc_now,
+)
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
 DEFAULT_STALE_RUN_TTL_HOURS = 6
 STALE_RUN_STATUS = "stale_failed"
 
-# Per-process memo of DB paths whose migrations were already applied in this
-# interpreter. apply_migrations is idempotent but runs a table scan + glob on
-# every call; skipping it on subsequent connects reclaims most of the overhead
-# that the long-lived MCP daemon pays on each tool invocation.
-_MIGRATIONS_APPLIED: set[Path] = set()
+# Per-process cache of each migrations directory's target version. Every
+# connection still confirms its database is current with one PRAGMA, so a
+# file swapped underneath a long-lived process (a restore, another checkout)
+# is caught on its next connection instead of being trusted from memory.
+_TARGET_VERSIONS: dict[Path, int] = {}
 
 
 def reset_migration_cache() -> None:
-    _MIGRATIONS_APPLIED.clear()
+    _TARGET_VERSIONS.clear()
+
+
+def target_schema_version(config: ChronicleConfig) -> int:
+    target = _TARGET_VERSIONS.get(config.migrations_dir)
+    if target is None:
+        target = schema_target_version(config)
+        _TARGET_VERSIONS[config.migrations_dir] = target
+    return target
 
 
 def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
@@ -100,19 +120,97 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
     return config
 
 
+_READ_ONLY_PROCESS = False
+
+
+def set_read_only_process(enabled: bool) -> None:
+    """Open every later connection of this process read-only (a read-only server).
+
+    Such a process never creates, initialises, upgrades, or writes a database:
+    a missing or outdated one is an error, and a write raises.
+    """
+    global _READ_ONLY_PROCESS
+    _READ_ONLY_PROCESS = enabled
+
+
+_SCHEMA_PROBE = (
+    "SELECT user_version, application_id, EXISTS ("
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ") FROM pragma_user_version, pragma_application_id"
+)
+
+
 @contextmanager
 def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
     # Yields a scoped connection and closes it on exit. sqlite3.Connection's own
     # `__exit__` only commits/rollbacks — without this wrapper, `with open_connection(...)`
     # leaked ~10MB of page cache + prepared statements per call, compounding inside
     # the long-lived MCP daemon. Callers still wrap in `with connection:` for a txn.
+    if _READ_ONLY_PROCESS:
+        if not config.db_path.exists():
+            raise SchemaMigrationRequired(
+                f"No database at {config.db_path}; a read-only server never creates one."
+            )
+        connection = connect(config.db_path, read_only=True)
+    else:
+        ensure_runtime_dirs(config)
+        connection = connect(config.db_path)
+    try:
+        current, application_id, has_history_table = connection.execute(_SCHEMA_PROBE).fetchone()
+        current_schema = (
+            current == target_schema_version(config)
+            and application_id in (0, APPLICATION_ID)
+            and has_history_table
+            # An empty history is no history: any file can hold such a table.
+            and connection.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations)").fetchone()[0]
+        )
+        if not current_schema:
+            if _READ_ONLY_PROCESS:
+                check_schema_policy(
+                    read_schema_state(connection, config), config, allow_upgrade=False, allow_init=False
+                )
+            else:
+                # A new database initialises here; anything else that is not
+                # current raises unless CHRONICLE_AUTO_MIGRATE opts back in.
+                ensure_schema(
+                    connection,
+                    config,
+                    allow_upgrade=feature_enabled(ENV_CHRONICLE_AUTO_MIGRATE, default=False),
+                )
+        yield connection
+    finally:
+        connection.close()
+
+
+def prepare_database(
+    config: ChronicleConfig,
+    *,
+    allow_upgrade: bool,
+    read_only: bool = False,
+) -> SchemaPreparation:
+    """Check, initialise or upgrade the schema up front (server start).
+
+    Upgrading an existing database takes an online backup first. A read-only
+    caller never creates or changes a database: a missing, empty or outdated
+    one is an error it reports instead of quietly serving an empty store.
+    """
+    if read_only:
+        if not config.db_path.exists():
+            raise SchemaMigrationRequired(
+                f"No database at {config.db_path}; a read-only server never creates one. "
+                "Run `chronicle migrate` first."
+            )
+        connection = connect(config.db_path, read_only=True)
+        try:
+            state = read_schema_state(connection, config)
+        finally:
+            connection.close()
+        check_schema_policy(state, config, allow_upgrade=False, allow_init=False)
+        return SchemaPreparation(state_before=state, applied=(), backup_path=None)
     ensure_runtime_dirs(config)
     connection = connect(config.db_path)
     try:
-        if config.db_path not in _MIGRATIONS_APPLIED:
-            apply_migrations(connection, config)
-            _MIGRATIONS_APPLIED.add(config.db_path)
-        yield connection
+        return ensure_schema(connection, config, allow_upgrade=allow_upgrade)
     finally:
         connection.close()
 

@@ -18,6 +18,17 @@ ENV_CHRONICLE_MANIFEST = "CHRONICLE_MANIFEST"
 ENV_CHRONICLE_AUTOMATION = "CHRONICLE_AUTOMATION_CONFIG"
 ENV_CHRONICLE_DB = "CHRONICLE_DB"
 ENV_CHRONICLE_TIMEZONE = "CHRONICLE_TIMEZONE"
+# Launchers set this so a lost environment fails loudly instead of silently
+# resolving to the package checkout or ~/.max-chronicle.
+ENV_CHRONICLE_REQUIRE_ROOT = "CHRONICLE_REQUIRE_ROOT"
+# Opt back into upgrading an existing database's schema on first connect.
+# Off by default: upgrades run through `chronicle migrate` or a server started
+# with `--migrate`. A server start ignores this variable; only the flag counts.
+ENV_CHRONICLE_AUTO_MIGRATE = "CHRONICLE_AUTO_MIGRATE"
+
+# Exit codes shared by `chronicle` and `chronicle-mcp`.
+EXIT_CONFIG_ERROR = 2  # which workspace to use is unclear (see CHRONICLE_REQUIRE_ROOT)
+EXIT_SCHEMA_ACTION = 3  # the schema needs `chronicle migrate`, or a newer release
 
 # v8 feature flags — toggle Phase 1 surfaces without editing code.
 ENV_FEATURE_ENTITY_ALIASES = "CHRONICLE_ENABLE_ENTITY_ALIASES"
@@ -58,6 +69,10 @@ DEFAULT_ARTIFACT_ALLOWED_EXTENSIONS = (
     "yaml",
     "yml",
 )
+
+
+class ChronicleConfigError(RuntimeError):
+    """The environment does not say which Chronicle workspace to use."""
 
 
 @dataclass(frozen=True)
@@ -121,11 +136,11 @@ def env_int(env_name: str, *, default: int) -> int:
         return default
 
 
-def resolve_status_root(
+def _explicit_status_root(
     *,
     manifest_path: Path | None = None,
     automation_path: Path | None = None,
-) -> Path:
+) -> Path | None:
     if os.environ.get(ENV_CHRONICLE_ROOT):
         return _expand(os.environ[ENV_CHRONICLE_ROOT])
 
@@ -141,10 +156,37 @@ def resolve_status_root(
     if os.environ.get(ENV_CHRONICLE_AUTOMATION):
         return _expand(os.environ[ENV_CHRONICLE_AUTOMATION]).parent
 
+    return None
+
+
+def _implicit_status_root() -> Path:
     if (REPO_ROOT / "SSOT_MANIFEST.toml").exists():
         return REPO_ROOT
-
     return DEFAULT_HOME_ROOT
+
+
+def resolve_status_root(
+    *,
+    manifest_path: Path | None = None,
+    automation_path: Path | None = None,
+) -> Path:
+    """Resolve the workspace root: environment and explicit paths first.
+
+    Without either, fall back to a checkout carrying SSOT_MANIFEST.toml, then
+    to ~/.max-chronicle. With CHRONICLE_REQUIRE_ROOT set, that fallback raises
+    instead: a launcher that lost its environment must fail loudly rather than
+    open, or create, some other database.
+    """
+    explicit = _explicit_status_root(manifest_path=manifest_path, automation_path=automation_path)
+    if explicit is not None:
+        return explicit
+    if feature_enabled(ENV_CHRONICLE_REQUIRE_ROOT, default=False):
+        raise ChronicleConfigError(
+            f"{ENV_CHRONICLE_REQUIRE_ROOT} is set but no workspace was given; set "
+            f"{ENV_CHRONICLE_ROOT} or {ENV_CHRONICLE_MANIFEST} instead of falling back to "
+            f"{_implicit_status_root()}"
+        )
+    return _implicit_status_root()
 
 
 def default_manifest_path(status_root: Path | None = None) -> Path:
@@ -165,7 +207,9 @@ def default_db_path(status_root: Path | None = None) -> Path:
     return (status_root or resolve_status_root()) / "chronicle.db"
 
 
-DEFAULT_STATUS_ROOT = resolve_status_root()
+# Import-time defaults never raise: CHRONICLE_REQUIRE_ROOT is enforced when a
+# config is actually resolved, so `--help` and plain imports keep working.
+DEFAULT_STATUS_ROOT = _explicit_status_root() or _implicit_status_root()
 DEFAULT_DB_PATH = default_db_path(DEFAULT_STATUS_ROOT)
 DEFAULT_ARTIFACT_DIR = DEFAULT_STATUS_ROOT / "chronicle-artifacts"
 DEFAULT_LEDGER_PATH = DEFAULT_STATUS_ROOT / "ssot-ledger.jsonl"

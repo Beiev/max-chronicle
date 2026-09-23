@@ -667,16 +667,18 @@ def test_mem0_dump_timeout_finishes_failed_soft(chronicle_sandbox, loaded_manife
         "time.sleep(5)\n",
         encoding="utf-8",
     )
+    # Long enough for the child to start and write on a slow CI runner; an
+    # interpreter start alone can exceed 50 ms there.
     automation = replace(
         loaded_automation,
-        guards=replace(loaded_automation.guards, subprocess_timeout_seconds=0.05),
+        guards=replace(loaded_automation.guards, subprocess_timeout_seconds=1.0),
     )
 
     result = run_automation_job(loaded_manifest, automation, job_name="mem0-dump", trigger_source="pytest")
 
     assert result["status"] == "failed_soft"
     assert result["reason"] == "subprocess_timeout"
-    assert result["timeout_seconds"] == 0.05
+    assert result["timeout_seconds"] == 1.0
     assert "started blocking dump" in result["stderr"]
 
     config = config_from_manifest(loaded_manifest)
