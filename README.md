@@ -143,7 +143,12 @@ can separately report `side_effect_errors` for failed evidence/projection output
 
 ## Recall and durability
 
-- **Lexical:** SQLite FTS5/BM25 over event text and explicit current fact values.
+- **Lexical:** SQLite FTS5/BM25 over event text and why, and over explicit
+  current fact values. Queries drop function words (English, Russian,
+  Ukrainian) but keep negations, keep every Unicode letter, and fold ё into е on
+  both sides. Evidence must contain every remaining term; when no event or fact
+  does, recall retries with word stems, keeps only events holding two thirds of
+  the terms, and returns `relaxed: true` because that match is weaker.
 - **Vector:** optional Ollama `nomic-embed-text` index. Model, dimension, scope,
   and visibility are checked before ranking. `vector_coverage` discloses gaps;
   `chronicle embed-backfill` repairs missing/incompatible index rows.
