@@ -178,7 +178,7 @@ def test_an_index_failure_that_rolls_back_a_whole_transaction_keeps_the_event(lo
     monkeypatch.setenv("CHRONICLE_EMBED_MODEL", QWEN)
     monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: _unit(2.0, 1024))
 
-    def disk_full(config, event_id, vector, model_key, dim, *, connection=None):
+    def disk_full(config, event_id, vector, model_key, dim, *, connection=None, **options):
         if connection is not None:  # on SQLITE_FULL, SQLite rolls back the whole transaction
             connection.execute("ROLLBACK")
         raise sqlite3.OperationalError("database or disk is full")
@@ -225,6 +225,37 @@ def test_an_index_of_another_dimension_only_is_empty(loaded_manifest, monkeypatc
     result = service.query_memory(loaded_manifest, query="zzqx")
 
     assert result["degraded"] is True and result["channel_errors"]["vector"] == "embedding_index_empty"
+
+
+def test_a_capture_never_replaces_a_vector_a_backfill_stored_meanwhile(loaded_manifest, monkeypatch) -> None:
+    monkeypatch.setenv("CHRONICLE_EMBED_MODEL", QWEN)
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: _unit(1.0, 768))  # the old dimension
+    real_store = service.store_event_embedding
+
+    def backfill_lands_first(config, event_id, vector, model_key, dim, **options):
+        real_store(config, event_id, _unit(1.0, 1024), model_key, 1024)
+        real_store(config, event_id, vector, model_key, dim, **options)
+
+    monkeypatch.setattr(service, "store_event_embedding", backfill_lands_first)
+
+    event = _record(loaded_manifest, "Recorded while the model behind the key changed")
+
+    with open_connection(config_from_manifest(loaded_manifest)) as connection:
+        dim = connection.execute("SELECT dim FROM event_vectors WHERE event_id = ?", (event["id"],)).fetchone()[0]
+    assert dim == 1024
+
+
+def test_backfill_stops_at_once_when_the_backend_is_unavailable(loaded_manifest, monkeypatch, without_embedding) -> None:
+    for n in range(3):
+        _record(loaded_manifest, f"Event {n}")
+    monkeypatch.setenv("CHRONICLE_EMBED_MODEL", QWEN)
+    calls = []
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: calls.append(text))
+
+    report = service.embed_backfill(loaded_manifest)
+
+    assert len(calls) == 1  # the dimension probe, not one timeout per event
+    assert report["backend_unavailable"] is True and (report["embedded"], report["failed"]) == (0, 3)
 
 
 def test_two_indexes_coexist_and_backfill_fills_only_the_active_one(

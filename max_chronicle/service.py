@@ -2138,11 +2138,11 @@ def record_event(
     )
 
     # Best-effort embedding, computed BEFORE the write transaction — the
-    # Ollama call can take seconds and must not hold the write lock. The row
-    # itself lands inside the same transaction as the event below, so an
-    # event either commits with its embedding or without one (never a
-    # dangling embedding). Failure MUST NOT surface to the caller; the flag
-    # (default ON) lets tests opt out via the env var.
+    # Ollama call can take seconds and must not hold the write lock. The vector
+    # is written after the event commits, in its own transaction; if that
+    # fails, the event stays without one until embed-backfill repairs it.
+    # Failure MUST NOT surface to the caller; the flag (default ON) lets tests
+    # opt out via the env var.
     embedding_vec: list[float] | None = None
     embed_model: str | None = None
     embed_dim: int | None = None
@@ -2233,8 +2233,10 @@ def record_event(
         # transaction, no failure of it can lose the event, not even one that
         # makes SQLite roll back a whole transaction (a full disk); embed-backfill
         # repairs the gap.
+        # Insert only: replacing a vector is embed-backfill's job, and a capture
+        # racing a backfill must not put back a vector of a stale dimension.
         try:
-            store_event_embedding(config, stored["id"], embedding_vec, embed_model, embed_dim)
+            store_event_embedding(config, stored["id"], embedding_vec, embed_model, embed_dim, replace=False)
         except (ValueError, sqlite3.Error):
             pass
     stored["observation_id"] = observation["observation_id"]
@@ -3363,7 +3365,8 @@ def embed_backfill(
 
     Returns counts: {embedded, skipped, failed}, the index's model key, and the
     model's dimension (None while the backend is unavailable).
-    Best-effort — individual failures do not abort the run.
+    Best-effort — individual failures do not abort the run, but an unavailable
+    backend (the dimension probe fails) ends it at once with backend_unavailable.
     """
     from .embeddings import BACKFILL_TIMEOUT_S, DIMENSION_PROBE_TEXT, active_profile, embed_document, event_embedding_text
 
@@ -3376,6 +3379,11 @@ def embed_backfill(
     event_ids = fetch_event_ids_without_embedding(config, model_key=model_key, dim=dim)
     if limit is not None:
         event_ids = event_ids[:limit]
+    if probe is None:
+        # The backend is down or hung: calling it once per event would only
+        # repeat the timeout. Nothing was embedded; the next run retries.
+        return {"model_key": model_key, "dim": None, "total_without_embedding": len(event_ids),
+                "embedded": 0, "skipped": 0, "failed": len(event_ids), "backend_unavailable": True}
 
     embedded = 0
     skipped = 0
@@ -3407,4 +3415,5 @@ def embed_backfill(
         "embedded": embedded,
         "skipped": skipped,
         "failed": failed,
+        "backend_unavailable": False,
     }
