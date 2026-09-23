@@ -995,11 +995,8 @@ def _daybook_unchanged(
     status = existing.get("status")
     payload = existing.get("payload") or {}
     if status in {"ok", "failed_soft"}:
-        recorded = payload.get("event_fingerprint")
-        if recorded is None:
-            # Written before fingerprints: the count is the only signal it has.
-            return existing if payload.get("event_count") == event_count else None
-        return existing if recorded == fingerprint else None
+        # A run from before fingerprints has none, so it is rewritten once.
+        return existing if payload.get("event_fingerprint") == fingerprint else None
     if status == "skipped" and event_count == 0:
         return existing
     return None
@@ -1102,13 +1099,19 @@ def run_daybook(
         # next run regenerates instead of missing it.
         event_count, fingerprint = fingerprint_events_between(config, **window)
         events = fetch_events_between(config, **window, limit=DAYBOOK_EVENT_LIMIT)
+        daybook_path = automation.daybook_dir / local_date[:4] / f"{local_date}.md"
         latest_backup = fetch_latest_backup_run(config, successful_only=True)
         latest_audit = fetch_latest_curation_run(config, curation_type="weekly_audit")
         snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
 
         if not events:
+            result = {"status": "skipped", "run_id": run_id, "reason": "no_events"}
+            if daybook_path.exists():
+                # Every event of the day was hidden since: keep none of their text.
+                _atomic_write_text(daybook_path, f"# {local_date}\n\nNo visible events for this day.\n")
+                result["cleared"] = str(daybook_path)
             finish_curation_run(config, run_id=run_id, status="skipped", notes="No durable delta for this date.")
-            return {"status": "skipped", "run_id": run_id, "reason": "no_events"}
+            return result
 
         content, llm_status, llm_error = _compose_daybook(
             automation,
@@ -1119,9 +1122,11 @@ def run_daybook(
             backup_status=latest_backup,
         )
 
-        daybook_dir = automation.daybook_dir / local_date[:4]
-        daybook_dir.mkdir(parents=True, exist_ok=True)
-        daybook_path = daybook_dir / f"{local_date}.md"
+        if len(events) < event_count:
+            content = content.rstrip("\n") + (
+                f"\n\n_Showing the first {len(events)} of {event_count} events of this day._\n"
+            )
+        daybook_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(daybook_path, content)
 
         artifact = _store_text_artifact(

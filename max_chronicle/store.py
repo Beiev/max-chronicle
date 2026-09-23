@@ -1844,10 +1844,9 @@ def fingerprint_events_between(
         )
         for row in rows:
             count += 1
-            for value in (row["id"], row["category"], row["text"], row["why"]):
-                digest.update((value or "").encode("utf-8"))
-                digest.update(b"\x1f")
-            digest.update(b"\x1e")
+            # JSON keeps field boundaries and NULL apart from "" unambiguous.
+            fields = [row["id"], row["category"], row["text"], row["why"]]
+            digest.update(json.dumps(fields, ensure_ascii=False).encode("utf-8") + b"\n")
     return count, digest.hexdigest()
 
 

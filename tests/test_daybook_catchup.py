@@ -64,7 +64,7 @@ def _daybook_path(sandbox, day: str) -> Path:
     return sandbox.status_root / "daybooks" / day[:4] / f"{day}.md"
 
 
-def _update_events(manifest: dict, sql: str) -> None:
+def _execute(manifest: dict, sql: str) -> None:
     with open_connection(config_from_manifest(manifest)) as connection, connection:
         connection.execute(sql)
 
@@ -120,7 +120,7 @@ def test_a_swapped_event_regenerates_the_day_at_the_same_count(
     run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
     # A guard pass hides the first event and a late one arrives: the day still
     # has one visible event, but not the same one.
-    _update_events(
+    _execute(
         loaded_manifest,
         "UPDATE events SET payload_json = json_set(COALESCE(payload_json, '{}'),"
         " '$.memory_guard.visibility', 'raw_only') WHERE text LIKE 'Chose SQLite%'",
@@ -135,6 +135,50 @@ def test_a_swapped_event_regenerates_the_day_at_the_same_count(
     assert "SQLite over Postgres" not in daybook
 
 
+def test_a_run_from_before_fingerprints_is_rewritten_once(loaded_manifest, loaded_automation) -> None:
+    _record(loaded_manifest, "Chose SQLite over Postgres for the local store.", "2026-09-20T08:00:00Z")
+    run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
+    _execute(
+        loaded_manifest,
+        f"UPDATE curation_runs SET payload_json = json_remove(payload_json, '$.event_fingerprint') WHERE run_key = '{DAY}'",
+    )
+
+    rewritten = run_daybook_catchup(loaded_manifest, loaded_automation, now=NEXT_EVENING)
+    settled = run_daybook_catchup(loaded_manifest, loaded_automation, now=NEXT_EVENING + timedelta(minutes=5))
+
+    assert rewritten["days"][DAY]["status"] == "ok"
+    assert settled["days"][DAY]["status"] == "existing"
+
+
+def test_a_day_past_the_render_limit_says_so(
+    loaded_manifest, loaded_automation, chronicle_sandbox, monkeypatch
+) -> None:
+    monkeypatch.setattr(native_automation, "DAYBOOK_EVENT_LIMIT", 2)
+    for hour in (8, 9, 10):
+        _record(loaded_manifest, f"Checked the importer queue at {hour}:00.", f"2026-09-20T{hour:02d}:00:00Z")
+
+    run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
+
+    assert "Showing the first 2 of 3 events" in _daybook_path(chronicle_sandbox, DAY).read_text(encoding="utf-8")
+
+
+def test_hiding_every_event_of_a_day_clears_its_daybook(
+    loaded_manifest, loaded_automation, chronicle_sandbox
+) -> None:
+    _record(loaded_manifest, "Pasted the staging password into the team chat.", "2026-09-20T08:00:00Z")
+    run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
+    _execute(
+        loaded_manifest,
+        "UPDATE events SET payload_json = json_set(COALESCE(payload_json, '{}'),"
+        " '$.memory_guard.visibility', 'raw_only')",
+    )
+
+    result = run_daybook_catchup(loaded_manifest, loaded_automation, now=NEXT_EVENING)
+
+    assert result["days"][DAY]["status"] == "skipped"
+    assert "staging password" not in _daybook_path(chronicle_sandbox, DAY).read_text(encoding="utf-8")
+
+
 def test_an_unchanged_day_and_its_own_summary_do_not_regenerate(loaded_manifest, loaded_automation) -> None:
     _record(loaded_manifest, "Chose SQLite over Postgres for the local store.", "2026-09-20T08:00:00Z")
     run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
@@ -147,7 +191,7 @@ def test_an_unchanged_day_and_its_own_summary_do_not_regenerate(loaded_manifest,
         category="daily_summary",
         source_kind=DAYBOOK_SOURCE_KIND,
     )
-    _update_events(loaded_manifest, "UPDATE events SET mem0_status = 'synced'")
+    _execute(loaded_manifest, "UPDATE events SET mem0_status = 'synced'")
 
     result = run_daybook_catchup(loaded_manifest, loaded_automation, now=NEXT_EVENING)
 
