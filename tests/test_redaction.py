@@ -7,6 +7,7 @@ holds no string a secret scanner would take for a real key.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import random
 import string
 
@@ -179,8 +180,8 @@ def test_record_event_never_stores_the_secret(loaded_manifest, chronicle_sandbox
     assert retry["chronicle_status"] == "existing" and retry["id"] == receipt["id"]
     assert "[REDACTED:openai_key]" in receipt["text"]
     assert secret not in _stored_text(loaded_manifest)
-    ledger = chronicle_sandbox.status_root / "ssot-ledger.jsonl"
-    assert not ledger.exists() or secret not in ledger.read_text(encoding="utf-8")
+    ledger = (chronicle_sandbox.status_root / "ssot-ledger.jsonl").read_text(encoding="utf-8")
+    assert secret not in ledger and "[REDACTED:openai_key]" in ledger
 
 
 def test_evidence_files_are_archived_redacted(loaded_manifest, tmp_path, monkeypatch) -> None:
@@ -201,8 +202,8 @@ def test_evidence_files_are_archived_redacted(loaded_manifest, tmp_path, monkeyp
         storage_path, metadata = connection.execute(
             "SELECT storage_path, metadata_json FROM artifacts WHERE sha256 = ?", (evidence["sha256"],)
         ).fetchone()
-    archived = (config.artifact_dir / storage_path if not storage_path.startswith("/") else None) or storage_path
-    content = open(archived, encoding="utf-8").read()
+    archived = Path(storage_path) if Path(storage_path).is_absolute() else config.artifact_dir / storage_path
+    content = archived.read_text(encoding="utf-8")
     assert secret not in content and "[REDACTED:runpod_key]" in content
     assert json.loads(metadata)["redactions"] == {"runpod_key": 1}
     assert note.read_text(encoding="utf-8").count(secret) == 1  # the source file is never touched
