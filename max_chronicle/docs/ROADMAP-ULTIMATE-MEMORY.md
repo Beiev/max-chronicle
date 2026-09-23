@@ -262,8 +262,8 @@ interface Receipt {
 
 | Requirement | Status |
 | --- | --- |
-| FR-1 to FR-8, NFR-1 to NFR-3 | Implemented in 0.10.0. Recency is still an equal fusion channel. |
-| FR-2 v1.1 | Unicode tokens, ё folding, flagged relaxed match: 0.11.0. `no_confident_match`: planned |
+| FR-1 to FR-8, NFR-1 to NFR-3 | Implemented in 0.10.0. Recency only breaks ties since 0.12.0 (FR-1 v1.1). |
+| FR-2 v1.1 | Unicode tokens, ё folding, flagged relaxed match: 0.11.0. `no_confident_match`: 0.12.0 |
 | FR-9, FR-13 | 0.11.0 |
 | FR-11 | Events, evidence files, generated text artifacts: 0.11.0. Snapshots, imports, Mem0 responses, notes: planned |
 | FR-10 | Planned: note index |

@@ -81,6 +81,22 @@ def test_a_completed_or_cancelled_task_is_not_open(loaded_manifest) -> None:
     assert [task["task_id"] for task in _context(loaded_manifest)["open_tasks"]] == ["launch"]
 
 
+def test_a_task_status_is_the_newest_visible_one_in_any_domain(loaded_manifest) -> None:
+    _checkpoint(loaded_manifest, "alpha", "migrate", "Move storage to SQLite")
+    hidden = _record(loaded_manifest, "Hidden completion", project="alpha", task_id="migrate",
+                     memory_guard={"visibility": "raw_only"},
+                     fact={"slot": "task.status", "value": "completed", "kind": "observed"})
+    assert [task["task_id"] for task in _context(loaded_manifest)["open_tasks"]] == ["migrate"]
+
+    _record(loaded_manifest, "Done, noted in another domain", project="alpha", task_id="migrate", domain="memory",
+            fact={"slot": "task.status", "value": "completed", "kind": "observed"})
+    assert _context(loaded_manifest)["open_tasks"] == []
+
+    _record(loaded_manifest, "Reopened", project="alpha", task_id="migrate",
+            fact={"slot": "task.status", "value": "active", "kind": "decision", "supersedes": hidden["fact_id"]})
+    assert [task["task_id"] for task in _context(loaded_manifest)["open_tasks"]] == ["migrate"]
+
+
 def test_a_project_scope_lists_only_its_own_open_tasks(loaded_manifest) -> None:
     _checkpoint(loaded_manifest, "alpha", "migrate", "Move storage to SQLite")
     _checkpoint(loaded_manifest, "beta", "launch", "Ship the landing page")
@@ -138,6 +154,22 @@ def test_the_forward_cursor_still_returns_only_new_changes(loaded_manifest) -> N
 
     assert [change["text"] for change in later["changes"]] == ["Step 1"]
     assert later["has_older"] is True  # Step 0 is behind this page
+
+
+def test_a_cursor_issued_before_backward_paging_still_works(loaded_manifest) -> None:
+    import base64
+    import json
+
+    _record(loaded_manifest, "Step 0", project="alpha", task_id="migrate")  # seq 1 in a fresh database
+    _record(loaded_manifest, "Step 1", project="alpha", task_id="migrate")
+    # A cursor exactly as 0.11.0 issued it: {"v":1,"scope":[domain,project,task],"seq":N}.
+    legacy = base64.urlsafe_b64encode(json.dumps(
+        {"v": 1, "scope": ["global", "alpha", "migrate"], "seq": 1}, separators=(",", ":"), sort_keys=True
+    ).encode()).decode()
+
+    later = _context(loaded_manifest, project="alpha", task_id="migrate", since=legacy)
+
+    assert [change["text"] for change in later["changes"]] == ["Step 1"]
 
 
 def test_cursors_are_bound_to_their_scope_and_direction(loaded_manifest) -> None:
