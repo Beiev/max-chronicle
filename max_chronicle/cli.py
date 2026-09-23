@@ -383,6 +383,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
         project=args.project,
         task_id=args.task_id,
         since=args.since,
+        before=args.before,
         compact=not args.full,
     )
     if args.format == "json":
@@ -909,6 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_startup.add_argument("--project", default=None, help="Project slug shared by cooperating agents")
     p_startup.add_argument("--task-id", default=None, help="Stable task ID within the project")
     p_startup.add_argument("--since", default=None, help="Cursor from a previous task_context response")
+    p_startup.add_argument("--before", default=None, help="task_context.before cursor: read older changes")
     p_startup.add_argument("--full", action="store_true", help="Include full source content")
     p_startup.add_argument("--capture", action="store_true", help="Capture a fresh runtime snapshot before building the bundle")
     p_startup.add_argument("--limit", type=int, default=3, help="Number of recent events to include")

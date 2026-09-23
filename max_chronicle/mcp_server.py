@@ -92,6 +92,7 @@ TASK_ARG = Annotated[str | None, Field(description="Stable task ID within projec
 SESSION_ARG = Annotated[str | None, Field(description="Originating session ID; defaults to the current MCP session identity.")]
 REQUEST_ARG = Annotated[str | None, Field(description="Unique write request ID. Reuse unchanged on retries; changed input requires a new ID.")]
 CURSOR_ARG = Annotated[str | None, Field(description="Cursor from task_context.cursor to read changes since a previous startup in the same scope.")]
+BEFORE_ARG = Annotated[str | None, Field(description="Cursor from task_context.before to read the older changes of the same scope; exclusive with since.")]
 COMPACT_ARG = Annotated[bool, Field(description="Return the compact startup bundle variant.")]
 TIMESTAMP_ARG = Annotated[str, Field(description="ISO timestamp to reconstruct around.")]
 WINDOW_HOURS_ARG = Annotated[int, Field(description="Search window in hours around the timestamp.")]
@@ -384,7 +385,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "mem0-dump context; `recent_events` is the cheap latest-N feed; `state_at` reconstructs "
             "a moment in time. Write durable facts with `record_event`; use `entity_admin` for entity maintenance. "
             "Task handoffs: Use the same project/task_id across agents. Startup returns "
-            "task_context (checkpoint, current_facts, changes, cursor); since resumes its change feed. "
+            "task_context (checkpoint, current_facts, changes, cursor); since resumes its change feed, "
+            "before pages back through older changes. Without task_id there is no checkpoint to "
+            "resume: task_context lists open_tasks instead; start again with the chosen task. "
             "Record a checkpoint at handoff with completed work, actual verification, unknowns, and next steps. "
             "Use request_id for write retries and fact.supersedes to replace an explicit current fact. "
             "A database record is an attributed assertion, not proof of correctness; inspect evidence and fact.kind. "
@@ -574,7 +577,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         description=(
             "THE session entry point — call once at session start. Returns the startup brief "
             "(domain state, recent durable events, freshness audit) and unlocks the chronicler "
-            "write surface for this session. Does not mutate Chronicle unless capture=true."
+            "write surface for this session. With project and task_id, task_context holds that "
+            "task's checkpoint to resume; without task_id it lists open_tasks instead. "
+            "Does not mutate Chronicle unless capture=true."
         ),
     )
     def tool_startup_bundle(
@@ -588,6 +593,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         project: PROJECT_ARG = None,
         task_id: TASK_ARG = None,
         since: CURSOR_ARG = None,
+        before: BEFORE_ARG = None,
         ctx: Context | None = None,
     ) -> dict:
         effective_capture = capture if profile == CHRONICLER_PROFILE else False
@@ -603,6 +609,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             project=project,
             task_id=task_id,
             since=since,
+            before=before,
         )
         payload.update(session_identity(ctx, agent))
         unlock_startup_gate(ctx)
@@ -619,7 +626,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def tool_recent_events(domain: DOMAIN_ARG = "global", limit: LIMIT_ARG = 10) -> list[dict]:
         loaded = manifest()
         config = config_from_manifest(loaded)
-        return fetch_recent_events(config, limit=limit, domain=domain, visibility="raw")
+        return fetch_recent_events(config, limit=limit, domain=domain)
 
     @register_tool(
         writes=False,

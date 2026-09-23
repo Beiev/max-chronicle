@@ -312,6 +312,53 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now) -> str:
     return fact_id
 
 
+OPEN_TASK_LIMIT = 5
+OPEN_TASK_NEXT_STEPS = 3  # enough to choose a task; its own scope returns the full checkpoint
+CLOSED_TASK_STATUSES = ("completed", "cancelled")
+_CURSOR_ERROR = "Invalid cursor or cursor belongs to another scope"
+
+
+def _encode_cursor(scope: list, seq: int) -> str:
+    return base64.urlsafe_b64encode(_json({"v": 1, "scope": scope, "seq": seq}).encode()).decode()
+
+
+def _decode_cursor(value: str, scope: list) -> int:
+    try:
+        cursor = json.loads(base64.urlsafe_b64decode(value.encode()))
+        if cursor["scope"] != scope or cursor["v"] != 1 or type(cursor["seq"]) is not int or cursor["seq"] < 0:
+            raise ValueError()
+    except Exception as exc:
+        raise ValueError(_CURSOR_ERROR) from exc
+    return cursor["seq"]
+
+
+def _open_tasks(connection, where: str, params: tuple, limit: int) -> list[dict]:
+    """The latest checkpoint of each task in scope whose task.status fact is not closed (FR-12)."""
+    closed = ",".join("?" for _ in CLOSED_TASK_STATUSES)
+    rows = connection.execute(
+        """SELECT * FROM (
+            SELECT o.*, ROW_NUMBER() OVER (PARTITION BY o.project, o.task_id ORDER BY o.seq DESC) AS latest
+            FROM event_observations o JOIN events e ON e.id=o.event_id
+            WHERE """ + where + """ AND o.task_id IS NOT NULL
+              AND json_type(o.payload_json,'$.checkpoint')='object'
+        ) AS c WHERE latest = 1 AND NOT EXISTS (
+            SELECT 1 FROM current_facts f WHERE f.slot_key='task.status'
+              AND json_extract(f.attributes_json,'$.project') IS c.project
+              AND json_extract(f.attributes_json,'$.task_id')=c.task_id
+              AND lower(trim(f.value_key)) IN (""" + closed + """))
+        ORDER BY seq DESC LIMIT ?""",
+        (*params, *CLOSED_TASK_STATUSES, limit),
+    ).fetchall()
+    tasks = []
+    for row in rows:
+        observation = _observation(row)
+        checkpoint = observation["checkpoint"]
+        tasks.append({
+            key: observation[key] for key in ("project", "task_id", "agent", "recorded_at_utc", "event_id")
+        } | {"goal": checkpoint.get("goal"), "next_steps": checkpoint.get("next_steps", [])[:OPEN_TASK_NEXT_STEPS]})
+    return tasks
+
+
 def task_context(
     manifest: dict,
     *,
@@ -319,30 +366,24 @@ def task_context(
     project: str | None,
     task_id: str | None,
     since: str | None = None,
+    before: str | None = None,
     limit: int = 10,
 ) -> dict:
-    """A resumable observation stream; new confirmations advance its cursor."""
+    """A resumable observation stream; new confirmations advance its cursor.
+
+    ``since`` pages forward to newer changes, ``before`` back to older ones.
+    Only a named task has a checkpoint to resume; without ``task_id`` the
+    context lists the open tasks in scope instead (FR-12).
+    """
     if not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     if task_id and not project:
         raise ValueError("task_id requires project")
+    if since and before:
+        raise ValueError("since and before are exclusive: page one way at a time")
     scope = [domain, project, task_id]
-    after = 0
-    if since:
-        try:
-            cursor = json.loads(base64.urlsafe_b64decode(since.encode()))
-            if (
-                cursor["scope"] != scope
-                or cursor["v"] != 1
-                or type(cursor["seq"]) is not int
-                or cursor["seq"] < 0
-            ):
-                raise ValueError()
-            after = cursor["seq"]
-        except Exception as exc:
-            raise ValueError(
-                "Invalid cursor or cursor belongs to another scope"
-            ) from exc
+    after = _decode_cursor(since, scope) if since else 0
+    older_than = _decode_cursor(before, scope) if before else None
     where = """(? IS NULL OR o.domain=?) AND (? IS NULL OR o.project=?) AND (? IS NULL OR o.task_id=?)
         AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
         AND COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'"""
@@ -352,22 +393,34 @@ def task_context(
         rows = connection.execute(
             "SELECT o.* FROM event_observations o JOIN events e ON e.id=o.event_id WHERE "
             + where
-            + " AND o.seq > ? ORDER BY o.seq "
+            + " AND o.seq > ? AND (? IS NULL OR o.seq < ?) ORDER BY o.seq "
             + ("ASC" if since else "DESC")
             + " LIMIT ?",
-            (*params, after, limit + 1),
+            (*params, after, older_than, older_than, limit + 1),
         ).fetchall()
         more = bool(since and len(rows) > limit)
+        has_older = bool(not since and len(rows) > limit)
         rows = rows[:limit]
         if not since:
             rows = list(reversed(rows))
+        # From the page itself, so no change recorded meanwhile is skipped; after
+        # an older page, following it forward rereads what is newer.
         next_seq = rows[-1]["seq"] if rows else after
-        checkpoint_row = connection.execute(
-            "SELECT o.* FROM event_observations o JOIN events e ON e.id=o.event_id WHERE "
-            + where
-            + " AND json_type(o.payload_json,'$.checkpoint')='object' ORDER BY o.seq DESC LIMIT 1",
-            params,
-        ).fetchone()
+        if since and rows:
+            has_older = connection.execute(
+                "SELECT EXISTS (SELECT 1 FROM event_observations o JOIN events e ON e.id=o.event_id WHERE "
+                + where + " AND o.seq < ?)",
+                (*params, rows[0]["seq"]),
+            ).fetchone()[0] == 1
+        checkpoint_row = None
+        if task_id:
+            checkpoint_row = connection.execute(
+                "SELECT o.* FROM event_observations o JOIN events e ON e.id=o.event_id WHERE "
+                + where
+                + " AND json_type(o.payload_json,'$.checkpoint')='object' ORDER BY o.seq DESC LIMIT 1",
+                params,
+            ).fetchone()
+        open_tasks = None if task_id else _open_tasks(connection, where, params, OPEN_TASK_LIMIT)
         facts = connection.execute(
             """SELECT f.* FROM current_facts f JOIN events e
             ON e.id=json_extract(f.attributes_json,'$.event_id')
@@ -379,7 +432,7 @@ def task_context(
             ORDER BY f.recorded_at_utc DESC,f.id LIMIT ?""",
             (*params, limit + 1),
         ).fetchall()
-    return {
+    context = {
         "project": project,
         "task_id": task_id,
         "checkpoint": _observation(checkpoint_row) if checkpoint_row else None,
@@ -392,9 +445,9 @@ def task_context(
             for row in rows
         ],
         "has_more": more,
-        "cursor": base64.urlsafe_b64encode(
-            _json({"v": 1, "scope": scope, "seq": next_seq}).encode()
-        ).decode(),
+        "cursor": _encode_cursor(scope, next_seq),
+        "has_older": has_older,
+        "before": _encode_cursor(scope, rows[0]["seq"]) if rows and has_older else None,
         "facts_has_more": len(facts) > limit,
         "current_facts": [
             {
@@ -408,6 +461,9 @@ def task_context(
             for f in facts[:limit]
         ],
     }
+    if open_tasks is not None:
+        context["open_tasks"] = open_tasks
+    return context
 
 
 def event_provenance(config, event_id: str, *, limit: int = 5) -> dict:

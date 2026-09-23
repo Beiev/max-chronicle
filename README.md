@@ -49,7 +49,12 @@ areas; they are not a substitute for project/task identity.
    Record what was actually verified and what remains unknown.
 5. **Resume:** the next agent reads `task_context.checkpoint`, `current_facts`, and
    `changes`. Save `task_context.cursor`; pass it as `since` on the next startup.
-   If `has_more` is true, continue paging with the returned cursor.
+   If `has_more` is true, continue paging with the returned cursor. For older
+   changes, pass `task_context.before` as `before` while `has_older` is true.
+   Only a named task has a checkpoint; a startup without `task_id` lists
+   `open_tasks` instead (the latest checkpoint of each task in scope whose
+   `task.status` fact is not `completed` or `cancelled`), so pick one and start again
+   with its `project` and `task_id`.
 
 Task startup includes current facts from the project and the selected task.
 Their scope stays explicit; another task's facts are excluded. If `facts_has_more`
