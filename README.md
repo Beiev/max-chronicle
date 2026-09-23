@@ -156,12 +156,16 @@ can separately report `side_effect_errors` for failed evidence/projection output
 - **Writes:** SQLite WAL with full commit synchronization; events, observations,
   facts, and evidence links commit together.
 - **Secrets:** a content-based filter replaces likely credentials with
-  `[REDACTED:<kind>]` before an event, its checkpoint or fact, or a UTF-8 evidence
-  file is stored: known key prefixes, values assigned to secret names, bearer
-  tokens, URL passwords, private key blocks, and high-entropy tokens on a line
-  that mentions a key, token, or password. Hex digests and UUIDs are never treated
-  as secrets. Identifiers such as `request_id` and paths are left as given, the
-  source file is never modified, and binary evidence is archived unchanged.
+  `[REDACTED:<kind>]` before an event (with its checkpoint and fact), a UTF-8
+  evidence file, or a generated text artifact (daybook, commit summary, audit
+  report) is stored. It catches known key prefixes, values assigned to secret
+  names, labelled keys (`key: <random>`), bearer tokens, URL passwords, private
+  key blocks, and high-entropy tokens on a short line that mentions a token,
+  password, or secret. Hex digests and UUIDs never count as high-entropy tokens.
+  Identifiers such as `request_id` and paths are left as given, the source file is
+  never modified, and binary evidence is archived unchanged. Not filtered yet:
+  snapshot excerpts, legacy imports, and Mem0 responses. Time is linear in the
+  input, so a hostile or huge text cannot stall the write path.
 - **Backups:** independent artifact copies, content-hash inventory, database
   integrity checks, and verification after relocation. Legacy backups disclose
   incomplete inventory coverage. Choose a separate backup device for disk failure.

@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import mimetypes
 import re
-import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -1159,65 +1158,24 @@ def _archive_source(
 
     A UTF-8 text file holding a likely secret is archived as a redacted copy
     under its own hash; ``metadata`` records the source hash and what was
-    redacted. Binary files and clean text are copied byte for byte.
+    redacted. Binary files and clean text are archived byte for byte. Either
+    way the bytes inspected are the bytes stored: the file is read once.
     """
     raw = source_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != source_sha256:
+        raise RuntimeError(f"Artifact source changed while copying: {source_path}")
     try:
         redaction = redact(raw.decode("utf-8"))
     except UnicodeDecodeError:
         redaction = None
-    if redaction is None or not redaction.count:
-        return _copy_source_to_content_addressed_path(
-            source_path,
-            artifact_type=artifact_type,
-            source_sha256=source_sha256,
-            source_name=source_path.name,
-            artifact_dir=artifact_dir,
-        )
-    if hashlib.sha256(raw).hexdigest() != source_sha256:
-        raise RuntimeError(f"Artifact source changed while copying: {source_path}")
-    content = redaction.text.encode("utf-8")
+    content = raw if redaction is None or not redaction.count else redaction.text.encode("utf-8")
     sha256 = hashlib.sha256(content).hexdigest()
     storage_path = artifact_dir / artifact_type / sha256[:2] / sha256[2:4] / f"{sha256}-{source_path.name}"
     _ensure_bytes_at_path(storage_path, content, sha256=sha256)
-    metadata["source_sha256"] = source_sha256
-    metadata["redactions"] = dict(redaction.counts)
+    if content is not raw:
+        metadata["source_sha256"] = source_sha256
+        metadata["redactions"] = dict(redaction.counts)
     return storage_path, sha256
-
-
-def _copy_source_to_content_addressed_path(
-    source_path: Path,
-    *,
-    artifact_type: str,
-    source_sha256: str,
-    source_name: str,
-    artifact_dir: Path,
-) -> tuple[Path, str]:
-    relative_storage = Path(artifact_type) / source_sha256[:2] / source_sha256[2:4] / f"{source_sha256}-{source_name}"
-    storage_path = artifact_dir / relative_storage
-    storage_path.parent.mkdir(parents=True, exist_ok=True)
-    if _path_matches_sha256(storage_path, source_sha256):
-        return storage_path, source_sha256
-
-    temp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile("wb", dir=storage_path.parent, prefix=f".{storage_path.name}.", suffix=".tmp", delete=False) as target:
-            temp_name = target.name
-            with source_path.open("rb") as source:
-                shutil.copyfileobj(source, target, length=1024 * 1024)
-            target.flush()
-            os.fsync(target.fileno())
-        temp_path = Path(temp_name)
-        copied_sha256 = _file_sha256(temp_path)
-        if copied_sha256 != source_sha256:
-            temp_path.unlink(missing_ok=True)
-            raise RuntimeError(f"Artifact source changed while copying: {source_path}")
-        os.replace(temp_path, storage_path)
-        return storage_path, copied_sha256
-    except Exception:
-        if temp_name is not None:
-            Path(temp_name).unlink(missing_ok=True)
-        raise
 
 
 def _artifact_extension(path: Path) -> str:
@@ -2098,7 +2056,8 @@ def store_artifact_text(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     observed_at = observed_at_utc or utc_now()
-    payload = content.encode("utf-8")
+    redaction = redact(content)
+    payload = redaction.text.encode("utf-8")
     sha256 = _bytes_sha256(payload)
     if len(payload) > config.artifact_max_copy_bytes:
         raise ValueError(
@@ -2112,6 +2071,8 @@ def store_artifact_text(
     artifact_metadata = dict(metadata or {})
     artifact_metadata.setdefault("source_name", filename)
     artifact_metadata.setdefault("source_size", len(payload))
+    if redaction.count:
+        artifact_metadata["redactions"] = dict(redaction.counts)
 
     with open_connection(config) as connection, connection:
         resolved_entity_id = entity_id

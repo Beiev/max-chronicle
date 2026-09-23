@@ -28,7 +28,8 @@ any operator's personal workspace.
 - Retrying a request cannot duplicate or change its committed observation.
 - Scope/visibility filters apply before ranking; unrelated recency is not evidence.
 - External recall failure cannot prevent canonical local writes.
-- Likely secrets are redacted before storage, archiving, or any derived output.
+- Likely secrets are redacted before an event, its evidence files, or a generated
+  text artifact is stored; keep every redaction pattern linear in its input.
 - Checkpoints record actual verification, uncertainty, and concrete next steps.
 - A committed write and incomplete derived output have separate receipts.
 - Backups must verify content, not only counts, and work without the source tree.
