@@ -29,6 +29,7 @@ DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b"
 DOCUMENT_TIMEOUT_S = 3.0  # on the write path, outside the write lock
 BACKFILL_TIMEOUT_S = 30.0  # a long event on a cold model
 FLOAT32_MAX = 3.4028234663852886e38  # vectors are stored as float32
+DIMENSION_PROBE_TEXT = "dimension probe"  # embedded once per backfill to learn the model's dimension
 
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 

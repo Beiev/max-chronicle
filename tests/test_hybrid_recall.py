@@ -19,7 +19,7 @@ import pytest
 
 from max_chronicle import service, store
 from max_chronicle.config import MIGRATIONS_DIR
-from max_chronicle.embeddings import cosine, pack_vector, unpack_vector
+from max_chronicle.embeddings import DIMENSION_PROBE_TEXT, cosine, pack_vector, unpack_vector
 from max_chronicle.runtime_context import load_manifest
 from max_chronicle.store import (
     config_from_manifest,
@@ -517,8 +517,9 @@ class TestEmbedBackfillCli:
         call_count = [0]
 
         def _count_and_return(text: str, **_options) -> list[float]:
-            call_count[0] += 1
-            return _make_vec(float(call_count[0]))
+            if text != DIMENSION_PROBE_TEXT:  # one probe per run learns the model's dimension
+                call_count[0] += 1
+            return _make_vec(float(call_count[0]) + 1.0)
 
         with patch("max_chronicle.embeddings.embed_text", side_effect=_count_and_return):
             result = service.embed_backfill(manifest, limit=2)

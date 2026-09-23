@@ -2182,10 +2182,10 @@ def record_event(
             else:
                 evidence.append({"path": str(path), "status": "missing" if not path.is_file() else "skipped"})
 
-    # One BEGIN IMMEDIATE transaction for dedup lookup + event + embedding +
-    # artifacts + links: a crash mid-way can no longer leave a half-recorded
-    # event, and the up-front write lock avoids the deferred-BEGIN upgrade
-    # deadlock that bypasses busy_timeout.
+    # One BEGIN IMMEDIATE transaction for dedup lookup + event + artifacts +
+    # links: a crash mid-way can no longer leave a half-recorded event, and the
+    # up-front write lock avoids the deferred-BEGIN upgrade deadlock that
+    # bypasses busy_timeout. The vector is written after it commits.
     artifacts_written = 0
     with write_transaction(config) as connection:
         prior_request = request_receipt(connection, normalized_entry)
@@ -2209,22 +2209,6 @@ def record_event(
         if existing:
             stored["dedupe_status"] = "exact_duplicate" if dedupe else "content_hash_match"
             stored["dedupe_window_hours"] = dedupe_window_hours if dedupe else hash_dedup_window
-        if embedding_vec is not None and embed_model is not None and embed_dim is not None:
-            # A vector is an index entry, not part of the record: failing to
-            # store it must not lose the event; embed-backfill repairs the gap.
-            connection.execute("SAVEPOINT event_vector")
-            try:
-                store_event_embedding(
-                    config,
-                    stored["id"],
-                    embedding_vec,
-                    embed_model,
-                    embed_dim,
-                    connection=connection,
-                )
-            except (ValueError, sqlite3.Error):
-                connection.execute("ROLLBACK TO event_vector")
-            connection.execute("RELEASE event_vector")
         for staged in staged_artifacts:
             staged["observed_at"] = stored["recorded_at"]
             staged["metadata"]["event_id"] = stored["id"]
@@ -2244,6 +2228,15 @@ def record_event(
             )
             artifacts_written += 1
         observation = record_observation(connection, normalized_entry, stored["id"], evidence)
+    if embedding_vec is not None and embed_model is not None and embed_dim is not None:
+        # A vector is an index entry, not part of the record. Written in its own
+        # transaction, no failure of it can lose the event, not even one that
+        # makes SQLite roll back a whole transaction (a full disk); embed-backfill
+        # repairs the gap.
+        try:
+            store_event_embedding(config, stored["id"], embedding_vec, embed_model, embed_dim)
+        except (ValueError, sqlite3.Error):
+            pass
     stored["observation_id"] = observation["observation_id"]
     stored["fact_id"] = observation["fact_id"]
     stored["evidence"] = evidence
@@ -3368,14 +3361,19 @@ def embed_backfill(
 ) -> dict[str, Any]:
     """Embed every event the active profile's index lacks.
 
-    Returns counts: {embedded, skipped, failed} and the index's model key.
+    Returns counts: {embedded, skipped, failed}, the index's model key, and the
+    model's dimension (None while the backend is unavailable).
     Best-effort — individual failures do not abort the run.
     """
-    from .embeddings import BACKFILL_TIMEOUT_S, active_profile, embed_document, event_embedding_text
+    from .embeddings import BACKFILL_TIMEOUT_S, DIMENSION_PROBE_TEXT, active_profile, embed_document, event_embedding_text
 
     config = _config(manifest)
     model_key = active_profile().key
-    event_ids = fetch_event_ids_without_embedding(config, model_key=model_key)
+    # The model's current dimension: a stored vector of another one (the model
+    # behind the key changed) is replaced. Unknown while the backend is down.
+    probe = embed_document(DIMENSION_PROBE_TEXT, timeout=BACKFILL_TIMEOUT_S)
+    dim = len(probe) if probe is not None else None
+    event_ids = fetch_event_ids_without_embedding(config, model_key=model_key, dim=dim)
     if limit is not None:
         event_ids = event_ids[:limit]
 
@@ -3404,6 +3402,7 @@ def embed_backfill(
 
     return {
         "model_key": model_key,
+        "dim": dim,
         "total_without_embedding": len(event_ids),
         "embedded": embedded,
         "skipped": skipped,

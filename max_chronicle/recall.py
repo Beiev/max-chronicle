@@ -73,12 +73,6 @@ def query_memory(
         errors["fts"] = f"{type(exc).__name__}: {exc}"
 
     compatible = [r for r in pool if r["vector"] is not None and len(r["vector"]) == r["dim"] * 4]
-    coverage = {
-        "model_key": profile.key,
-        "eligible": len(pool),
-        "compatible": len(compatible),
-        "missing_or_incompatible": len(pool) - len(compatible),
-    }
     similarities: dict[str, float] = {}
     vector_available = False
     try:
@@ -87,11 +81,14 @@ def query_memory(
             errors["vector"] = "embedding_backend_unavailable"
         elif not all(math.isfinite(x) for x in query_vec) or not any(query_vec):
             errors["vector"] = "invalid_query_embedding"
-        elif pool and not compatible:
-            # The active model has no index yet (run embed-backfill); a partial
-            # index still ranks what it holds, and coverage discloses the rest.
-            errors["vector"] = "embedding_index_empty"
         else:
+            # A vector of another dimension (the model behind the key changed)
+            # is incompatible: coverage counts it and embed-backfill replaces it.
+            compatible = [r for r in compatible if r["dim"] == len(query_vec)]
+            if pool and not compatible:
+                # No usable index yet (run embed-backfill). A partial index
+                # still ranks what it holds, and coverage discloses the rest.
+                errors["vector"] = "embedding_index_empty"
             vector_available = bool(compatible)
             for row in compatible:
                 try:
@@ -105,6 +102,12 @@ def query_memory(
                     errors["vector"] = f"invalid_stored_embedding: {exc}"
     except Exception as exc:
         errors["vector"] = f"{type(exc).__name__}: {exc}"
+    coverage = {
+        "model_key": profile.key,
+        "eligible": len(pool),
+        "compatible": len(compatible),
+        "missing_or_incompatible": len(pool) - len(compatible),
+    }
 
     vector_ids = sorted(similarities, key=lambda eid: (-similarities[eid], eid))[
         : max(limit * 4, 40)

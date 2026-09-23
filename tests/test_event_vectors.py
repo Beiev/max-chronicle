@@ -8,6 +8,7 @@ import io
 import json
 import math
 import shutil
+import sqlite3
 
 import pytest
 
@@ -171,6 +172,59 @@ def test_a_vector_that_cannot_be_stored_does_not_lose_the_event(loaded_manifest,
         stored = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (event["id"],)).fetchone()[0]
         vectors = connection.execute("SELECT COUNT(*) FROM event_vectors WHERE event_id = ?", (event["id"],)).fetchone()[0]
     assert (stored, vectors) == (1, 0)
+
+
+def test_an_index_failure_that_rolls_back_a_whole_transaction_keeps_the_event(loaded_manifest, monkeypatch) -> None:
+    monkeypatch.setenv("CHRONICLE_EMBED_MODEL", QWEN)
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: _unit(2.0, 1024))
+
+    def disk_full(config, event_id, vector, model_key, dim, *, connection=None):
+        if connection is not None:  # on SQLITE_FULL, SQLite rolls back the whole transaction
+            connection.execute("ROLLBACK")
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(service, "store_event_embedding", disk_full)
+
+    event = _record(loaded_manifest, "Recorded while the disk is nearly full")
+
+    assert event["chronicle_status"] == "stored"
+    with open_connection(config_from_manifest(loaded_manifest)) as connection:
+        stored = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (event["id"],)).fetchone()[0]
+        vectors = connection.execute("SELECT COUNT(*) FROM event_vectors WHERE event_id = ?", (event["id"],)).fetchone()[0]
+    assert (stored, vectors) == (1, 0)
+
+
+def test_a_vector_of_another_dimension_is_incompatible_and_replaced(
+    loaded_manifest, monkeypatch, without_embedding
+) -> None:
+    config = config_from_manifest(loaded_manifest)
+    old = _record(loaded_manifest, "Indexed before the model behind the key changed")
+    new = _record(loaded_manifest, "Indexed after the change")
+    store_event_embedding(config, old["id"], _unit(0.0, 768), QWEN, 768)
+    store_event_embedding(config, new["id"], _unit(0.0, 1024), QWEN, 1024)
+    monkeypatch.setenv("CHRONICLE_EMBED_MODEL", QWEN)
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: _unit(0.0, 1024))
+
+    result = service.query_memory(loaded_manifest, query="zzqx")
+
+    assert [hit["event_id"] for hit in result["results"]] == [new["id"]] and result["degraded"] is False
+    assert result["vector_coverage"]["missing_or_incompatible"] == 1
+
+    report = service.embed_backfill(loaded_manifest)
+
+    assert (report["dim"], report["embedded"]) == (1024, 1)
+    assert {len(vector) for _, vector in fetch_all_event_embeddings(config)} == {1024}
+
+
+def test_an_index_of_another_dimension_only_is_empty(loaded_manifest, monkeypatch, without_embedding) -> None:
+    event = _record(loaded_manifest, "Indexed before the model behind the key changed")
+    store_event_embedding(config_from_manifest(loaded_manifest), event["id"], _unit(0.0, 768), QWEN, 768)
+    monkeypatch.setenv("CHRONICLE_EMBED_MODEL", QWEN)
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: _unit(0.0, 1024))
+
+    result = service.query_memory(loaded_manifest, query="zzqx")
+
+    assert result["degraded"] is True and result["channel_errors"]["vector"] == "embedding_index_empty"
 
 
 def test_two_indexes_coexist_and_backfill_fills_only_the_active_one(

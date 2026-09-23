@@ -4087,8 +4087,14 @@ def fetch_all_event_embeddings(
     return [(row["event_id"], unpack_vector(row["vector"])) for row in rows]
 
 
-def fetch_event_ids_without_embedding(config: ChronicleConfig, *, model_key: str | None = None) -> list[str]:
-    """Events the index of ``model_key`` (the active profile's by default) lacks or holds malformed."""
+def fetch_event_ids_without_embedding(
+    config: ChronicleConfig, *, model_key: str | None = None, dim: int | None = None
+) -> list[str]:
+    """Events the index of ``model_key`` (the active profile's by default) lacks or holds malformed.
+
+    With ``dim``, the model's current dimension, a vector of another dimension
+    counts as missing too.
+    """
     from .embeddings import active_profile
 
     with open_connection(config) as connection:
@@ -4097,8 +4103,8 @@ def fetch_event_ids_without_embedding(config: ChronicleConfig, *, model_key: str
             SELECT e.id
             FROM events AS e
             LEFT JOIN event_vectors AS ev ON ev.event_id = e.id AND ev.model_key = ?
-            WHERE ev.event_id IS NULL OR length(ev.vector) != ev.dim * 4
+            WHERE ev.event_id IS NULL OR length(ev.vector) != ev.dim * 4 OR ev.dim != coalesce(?, ev.dim)
             ORDER BY e.occurred_at_utc DESC
-            """, (model_key or active_profile().key,),
+            """, (model_key or active_profile().key, dim),
         ).fetchall()
     return [row["id"] for row in rows]
