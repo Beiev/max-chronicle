@@ -155,6 +155,59 @@ def test_the_environment_overrides_the_confident_floor(loaded_manifest, qwen, mo
         service.query_memory(loaded_manifest, query="zzqx")
 
 
+def test_every_term_counts_even_below_the_capped_full_text_list(loaded_manifest, qwen) -> None:
+    for n in range(40):  # short, so BM25 ranks them all above the long one
+        _record(loaded_manifest, f"rollout canary {n}", at=f"2026-07-01T10:{n:02d}:00Z")
+    long_one = _record(loaded_manifest, "The rollout went to one canary region first " + "and waited " * 20,
+                       at="2026-09-01T10:00:00Z", similarity=0.55)
+
+    result = service.query_memory(loaded_manifest, query="rollout canary", limit=1)
+
+    assert _ids(result) == [long_one] and result["results"][0]["channels"]["fts_rank"] is None
+    assert result["no_confident_match"] is False
+
+
+def test_a_similarity_below_the_admission_floor_still_counts_toward_confidence(loaded_manifest, qwen, monkeypatch) -> None:
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: QUERY)
+    event = _record(loaded_manifest, "Выбрали FastAPI для внутреннего API вместо Flask.", at="2026-07-01T10:00:00Z",
+                    similarity=0.7)
+    _record(loaded_manifest, "Unrelated, found by vector only", at="2026-07-02T10:00:00Z", similarity=0.7)
+    monkeypatch.setenv("CHRONICLE_VECTOR_MIN_SIMILARITY", "0.8")
+
+    result = service.query_memory(loaded_manifest, query="какой фреймворк выбрали для внутреннего API")
+
+    assert _ids(result) == [event] and result["relaxed"] is True  # the vector-only event stays out
+    assert result["results"][0]["channels"]["vector_similarity"] == pytest.approx(0.7, abs=1e-6)
+    assert result["no_confident_match"] is False  # 0.7 reaches the confident floor of 0.6
+
+
+def test_a_tie_between_facts_ranks_the_newer_event_first(loaded_manifest, qwen, monkeypatch) -> None:
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: None)
+    oldest_first = [
+        service.record_event(loaded_manifest, {
+            "agent": "agent-a", "domain": "global", "text": "Store chosen", "project": "alpha", "task_id": f"t{month}",
+            "recorded_at": f"2026-{month}-01T10:00:00Z",
+            "fact": {"slot": "store", "value": "Postgres", "kind": "decision"},
+        })["id"]
+        for month in MONTHS
+    ]
+
+    result = service.query_memory(loaded_manifest, query="Postgres", project="alpha")
+
+    assert _ids(result) == oldest_first[::-1]
+
+
+def test_a_focused_startup_reports_the_recall_signals(loaded_manifest, qwen, monkeypatch) -> None:
+    monkeypatch.setattr(embeddings, "embed_text", lambda text, **options: None)
+    _record(loaded_manifest, "Выбрали FastAPI для внутреннего API вместо Flask.", at="2026-07-01T10:00:00Z")
+
+    bundle = service.build_startup_bundle(loaded_manifest, focus="какой фреймворк выбрали для внутреннего API")
+
+    status = bundle["recall_status"]
+    assert status["relaxed"] is True and status["no_confident_match"] is True
+    assert status["hint"] == NO_CONFIDENT_MATCH_HINT
+
+
 # ---------------------------------------------------------------------------
 # Eval: the cost of abstaining is measured, not hidden
 # ---------------------------------------------------------------------------

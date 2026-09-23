@@ -1848,6 +1848,19 @@ def search_events(
     return [_event_row_to_entry(row) for row in kept[:limit]]
 
 
+def strict_matches(config: ChronicleConfig, *, query: str, event_ids: list[str]) -> set[str]:
+    """Which of *event_ids* hold every query term in their text or why, whatever their rank."""
+    if not event_ids or not query_terms(query):
+        return set()
+    placeholders = ",".join("?" for _ in event_ids)
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            "SELECT event_id FROM events_fts WHERE events_fts MATCH ? AND event_id IN (" + placeholders + ")",
+            (_fts_query(query, relaxed=False), *event_ids),
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
 def search_fact_events(
     config: ChronicleConfig, *, query: str, limit: int = 40,
     domain: str | None = None, project: str | None = None,
@@ -1864,7 +1877,7 @@ def search_fact_events(
               AND """ + _event_domain_where_clause("e") + """
               AND (? IS NULL OR e.title=?)
               AND (? IS NULL OR json_extract(e.payload_json,'$.task_id')=?)
-            ORDER BY bm25(facts_fts),e.id LIMIT ?""",
+            ORDER BY bm25(facts_fts),e.occurred_at_utc DESC,e.id LIMIT ?""",
             (_fts_query(query), domain, domain, domain, project, project, task_id, task_id, limit),
         ).fetchall()
     return [row["id"] for row in rows]

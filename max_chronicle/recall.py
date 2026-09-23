@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import sqlite3
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ from .store import (
     fetch_recall_pool,
     search_events,
     search_fact_events,
+    strict_matches,
 )
 
 ENV_MIN_SIMILARITY = "CHRONICLE_VECTOR_MIN_SIMILARITY"
@@ -70,6 +72,7 @@ def query_memory(
     eligible = {row["id"]: row for row in pool}
     errors: dict[str, str] = {}
     fts: dict[str, int] = {}
+    fact_matches: set[str] = set()
     relaxed = False
     try:
         wanted = max(limit * 4, 40)
@@ -88,6 +91,7 @@ def query_memory(
         for rank, event_id in enumerate(fact_hits):
             if event_id in eligible:
                 fts[event_id] = min(fts.get(event_id, rank), rank)
+                fact_matches.add(event_id)
     except Exception as exc:
         errors["fts"] = f"{type(exc).__name__}: {exc}"
 
@@ -114,9 +118,7 @@ def query_memory(
                     vec = unpack_vector(row["vector"])
                     if not any(vec):
                         raise ValueError("zero vector")
-                    similarity = cosine(query_vec, vec)
-                    if similarity >= threshold:
-                        similarities[row["id"]] = similarity
+                    similarities[row["id"]] = cosine(query_vec, vec)
                 except (ValueError, TypeError) as exc:
                     errors["vector"] = f"invalid_stored_embedding: {exc}"
     except Exception as exc:
@@ -128,8 +130,11 @@ def query_memory(
         "missing_or_incompatible": len(pool) - len(compatible),
     }
 
-    # Equal similarity (such as the same text recorded twice) ranks the newer event first.
-    newest_first = sorted(similarities, key=lambda eid: (eligible[eid]["occurred_at_utc"], eid), reverse=True)
+    # Only a similarity above the floor makes a vector candidate; every one is
+    # still reported, and counts toward confidence. Equal similarity (such as
+    # the same text recorded twice) ranks the newer event first.
+    admitted = [eid for eid, similarity in similarities.items() if similarity >= threshold]
+    newest_first = sorted(admitted, key=lambda eid: (eligible[eid]["occurred_at_utc"], eid), reverse=True)
     vector_ids = sorted(newest_first, key=lambda eid: -similarities[eid])[: max(limit * 4, 40)]
     vector_ranks = {eid: rank for rank, eid in enumerate(vector_ids)}
     candidates = set(fts) | set(vector_ranks)
@@ -185,10 +190,17 @@ def query_memory(
         + (["vector"] if vector_available else [])
         + (["temporal"] if candidates else [])
     )
-    # Confident evidence holds every query term (a relaxed match does not) or is
-    # as close as this model gets only for related text.
+    # Confident evidence holds every query term (a relaxed match does not), or
+    # is as close as this model gets only for related text. Every term is
+    # checked on the returned events themselves: one ranked below the capped
+    # full-text list still holds them.
+    returned = [hit["event_id"] for hit in results]
+    try:
+        lexical = strict_matches(config, query=query, event_ids=returned) | (fact_matches & set(returned))
+    except sqlite3.Error:
+        lexical = set()  # unknown, so not confident
     confident = any(
-        (hit["channels"]["fts_rank"] is not None and not relaxed)
+        hit["event_id"] in lexical
         or (
             confident_floor is not None
             and hit["channels"]["vector_similarity"] is not None
