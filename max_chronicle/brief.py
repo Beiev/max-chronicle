@@ -12,12 +12,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
 
+from .db import connect
 from .memory import open_tasks
-from .store import ChronicleConfig, config_from_manifest, open_connection
+from .redaction import redact
+from .store import ChronicleConfig, config_from_manifest
 
 BRIEF_MAX_CHARS = 8000  # FR-12 ceiling
 BRIEF_DEFAULT_CHARS = 6000  # about 2k tokens even for Cyrillic text
@@ -27,6 +30,7 @@ BRIEF_FACTS = 10
 BRIEF_DECISIONS = 8
 BRIEF_DECISION_DAYS = 14
 BRIEF_LINE_CHARS = 220
+BRIEF_WARNINGS = 5
 CAPTURE_STALE_HOURS = 36
 FAILED_RUN_STATUSES = ("failed", "failed_soft", "stale_failed", "issues")
 FAILED_RUN_DAYS = 7  # an older last failure belongs to a retired job
@@ -44,16 +48,33 @@ PROTOCOL = (
 
 @contextmanager
 def _read_only(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
-    with open_connection(config) as connection:
-        connection.execute("PRAGMA query_only=ON")
+    """A query_only connection that never creates the file or changes its journal mode."""
+    connection = connect(config.db_path, read_only=True)
+    try:
         yield connection
+    finally:
+        connection.close()
 
 
-def _line(text: Any, limit: int = BRIEF_LINE_CHARS, *, suffix: str = "") -> str:
-    """One line of at most *limit* characters; *suffix* (an id) survives the cut."""
-    flat = " ".join(str(text or "").split())
-    room = limit - len(suffix)
-    return (flat if len(flat) <= room else flat[: room - 1].rstrip() + "…") + suffix
+class _Cleaner:
+    """Flattens recorded text and redacts likely secrets: rows written before the
+    secret filter, or imported past it, must not reach a session (FR-11)."""
+
+    def __init__(self) -> None:
+        self.redactions = 0
+
+    def __call__(self, text: Any) -> str:
+        result = redact(" ".join(str(text or "").split()))
+        self.redactions += result.count
+        return result.text
+
+
+def _line(text: str, limit: int = BRIEF_LINE_CHARS, *, prefix: str = "", suffix: str = "") -> str:
+    """One line of about *limit* characters; *prefix* and *suffix* (ids) survive the cut."""
+    room = limit - len(prefix) - len(suffix)
+    if len(text) > room:
+        text = text[: max(room - 1, 0)].rstrip() + "…"
+    return prefix + text + suffix
 
 
 def _short_time(value: str | None) -> str:
@@ -68,11 +89,11 @@ def resolve_project(
         return project, "given"
     if not cwd:
         return None, "none"
-    where = Path(cwd).expanduser()
+    where = Path(os.path.normpath(os.path.expanduser(cwd)))
     best: tuple[int, str] | None = None
     for entry in manifest.get("projects", []):
         for root in entry.get("roots", []):
-            root_path = Path(root).expanduser()
+            root_path = Path(os.path.normpath(os.path.expanduser(root)))
             if where == root_path or root_path in where.parents:
                 depth = len(root_path.parts)
                 if best is None or depth > best[0]:
@@ -90,7 +111,8 @@ def resolve_project(
 
 def _facts(connection: sqlite3.Connection, project: str | None) -> list[dict[str, Any]]:
     rows = connection.execute(
-        """SELECT f.id, f.slot_key, f.value_key, json_extract(f.attributes_json,'$.project') AS project
+        """SELECT f.id, f.slot_key, f.value_key, json_extract(f.attributes_json,'$.project') AS project,
+                  json_extract(f.attributes_json,'$.task_id') AS task_id, json_extract(f.attributes_json,'$.kind') AS kind
         FROM current_facts f JOIN events e ON e.id=json_extract(f.attributes_json,'$.event_id')
         WHERE COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
           AND f.slot_key != 'task.status'
@@ -110,8 +132,9 @@ def _decisions(connection: sqlite3.Connection, project: str | None, now: datetim
         FROM events e
         WHERE e.category = 'decision' AND e.occurred_at_utc >= ?
           AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
-          -- A decision that set a current fact is shown as that fact.
-          AND NOT EXISTS (SELECT 1 FROM current_facts f WHERE json_extract(f.attributes_json,'$.event_id') = e.id)
+          -- A decision that set a fact is shown through the facts: the current value
+          -- there, a replaced one nowhere, so an old decision never returns unmarked.
+          AND NOT EXISTS (SELECT 1 FROM facts f WHERE json_extract(f.attributes_json,'$.event_id') = e.id)
           AND (? IS NULL OR COALESCE(e.title, json_extract(e.payload_json,'$.project')) IS NULL
                OR COALESCE(e.title, json_extract(e.payload_json,'$.project')) = ?)
         ORDER BY e.occurred_at_utc DESC, e.id LIMIT ?""",
@@ -143,30 +166,38 @@ def _warnings(connection: sqlite3.Connection, now: datetime) -> list[str]:
 
 
 def _render(
-    project: str | None, how: str, tasks: list, facts: list, decisions: list, warnings: list[str]
+    project: str | None, how: str, tasks: list, facts: list, decisions: list, warnings: list[str], clean: _Cleaner
 ) -> list[tuple[str, list[str]]]:
-    heading = f"Project: {project} ({'from the working directory' if how != 'given' else 'as requested'})." if project else (
-        "No project matched this directory: the brief covers all projects."
+    heading = (
+        f"Project: {clean(project)} ({'from the working directory' if how != 'given' else 'as requested'})."
+        if project else "No project matched this directory: the brief covers all projects."
     )
     sections: list[tuple[str, list[str]]] = [("", [FRAMING, heading])]
     sections.append(("Open tasks (resume with startup_bundle(project, task_id))", [
-        _line(f"{task['project']}/{task['task_id']} ({task['agent']}, {_short_time(task['recorded_at_utc'])}): {task['goal']}")
-        + ("\n  " + _line("next: " + "; ".join(step.rstrip(".") for step in task["next_steps"]))
+        _line(clean(task["goal"]), prefix=f"{clean(task['project'])}/{clean(task['task_id'])} "
+              f"({clean(task['agent'])}, {_short_time(task['recorded_at_utc'])}): ")
+        + ("\n  " + _line(clean("; ".join(step.rstrip(".") for step in task["next_steps"])), prefix="next: ")
            if task["next_steps"] else "")
         for task in tasks
     ]))
     sections.append(("Current facts", [
-        _line(f"{fact['slot_key']} = {fact['value_key']}" + (f" [{fact['project']}]" if fact["project"] and not project else ""),
-              suffix=f" (fact {fact['id']})")
+        _line(clean(f"{fact['slot_key']} = {fact['value_key']}"),
+              suffix=" [" + ", ".join(part for part in (
+                  clean(fact["project"]) if fact["project"] and not project else None,
+                  f"task {clean(fact['task_id'])}" if fact["task_id"] else None,
+                  fact["kind"] if fact["kind"] == "assumption" else None,
+              ) if part) + "]" if (fact["project"] and not project) or fact["task_id"] or fact["kind"] == "assumption" else "")
+        .rstrip() + f" (fact {fact['id']})"
         for fact in facts
     ]))
     sections.append((f"Decisions, last {BRIEF_DECISION_DAYS} days", [
-        _line(f"{_short_time(decision['occurred_at_utc'])} {decision['actor'] or '?'}"
-              + (f" [{decision['project']}]" if decision["project"] and not project else "")
-              + f": {decision['text']}", suffix=f" (event {decision['id']})")
+        _line(clean(decision["text"]),
+              prefix=f"{_short_time(decision['occurred_at_utc'])} {clean(decision['actor']) or '?'}"
+              + (f" [{clean(decision['project'])}]" if decision["project"] and not project else "") + ": ",
+              suffix=f" (event {decision['id']})")
         for decision in decisions
     ]))
-    sections.append(("Warnings", [_line(warning) for warning in warnings]))
+    sections.append(("Warnings", [_line(clean(warning)) for warning in warnings[:BRIEF_WARNINGS]]))
     sections.append(("Protocol", list(PROTOCOL)))
     return sections
 
@@ -193,21 +224,29 @@ def build_brief(
         raise ValueError(f"max_chars must be between {BRIEF_MIN_CHARS} and {BRIEF_MAX_CHARS}")
     now = now or datetime.now(timezone.utc)
     config = config_from_manifest(manifest)
+    if not config.db_path.exists():  # a fresh installation: nothing recorded, nothing created
+        text = _text([("", [FRAMING, "Nothing has been recorded in Chronicle yet."]), ("Protocol", list(PROTOCOL))])
+        return {"project": project, "project_source": "given" if project else "none", "text": text,
+                "counts": {"open_tasks": 0, "facts": 0, "decisions": 0, "warnings": 0},
+                "omitted": 0, "cut": False, "redactions": 0}
     with _read_only(config) as connection:
         resolved, how = resolve_project(connection, manifest, cwd=cwd, project=project)
         tasks = open_tasks(connection, project=resolved, limit=BRIEF_TASKS)
         facts = _facts(connection, resolved)
         decisions = _decisions(connection, resolved, now)
         warnings = _warnings(connection, now)
-    sections = _render(resolved, how, tasks, facts, decisions, warnings)
-    omitted = 0
-    # Over budget: drop the oldest items of the least urgent sections first.
-    for index in (3, 2, 1):
+    clean = _Cleaner()
+    sections = _render(resolved, how, tasks, facts, decisions, warnings, clean)
+    omitted = max(len(warnings) - BRIEF_WARNINGS, 0)
+    # Over budget: drop the oldest items of the least urgent sections first:
+    # decisions, facts, warnings, then tasks. Framing and protocol always stay.
+    for index in (3, 2, 4, 1):
         while len(_text(sections)) > max_chars and sections[index][1]:
             sections[index][1].pop()
             omitted += 1
     text = _text(sections)
-    if len(text) > max_chars:
+    cut = len(text) > max_chars  # only an extreme project slug gets here
+    if cut:
         text = text[: max_chars - 1] + "…"
     return {
         "project": resolved,
@@ -215,5 +254,7 @@ def build_brief(
         "text": text,
         "counts": {"open_tasks": len(tasks), "facts": len(facts), "decisions": len(decisions), "warnings": len(warnings)},
         "omitted": omitted,
+        "cut": cut,
+        "redactions": clean.redactions,
     }
 

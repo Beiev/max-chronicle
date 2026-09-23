@@ -114,6 +114,50 @@ def test_a_long_line_keeps_its_id(loaded_manifest) -> None:
     assert line.endswith(f"… (event {decision['id']})") and len(line) <= 2 + 220
 
 
+def test_a_secret_stored_before_the_filter_does_not_reach_the_brief(loaded_manifest) -> None:
+    key = "sk-" + "proj-" + "".join(["aB3dE", "fG7hJ", "kL9mN", "pQ2rS", "tU4vW", "xY6zA"]) * 2  # synthetic
+    decision = _record(loaded_manifest, "Rotated the API key", category="decision")
+    with open_connection(config_from_manifest(loaded_manifest)) as connection, connection:
+        connection.execute("UPDATE events SET text = ? WHERE id = ?", (f"Rotated the API key {key}", decision["id"]))
+
+    brief = _brief(loaded_manifest)
+
+    assert key not in brief["text"] and "[REDACTED:" in brief["text"] and brief["redactions"] == 1
+
+
+def test_a_fact_shows_its_task_and_an_assumption_says_so(loaded_manifest) -> None:
+    _record(loaded_manifest, "Live target", project="alpha", task_id="live",
+            fact={"slot": "deploy.target", "value": "production", "kind": "observed"})
+    _record(loaded_manifest, "Preview target", project="alpha", task_id="preview",
+            fact={"slot": "deploy.target", "value": "staging", "kind": "assumption"})
+
+    lines = [line for line in _brief(loaded_manifest, project="alpha")["text"].splitlines() if "deploy.target" in line]
+
+    assert any(line.startswith("- deploy.target = production [task live] (fact ") for line in lines)
+    assert any(line.startswith("- deploy.target = staging [task preview, assumption] (fact ") for line in lines)
+
+
+def test_a_replaced_decision_does_not_come_back(loaded_manifest) -> None:
+    first = _record(loaded_manifest, "Deploy to production", project="alpha", category="decision",
+                    fact={"slot": "deploy.target", "value": "production", "kind": "decision"})
+    _record(loaded_manifest, "Deploy to staging instead", project="alpha", category="decision",
+            fact={"slot": "deploy.target", "value": "staging", "kind": "decision", "supersedes": first["fact_id"]})
+
+    text = _brief(loaded_manifest, project="alpha")["text"]
+
+    assert "deploy.target = staging" in text
+    assert "production" not in text
+
+
+def test_a_long_task_id_stays_whole(loaded_manifest) -> None:
+    project, task = "p" * 120, "t" * 120
+    _checkpoint(loaded_manifest, project, task, "A goal " * 40)
+
+    line = next(line for line in _brief(loaded_manifest)["text"].splitlines() if line.startswith(f"- {project}/{task} "))
+
+    assert line.endswith("…")
+
+
 # ---------------------------------------------------------------------------
 # Budget
 # ---------------------------------------------------------------------------
@@ -129,6 +173,22 @@ def test_over_budget_the_oldest_decisions_go_first(loaded_manifest) -> None:
     assert len(brief["text"]) <= 1500 and brief["omitted"] > 0
     assert "Move storage to SQLite" in brief["text"]  # tasks outrank decisions
     assert "Decision number 7" in brief["text"] and "Decision number 0" not in brief["text"]
+
+
+def test_many_warnings_never_cut_the_protocol(loaded_manifest) -> None:
+    from max_chronicle.brief import PROTOCOL
+
+    with open_connection(config_from_manifest(loaded_manifest)) as connection, connection:
+        for n in range(10):
+            connection.execute(
+                "INSERT INTO automation_runs(id, job_name, started_at_utc, status) VALUES (?, ?, ?, 'failed')",
+                (f"run-{n}", f"job-{n}-" + "x" * 80, "2026-09-24T05:00:00Z"),
+            )
+
+    brief = _brief(loaded_manifest, max_chars=1000)
+
+    assert all(line in brief["text"] for line in PROTOCOL)
+    assert brief["omitted"] > 0 and brief["cut"] is False and len(brief["text"]) <= 1000
 
 
 @pytest.mark.parametrize("max_chars", [999, 8001])
@@ -159,6 +219,8 @@ def test_the_project_comes_from_a_given_slug_a_root_or_the_directory_name(loaded
         assert resolve(cwd=str(tmp_path / "Projects" / "ALPHA")) == ("alpha", "directory")
         # A parent's generic name does not claim the directories below it.
         assert resolve(cwd=str(tmp_path / "Projects" / "unknown-repo")) == (None, "none")
+        # `..` is resolved before any comparison: this is `other`, not `repo`.
+        assert resolve(cwd=str(tmp_path / "work" / "repo" / ".." / "other")) == ("wide", "root")
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +229,26 @@ def test_the_project_comes_from_a_given_slug_a_root_or_the_directory_name(loaded
 
 
 def test_the_brief_connection_cannot_write(loaded_manifest) -> None:
+    _record(loaded_manifest, "Some decision", category="decision")
     with _read_only(config_from_manifest(loaded_manifest)) as connection:
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             connection.execute("DELETE FROM events")
+
+
+def test_the_brief_never_creates_or_converts_the_database(loaded_manifest) -> None:
+    config = config_from_manifest(loaded_manifest)
+    assert not config.db_path.exists()
+
+    fresh = _brief(loaded_manifest)
+
+    assert not config.db_path.exists()
+    assert fresh["text"].startswith(FRAMING) and "Nothing has been recorded" in fresh["text"]
+    _record(loaded_manifest, "Some decision", category="decision")
+    with sqlite3.connect(config.db_path) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+    _brief(loaded_manifest)
+    with sqlite3.connect(config.db_path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
 
 @pytest.mark.parametrize(
@@ -221,3 +300,17 @@ def test_startup_in_brief_mode_returns_the_brief_and_unlocks_writes(chronicle_sa
     assert started["brief"].startswith(FRAMING) and started["project"] == "alpha"
     assert "task_context" not in started
     assert written["chronicle_status"] == "stored"
+
+
+def test_a_brief_start_binds_the_agent_like_a_full_start(chronicle_sandbox) -> None:
+    async def exercise() -> tuple[dict, dict]:
+        server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
+        started = await server.call_tool("startup_bundle", {"agent": "agent-a", "mode": "brief"})
+        written = await server.call_tool("record_event", {"text": "Recorded without naming the agent"})
+        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else result)[0].text)
+        return decode(started), decode(written)
+
+    started, written = asyncio.run(exercise())
+
+    assert started["agent"] == "agent-a" and started["session_id"]
+    assert written["agent"] == "agent-a"
