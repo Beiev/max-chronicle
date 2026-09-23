@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import mimetypes
-import re
 import shutil
 import sqlite3
 import tempfile
@@ -19,26 +18,49 @@ from zoneinfo import ZoneInfo
 
 from .config import (
     DEFAULT_MEM0_COLLECTION,
+    ENV_CHRONICLE_AUTO_MIGRATE,
     ChronicleConfig,
     default_config,
     ensure_runtime_dirs,
+    feature_enabled,
 )
-from .db import apply_migrations, connect, utc_now
+from .db import (
+    APPLICATION_ID,
+    SchemaMigrationRequired,
+    SchemaPreparation,
+    check_schema_policy,
+    connect,
+    ensure_schema,
+    read_schema_state,
+    schema_target_version,
+    utc_now,
+)
+from .lexical import covers, query_terms, relaxed_query, strict_query
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
+RELAXED_CANDIDATE_FACTOR = 5  # relaxed FTS rows read per page, per result wanted
+RELAXED_MAX_PAGES = 4  # a relaxed search reads at most this many pages
 DEFAULT_STALE_RUN_TTL_HOURS = 6
 STALE_RUN_STATUS = "stale_failed"
 
-# Per-process memo of DB paths whose migrations were already applied in this
-# interpreter. apply_migrations is idempotent but runs a table scan + glob on
-# every call; skipping it on subsequent connects reclaims most of the overhead
-# that the long-lived MCP daemon pays on each tool invocation.
-_MIGRATIONS_APPLIED: set[Path] = set()
+# Per-process cache of each migrations directory's target version. Every
+# connection still confirms its database is current with one PRAGMA, so a
+# file swapped underneath a long-lived process (a restore, another checkout)
+# is caught on its next connection instead of being trusted from memory.
+_TARGET_VERSIONS: dict[Path, int] = {}
 
 
 def reset_migration_cache() -> None:
-    _MIGRATIONS_APPLIED.clear()
+    _TARGET_VERSIONS.clear()
+
+
+def target_schema_version(config: ChronicleConfig) -> int:
+    target = _TARGET_VERSIONS.get(config.migrations_dir)
+    if target is None:
+        target = schema_target_version(config)
+        _TARGET_VERSIONS[config.migrations_dir] = target
+    return target
 
 
 def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
@@ -100,19 +122,97 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
     return config
 
 
+_READ_ONLY_PROCESS = False
+
+
+def set_read_only_process(enabled: bool) -> None:
+    """Open every later connection of this process read-only (a read-only server).
+
+    Such a process never creates, initialises, upgrades, or writes a database:
+    a missing or outdated one is an error, and a write raises.
+    """
+    global _READ_ONLY_PROCESS
+    _READ_ONLY_PROCESS = enabled
+
+
+_SCHEMA_PROBE = (
+    "SELECT user_version, application_id, EXISTS ("
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ") FROM pragma_user_version, pragma_application_id"
+)
+
+
 @contextmanager
 def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
     # Yields a scoped connection and closes it on exit. sqlite3.Connection's own
     # `__exit__` only commits/rollbacks — without this wrapper, `with open_connection(...)`
     # leaked ~10MB of page cache + prepared statements per call, compounding inside
     # the long-lived MCP daemon. Callers still wrap in `with connection:` for a txn.
+    if _READ_ONLY_PROCESS:
+        if not config.db_path.exists():
+            raise SchemaMigrationRequired(
+                f"No database at {config.db_path}; a read-only server never creates one."
+            )
+        connection = connect(config.db_path, read_only=True)
+    else:
+        ensure_runtime_dirs(config)
+        connection = connect(config.db_path)
+    try:
+        current, application_id, has_history_table = connection.execute(_SCHEMA_PROBE).fetchone()
+        current_schema = (
+            current == target_schema_version(config)
+            and application_id in (0, APPLICATION_ID)
+            and has_history_table
+            # An empty history is no history: any file can hold such a table.
+            and connection.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations)").fetchone()[0]
+        )
+        if not current_schema:
+            if _READ_ONLY_PROCESS:
+                check_schema_policy(
+                    read_schema_state(connection, config), config, allow_upgrade=False, allow_init=False
+                )
+            else:
+                # A new database initialises here; anything else that is not
+                # current raises unless CHRONICLE_AUTO_MIGRATE opts back in.
+                ensure_schema(
+                    connection,
+                    config,
+                    allow_upgrade=feature_enabled(ENV_CHRONICLE_AUTO_MIGRATE, default=False),
+                )
+        yield connection
+    finally:
+        connection.close()
+
+
+def prepare_database(
+    config: ChronicleConfig,
+    *,
+    allow_upgrade: bool,
+    read_only: bool = False,
+) -> SchemaPreparation:
+    """Check, initialise or upgrade the schema up front (server start).
+
+    Upgrading an existing database takes an online backup first. A read-only
+    caller never creates or changes a database: a missing, empty or outdated
+    one is an error it reports instead of quietly serving an empty store.
+    """
+    if read_only:
+        if not config.db_path.exists():
+            raise SchemaMigrationRequired(
+                f"No database at {config.db_path}; a read-only server never creates one. "
+                "Run `chronicle migrate` first."
+            )
+        connection = connect(config.db_path, read_only=True)
+        try:
+            state = read_schema_state(connection, config)
+        finally:
+            connection.close()
+        check_schema_policy(state, config, allow_upgrade=False, allow_init=False)
+        return SchemaPreparation(state_before=state, applied=(), backup_path=None)
     ensure_runtime_dirs(config)
     connection = connect(config.db_path)
     try:
-        if config.db_path not in _MIGRATIONS_APPLIED:
-            apply_migrations(connection, config)
-            _MIGRATIONS_APPLIED.add(config.db_path)
-        yield connection
+        return ensure_schema(connection, config, allow_upgrade=allow_upgrade)
     finally:
         connection.close()
 
@@ -281,6 +381,16 @@ def _retire_stale_curation_run(
     )
 
 
+def _supersede_curation_run(connection: sqlite3.Connection, row: sqlite3.Row, *, marked_at_utc: str) -> None:
+    """Keep a finished run as history and free its run_key for a regeneration."""
+    payload = _load_json(row["payload_json"])
+    payload["superseded"] = {"at_utc": marked_at_utc, "original_run_key": row["run_key"]}
+    connection.execute(
+        "UPDATE curation_runs SET run_key = ?, payload_json = ? WHERE id = ?",
+        (f"{row['run_key']}:superseded:{row['id']}", _json(payload), row["id"]),
+    )
+
+
 def to_local_iso(timestamp: str, timezone_name: str) -> str:
     local_tz = ZoneInfo(timezone_name)
     return _parse_iso(timestamp).astimezone(local_tz).isoformat(timespec="seconds")
@@ -319,15 +429,9 @@ def _project_from_entity_id(entity_id: str | None) -> str | None:
     return entity_id.split(":", 1)[1]
 
 
-def _fts_query(query: str) -> str:
-    tokens = [
-        token.replace('"', '""')
-        for token in re.findall(r"[A-Za-zА-Яа-я0-9$+._-]+", query.casefold())
-        if len(token) >= 2
-    ]
-    if not tokens:
-        return '""'
-    return " AND ".join(f'"{token}"' for token in tokens)
+def _fts_query(query: str, *, relaxed: bool = False) -> str:
+    terms = query_terms(query)
+    return relaxed_query(terms) if relaxed else strict_query(terms)
 
 
 def _ensure_entity(
@@ -1661,50 +1765,69 @@ def search_events(
     project: str | None = None,
     task_id: str | None = None,
     current_only: bool = False,
+    relaxed: bool = False,
 ) -> list[dict[str, Any]]:
+    """Rank events matching every query term, or with ``relaxed``, most of them by stem.
+
+    A relaxed match is re-checked for coverage, and BM25 can rank a row holding
+    one rare term above rows holding most terms, so relaxed rows are read page
+    by page until ``limit`` rows pass or ``RELAXED_MAX_PAGES`` pages are read.
+    """
     resolved_visibility = _normalize_event_visibility(visibility)
-    fts_query = _fts_query(query)
+    fts_query = _fts_query(query, relaxed=relaxed)
+    terms = query_terms(query)
+    page_size = limit * RELAXED_CANDIDATE_FACTOR if relaxed else limit
+    kept: list[sqlite3.Row] = []
     with open_connection(config) as connection:
-        rows = connection.execute(
-            """
-            SELECT
-                e.id,
-                e.occurred_at_utc,
-                e.actor,
-                e.category,
-                e.entity_id,
-                e.text,
-                e.why,
-                e.circumstances,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at,
-                bm25(events_fts) AS rank
-            FROM events_fts
-            JOIN events AS e
-                ON e.id = events_fts.event_id
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
-            WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
-              AND events_fts MATCH ?
-              AND """ + _event_domain_where_clause("e") + """
-              AND (? IS NULL OR e.title = ?)
-              AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
-              AND (? = 0 OR NOT EXISTS (SELECT 1 FROM facts f
-                  WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
-                  OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
-                      AND json_extract(obs.payload_json,'$.fact_id')=f.id))))
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (resolved_visibility, fts_query, domain, domain, domain,
-             project, project, task_id, task_id, current_only, limit),
-        ).fetchall()
-    return [_event_row_to_entry(row) for row in rows]
+        if relaxed:
+            connection.execute("BEGIN")  # every page reads one snapshot, so offsets hold
+        for page in range(RELAXED_MAX_PAGES if relaxed else 1):
+            rows = connection.execute(
+                """
+                SELECT
+                    e.id,
+                    e.occurred_at_utc,
+                    e.actor,
+                    e.category,
+                    e.entity_id,
+                    e.text,
+                    e.why,
+                    e.circumstances,
+                    e.mem0_status,
+                    e.mem0_error,
+                    e.payload_json,
+                    o.status AS outbox_status,
+                    o.last_error AS outbox_last_error,
+                    o.payload_json AS outbox_payload_json,
+                    o.synced_at_utc AS outbox_synced_at,
+                    bm25(events_fts) AS rank
+                FROM events_fts
+                JOIN events AS e
+                    ON e.id = events_fts.event_id
+                LEFT JOIN mem0_outbox AS o
+                    ON o.event_id = e.id AND o.operation = 'add'
+                WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
+                  AND events_fts MATCH ?
+                  AND """ + _event_domain_where_clause("e") + """
+                  AND (? IS NULL OR e.title = ?)
+                  AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
+                  AND (? = 0 OR NOT EXISTS (SELECT 1 FROM facts f
+                      WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
+                      OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
+                          AND json_extract(obs.payload_json,'$.fact_id')=f.id))))
+                ORDER BY rank, e.id
+                LIMIT ? OFFSET ?
+                """,
+                (resolved_visibility, fts_query, domain, domain, domain,
+                 project, project, task_id, task_id, current_only, page_size, page * page_size),
+            ).fetchall()
+            if not relaxed:
+                kept = rows
+                break
+            kept += [row for row in rows if covers(terms, " ".join(filter(None, (row["text"], row["why"]))))]
+            if len(kept) >= limit or len(rows) < page_size:
+                break
+    return [_event_row_to_entry(row) for row in kept[:limit]]
 
 
 def search_fact_events(
@@ -1760,8 +1883,12 @@ def fetch_events_between(
     domain: str | None = None,
     limit: int = 500,
     visibility: str = "default",
+    exclude_source_kinds: tuple[str, ...] = (),
+    newest: bool = False,
 ) -> list[dict[str, Any]]:
+    """Events in a window, oldest first; with ``newest``, the latest ``limit`` of them."""
     resolved_visibility = _normalize_event_visibility(visibility)
+    excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
     with open_connection(config) as connection:
         rows = connection.execute(
             """
@@ -1787,13 +1914,56 @@ def fetch_events_between(
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?
-              AND """ + _event_domain_where_clause("e") + """
-            ORDER BY e.occurred_at_utc ASC
+              AND """ + _event_domain_where_clause("e") + excluded_sql + """
+            ORDER BY e.occurred_at_utc """ + ("DESC" if newest else "ASC") + """
             LIMIT ?
             """,
-            (resolved_visibility, start_utc, end_utc, domain, domain, domain, limit),
+            (resolved_visibility, start_utc, end_utc, domain, domain, domain, *excluded_params, limit),
         ).fetchall()
-    return [_event_row_to_entry(row) for row in rows]
+    entries = [_event_row_to_entry(row) for row in rows]
+    return entries[::-1] if newest else entries
+
+
+def _source_kind_exclusion(source_kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    if not source_kinds:
+        return "", ()
+    placeholders = ", ".join("?" for _ in source_kinds)
+    return f"\n              AND COALESCE(e.source_kind, '') NOT IN ({placeholders})", tuple(source_kinds)
+
+
+def fingerprint_events_between(
+    config: ChronicleConfig,
+    *,
+    start_utc: str,
+    end_utc: str,
+    exclude_source_kinds: tuple[str, ...] = (),
+) -> tuple[int, str]:
+    """Count and sha256 of every visible event in a window, with no row limit.
+
+    A change signal that also moves when an event is edited, hidden or swapped
+    for another while the count stays the same.
+    """
+    excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
+    digest = hashlib.sha256()
+    count = 0
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            """
+            SELECT e.id, e.category, e.text, e.why
+            FROM events AS e
+            WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
+              AND e.occurred_at_utc >= ?
+              AND e.occurred_at_utc <= ?""" + excluded_sql + """
+            ORDER BY e.occurred_at_utc ASC, e.id ASC
+            """,
+            (start_utc, end_utc, *excluded_params),
+        )
+        for row in rows:
+            count += 1
+            # JSON keeps field boundaries and NULL apart from "" unambiguous.
+            fields = [row["id"], row["category"], row["text"], row["why"]]
+            digest.update(json.dumps(fields, ensure_ascii=False).encode("utf-8") + b"\n")
+    return count, digest.hexdigest()
 
 
 def start_ingest_run(
@@ -2707,11 +2877,20 @@ def start_curation_run(
     prompt_sha256: str | None = None,
     payload: dict[str, Any] | None = None,
     stale_ttl_hours: float | int = DEFAULT_STALE_RUN_TTL_HOURS,
+    supersede_finished: bool = False,
 ) -> tuple[str, bool]:
+    """Claim the (curation_type, run_key) lease for a new run.
+
+    A finished run normally keeps the key, so a repeat is a no-op. With
+    supersede_finished the finished row stays as history under a moved key
+    and a new run starts; a live running row still blocks.
+    """
     run_id = str(uuid.uuid4())
     started_at = utc_now()
     started_dt = _parse_iso(started_at)
-    with open_connection(config) as connection, connection:
+    # Read-then-write under the write lock: two claimers of one key serialise,
+    # and the second sees the first's running row instead of racing its INSERT.
+    with write_transaction(config) as connection:
         existing = connection.execute(
             """
             SELECT id, status, run_key, started_at_utc, payload_json
@@ -2743,6 +2922,8 @@ def start_curation_run(
                     reason="stale_failed row retired before new run",
                     move_run_key=True,
                 )
+            elif supersede_finished:
+                _supersede_curation_run(connection, existing, marked_at_utc=started_at)
             else:
                 return existing["id"], False
         connection.execute(

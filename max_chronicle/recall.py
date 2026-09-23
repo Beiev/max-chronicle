@@ -49,16 +49,22 @@ def query_memory(
     eligible = {row["id"]: row for row in pool}
     errors: dict[str, str] = {}
     fts: dict[str, int] = {}
+    relaxed = False
     try:
-        hits = search_events(
-            config, query=query, limit=max(limit * 4, 40), current_only=True, **scope
-        )
+        wanted = max(limit * 4, 40)
+        hits = search_events(config, query=query, limit=wanted, current_only=True, **scope)
+        fact_hits = search_fact_events(config, query=query, limit=wanted, **scope)
+        if not any(hit["id"] in eligible for hit in hits) and not any(e in eligible for e in fact_hits):
+            # No event or fact in scope holds every term: accept events whose
+            # stems cover most of them, and say so, since such a match is
+            # weaker (FR-2). A hit outside the pool, such as a fact recorded
+            # after the pool was read, is not evidence here either.
+            hits = search_events(config, query=query, limit=wanted, current_only=True, relaxed=True, **scope)
+            relaxed = any(hit["id"] in eligible for hit in hits)
         fts = {
             hit["id"]: rank for rank, hit in enumerate(hits) if hit["id"] in eligible
         }
-        for rank, event_id in enumerate(
-            search_fact_events(config, query=query, limit=max(limit * 4, 40), **scope)
-        ):
+        for rank, event_id in enumerate(fact_hits):
             if event_id in eligible:
                 fts[event_id] = min(fts.get(event_id, rank), rank)
     except Exception as exc:
@@ -170,6 +176,7 @@ def query_memory(
         "query": query,
         **scope,
         "results": results,
+        "relaxed": relaxed,
         "channels_used": channels,
         "degraded": bool(errors),
         "channel_errors": errors,

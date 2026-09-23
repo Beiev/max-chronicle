@@ -118,9 +118,10 @@ MCP configuration uses an absolute installed command and workspace path:
 
 Use your client's equivalent configuration format. Stdio starts with the client
 and does not require a separately running HTTP service. For supervised HTTP, use
-`chronicle-mcp --transport streamable-http`; `MCP_HOST`/`MCP_PORT` set its address.
-`GET /health` checks service and database availability; `sources_audit` and startup
-source health describe freshness. These are different checks.
+`chronicle-mcp --transport streamable-http --migrate`; `MCP_HOST`/`MCP_PORT` set its address.
+`GET /health` checks service and database availability and names the database,
+manifest, schema version and installed code path that answered; `sources_audit` and
+startup source health describe freshness. These are different checks.
 
 | Tool | Purpose |
 | --- | --- |
@@ -142,7 +143,12 @@ can separately report `side_effect_errors` for failed evidence/projection output
 
 ## Recall and durability
 
-- **Lexical:** SQLite FTS5/BM25 over event text and explicit current fact values.
+- **Lexical:** SQLite FTS5/BM25 over event text and why, and over explicit
+  current fact values. Queries drop function words (English, Russian,
+  Ukrainian) but keep negations, keep every Unicode letter, and fold ё into е on
+  both sides. Evidence must contain every remaining term; when no event or fact
+  does, recall retries with word stems, keeps only events holding two thirds of
+  the terms, and returns `relaxed: true` because that match is weaker.
 - **Vector:** optional Ollama `nomic-embed-text` index. Model, dimension, scope,
   and visibility are checked before ranking. `vector_coverage` discloses gaps;
   `chronicle embed-backfill` repairs missing/incompatible index rows.
@@ -153,10 +159,44 @@ can separately report `side_effect_errors` for failed evidence/projection output
   on your own corpus; cosine and reciprocal-rank scores are not confidence values.
 - **Writes:** SQLite WAL with full commit synchronization; events, observations,
   facts, and evidence links commit together.
+- **Schema changes:** an empty database initialises on first use. An existing one is
+  never upgraded as a side effect of connecting: run `chronicle migrate` or start the
+  server with `chronicle-mcp --migrate`; both take an online backup
+  (`chronicle.db.bak-premigrate-…`) under the same write lock as the upgrade. Without
+  `--migrate` a server refuses to start on an outdated schema (exit code 3), and a
+  read-only server never creates or changes a database. A database newer than the installed code, or
+  another application's SQLite file, is refused. After installing a release with new
+  migrations, migrate before scheduled jobs run: until then they exit with code 3.
+  `CHRONICLE_AUTO_MIGRATE=1` restores upgrade-on-connect for the CLI and library;
+  a server upgrades only with `--migrate`. `CHRONICLE_REQUIRE_ROOT=1`
+  makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
+  instead of falling back to `~/.max-chronicle`.
+- **Read-only servers:** SQLite reads a WAL database through its `-wal` and `-shm`
+  files, so even a read-only server creates them when they are missing. Next to a
+  live writer they already exist. To serve a copy from a read-only directory,
+  switch the copy to `PRAGMA journal_mode = DELETE` first.
 - **Backups:** independent artifact copies, content-hash inventory, database
   integrity checks, and verification after relocation. Legacy backups disclose
   incomplete inventory coverage. Choose a separate backup device for disk failure.
   Explicitly purged artifacts are counted separately; they are not claimed as restorable.
+
+### Measuring recall
+
+`chronicle eval --golden questions.jsonl` asks each question through recall and
+scores the ranking: hit@1/5/10, recall@5 and MRR@10 on answerable questions,
+abstention on questions memory cannot answer, stale-over-current ordering on
+knowledge updates, and latency percentiles, overall and per category and language.
+
+```json
+{"id": "why-sqlite", "query": "why did we pick SQLite", "category": "rationale", "lang": "en", "expected": ["event:<id>"], "scope": {"project": "demo"}}
+{"id": "db-now", "query": "current database", "category": "knowledge_update", "expected": ["event:<new>"], "stale": ["event:<old>"]}
+{"id": "unknown", "query": "office wifi password", "category": "abstention", "expected": []}
+```
+
+Categories follow LongMemEval: `fact`, `rationale`, `knowledge_update`, `temporal`,
+`handoff`, `abstention`. `--json` prints the full report, `--out` saves it, and
+`--fail-under hit@5=0.6` exits 1 below a floor. The test suite runs a synthetic
+bilingual set (`tests/fixtures/eval/`) and pins which cases lexical recall passes.
 
 ## CLI
 
@@ -167,6 +207,7 @@ chronicle record "Ready for review" --project demo --task-id ship \
   --checkpoint-file checkpoint.json --request-id handoff-1
 chronicle startup --project demo --task-id ship --focus "Continue review" --format json
 chronicle query-memory "local storage" --project demo --task-id ship --format json
+chronicle eval --golden questions.jsonl --out results/baseline.json
 chronicle timeline --at "2026-09-15T12:00:00Z"
 chronicle backup --force
 ```
