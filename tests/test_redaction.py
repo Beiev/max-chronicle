@@ -91,6 +91,11 @@ def test_values_assigned_to_secret_names_are_redacted(text: str) -> None:
         "tokenizer=bert-base-uncased",
         "passwordless request " + _random(40),
         "keyboardShortcuts" + _random(40),
+        "https://example.com/?token=abc&project=chronicle",
+        '{"max_tokens": 100, "id": "chatcmpl-' + _random(29) + '"}',
+        '{"usage": {"prompt_tokens": 12}, "id": "' + _random(40) + '"}',
+        "token_count: 1532, request " + _random(40),
+        "publicKey " + _random(40),
     ],
 )
 def test_references_and_ordinary_words_stay(text: str) -> None:
@@ -136,6 +141,7 @@ def test_a_random_token_is_redacted_only_where_the_line_speaks_of_secrets() -> N
         "wan22_i2v_720p_turbo_10steps_v3_final",  # slug
         "lighthouse-batch8-production-lessons",  # slug of long words
         "harbor-nightlyRenderQueue-2026-08-31",  # slug with a camel-case part
+        "release-PyQt6-Qt6-OpenGL-ES3-migration",  # branch with acronyms
         "Byzantine_stone_tablet_final_20260915.png",  # file name
     ],
 )
@@ -202,8 +208,26 @@ def test_basic_credentials_are_redacted(credential: str) -> None:
         ("AWS_SESSION_TOKEN=" + _random(792, ALNUM + "+/"), "assigned_secret"),
         ("ey" + "J" + _random(20) + ".ey" + "J" + _random(10_000) + "." + _random(43), "jwt"),
         ("postgres://app:" + _random(1) + "@db.local/main", "url_password"),
+        ("WAVESPEED_TOKEN " + _random(40), "high_entropy"),
+        ("key: " + base64.urlsafe_b64encode(random.Random(8).randbytes(900)).decode(), "labelled_key"),
+        ("key: " + base64.b32encode(random.Random(9).randbytes(320)).decode(), "labelled_key"),
+        ("key: " + "-".join(_random(5, string.ascii_uppercase + string.digits) for _ in range(5)), "labelled_key"),
+        ("key: ABCDEFG2-HIJKLMN3-OPQRSTU4-VWXYZ567", "labelled_key"),
     ],
-    ids=["name-joined-cue", "labelled", "camel-case", "wide-json", "long-session-token", "large-jwt", "short-password"],
+    ids=[
+        "name-joined-cue",
+        "labelled",
+        "camel-case",
+        "wide-json",
+        "long-session-token",
+        "large-jwt",
+        "short-password",
+        "provider-token-name",
+        "long-labelled-key",
+        "base32-key",
+        "license-key",
+        "capital-groups",
+    ],
 )
 def test_secrets_in_less_common_shapes_are_redacted(text: str, kind: str) -> None:
     result = redact(text)
@@ -213,12 +237,22 @@ def test_secrets_in_less_common_shapes_are_redacted(text: str, kind: str) -> Non
 
 @pytest.mark.parametrize(
     "alphabet",
-    [string.ascii_lowercase + string.digits, string.ascii_uppercase + string.digits, ALNUM, ALNUM + "-_"],
-    ids=["lower-digits", "upper-digits", "alnum", "url-safe"],
+    [
+        string.ascii_lowercase + string.digits,
+        string.ascii_uppercase + string.digits,
+        string.ascii_uppercase + "234567",
+        ALNUM,
+        ALNUM + "-_",
+    ],
+    ids=["lower-digits", "upper-digits", "base32", "alnum", "url-safe"],
 )
 def test_random_keys_of_any_alphabet_are_redacted_near_a_cue(alphabet: str) -> None:
     rng = random.Random(len(alphabet))
-    keys = ["".join(rng.choice(alphabet) for _ in range(length)) for length in (32, 40, 48, 64) for _ in range(100)]
+    keys = [
+        "".join(rng.choice(alphabet) for _ in range(length))
+        for length in (32, 40, 48, 64, 128, 256)
+        for _ in range(100)
+    ]
 
     missed = [key for key in keys if key in redact(f"token {key}").text]
 
@@ -394,6 +428,17 @@ def test_files_that_redact_alike_keep_their_own_provenance(loaded_manifest, tmp_
     assert len({row["sha256"] for row in rows}) == 1  # both notes redact to the same bytes
     provenance = {row["source_path"]: json.loads(row["metadata_json"])["source_sha256"] for row in rows}
     assert provenance == {str(note): hashlib.sha256(note.read_bytes()).hexdigest() for note in notes}
+
+
+def test_a_long_source_name_still_fits_the_archive(loaded_manifest, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CHRONICLE_FEATURE_EVENT_EMBEDDINGS", "0")
+    note = tmp_path / ("pod-access-notes-" + "x" * 180 + ".md")
+    note.write_text("RunPod API key: " + "rp" + "a_" + _random(40) + "\n", encoding="utf-8")
+
+    receipt = service.record_event(loaded_manifest, {"agent": "agent-a", "text": "Documented a pod", "source_files": [str(note)]})
+
+    [evidence] = receipt["evidence"]
+    assert evidence["status"] == "archived" and evidence["redactions"] == {"runpod_key": 1}
 
 
 def test_encoded_blobs_are_archived_unchanged(loaded_manifest, tmp_path, monkeypatch) -> None:

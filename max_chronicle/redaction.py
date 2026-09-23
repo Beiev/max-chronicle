@@ -34,6 +34,7 @@ ENTROPY_MIN_LENGTH = 32
 # random key falls further about once in a thousand draws. Identifiers that mix
 # words and digits often stay within it too, which is why a cue must be near.
 ENTROPY_MAX_SHORTFALL = 3.0
+ENTROPY_MIN_ALPHABET = 16  # a narrower alphabet is a pattern (ab12ab12...), not a key
 # A short line is one note: a cue anywhere in it covers every token. On a longer
 # line (a JSON log, a minified file) only the text around each cue is examined.
 ENTROPY_WHOLE_LINE_LENGTH = 2000
@@ -83,7 +84,9 @@ _SECRET_WORD = (
     r"(?:api[_\-]?key|access[_\-]?key|secret(?:[_\-]?key)?|token|passw(?:or)?d|pwd|private[_\-]?key|credentials?)"
 )
 _ASSIGN = r"[\"']?[ \t]{0,64}[:=][ \t]{0,64}[\"']?"
-_VALUE = r"(?P<value>[^\s\"'`,;<>(){}\[\]\\]{1,%d})" % VALUE_MAX_LENGTH
+# "&" belongs to a value (a password may hold one) unless a "name=" follows it,
+# which starts the next parameter of a query string.
+_VALUE = r"(?P<value>(?:[^\s\"'`,;<>(){}\[\]\\&]|&(?![A-Za-z0-9_.\-]{1,64}=)){1,%d})" % VALUE_MAX_LENGTH
 # In a URL query or fragment a value ends at "&"; anywhere else "&" is part of it.
 _QUERY_PARAM = re.compile(
     r"(?i)(?<=[?&#])[A-Za-z0-9_.\-]{0,64}?"
@@ -113,20 +116,29 @@ _TOKEN = re.compile(
     r"(?<![A-Za-z0-9_\-+])(?<![Ss][Hh][Aa]256:)(?<![Ss][Hh][Aa]512:)[A-Za-z0-9_\-+]{%d,}={0,2}" % ENTROPY_MIN_LENGTH
 )
 _HEX = re.compile(r"[0-9a-fA-F\-]+")
-# Parts of a slug or file name: a short word or number, or a longer word, camel
-# case included, with digits on one side only (batch8, 720p, SeriesB, chromeProfile).
-_SLUG_SHORT_PART = re.compile(r"[a-z0-9]{1,5}|[A-Z0-9]{1,5}|[A-Z][a-z0-9]{1,4}")
-_SLUG_WORD = re.compile(r"[a-z]+[0-9]*|[0-9]+[a-z]*|[A-Z]?[a-z]+(?:[A-Z][a-z]+)*[A-Z]?[0-9]*|[A-Z]+[0-9]*|[0-9]+[A-Z]+")
+# Parts of a slug or file name: up to three characters (v3, i2v, ES3), a number,
+# a word with digits on one side (batch8, 720p), an acronym (IMG, GPU2), or camel
+# case (nightlyRenderQueue, PyQt6, OpenGL). A group of a license key (7K3QX) or
+# a long run of capitals (ABCDEFG2) is none of these.
+_SLUG_SHORT_PART = re.compile(r"[a-z0-9]{1,3}|[A-Z0-9]{1,3}|[A-Z][a-z0-9]{1,2}")
+_SLUG_WORD = re.compile(
+    r"[0-9]+|[a-z]+[0-9]*|[0-9]+[a-z]+|[A-Z]{2,5}[0-9]*|[A-Z]?[a-z]+(?:[A-Z][a-z]+)*(?:[A-Z]{1,2})?[0-9]*"
+)
 # Anchored at a run start, so each run is scanned once.
 _BLOB = re.compile(r"(?<![A-Za-z0-9+/=_\-])[A-Za-z0-9+/=_\-]{%d,}" % (ENTROPY_MAX_TOKEN_LENGTH + 1))
 # Words that make a random-looking token nearby likely a credential. English
-# cues stand apart from base64 characters, where "key" or "token" occur by chance;
-# "_" and "-" may join them to a name (ACCESS_TOKEN), and camel case counts too.
+# cues stand apart from base64 characters, where "key" or "token" occur by chance.
+# A name may end in one (GITHUB_TOKEN, DB_PASSWORD, apiKey); a plural joined to
+# another word counts things (max_tokens), and nothing may follow a cue (token_count).
+# Camel case counts too, but not a bare "Key": publicKey or primaryKey is no secret.
 _SECRET_CUE = re.compile(
     r"(?i)(?<![A-Za-z0-9+/=])"
-    r"(?:api[\s_\-]?keys?|access[\s_\-]?keys?|tokens?|secrets?|passw(?:or)?ds?|pwd|credentials?|bearer)"
-    r"(?![A-Za-z0-9+/=])"
-    r"|(?-i:(?<=[a-z])(?:Token|Secret|Password|Key)(?![a-z]))"
+    r"(?:(?:api|access|secret|private)[\s_\-]?key|token|secret|passw(?:or)?d|pwd|credential|bearer)"
+    r"(?![A-Za-z0-9+/=_\-])"
+    r"|(?<![A-Za-z0-9+/=_\-])"
+    r"(?:(?:api|access)[\s_\-]?keys|tokens|secrets|passw(?:or)?ds|credentials)"
+    r"(?![A-Za-z0-9+/=_\-])"
+    r"|(?-i:(?<=[a-z])(?:Token|Secret|Password)(?![a-z]))"
     # Russian nouns with their case endings; "ключевой" (main, adj.) is no cue.
     r"|(?<!\w)(?:ключ(?:а|у|ом|е|и|ей|ам|ами|ах)?|токен\w{0,3}|парол[ьяюеи]\w{0,2}|секрет(?:а|у|ом|е|ы|ов|ами|ах)?)(?!\w)"
 )
@@ -164,7 +176,7 @@ def redact(text: str) -> Redaction:
     text = _replace_group(_QUERY_PARAM, text, "assigned_secret", mark, check=_plausible_assigned_value)
     text = _replace_group(_ASSIGNED, text, "assigned_secret", mark, check=_plausible_assigned_value)
     text = _replace_group(_ASSIGNED_CAMEL, text, "assigned_secret", mark, check=_plausible_assigned_value)
-    text = _replace_group(_KEY_LABEL, text, "labelled_key", mark, check=_high_entropy)
+    text = _replace_group(_KEY_LABEL, text, "labelled_key", mark, check=_labelled_value)
     text = _replace_group(_BEARER, text, "bearer_token", mark, check=_not_a_marker)
     text = _replace_group(_BASIC, text, "basic_credential", mark, check=_basic_credential)
     text = _replace_group(_URL_PASSWORD, text, "url_password", mark, check=_not_a_marker)
@@ -241,13 +253,23 @@ def _plausible_assigned_value(value: str) -> bool:
     return classes >= 2
 
 
-def _high_entropy(token: str) -> bool:
+def _labelled_value(value: str) -> bool:
+    """A value right after "key": random-looking, and it may be long."""
+    return _high_entropy(value, max_length=VALUE_MAX_LENGTH)
+
+
+def _high_entropy(token: str, *, max_length: int = ENTROPY_MAX_TOKEN_LENGTH) -> bool:
     token = token.rstrip("=")
-    if not ENTROPY_MIN_LENGTH // 2 <= len(token) <= ENTROPY_MAX_TOKEN_LENGTH or _HEX.fullmatch(token):
+    if not ENTROPY_MIN_LENGTH // 2 <= len(token) <= max_length or _HEX.fullmatch(token):
         return False
     if not re.search(r"[A-Za-z]", token) or not re.search(r"[0-9]", token) or _slug(token):
         return False
     alphabet = sum(size for pattern, size in _CHARACTER_CLASSES if re.search(pattern, token))
+    distinct = len(set(token))
+    # A long random token shows nearly all of its alphabet, which may be narrower
+    # than its character classes: base32 is A-Z and 2-7, not every digit.
+    if len(token) >= 2 * alphabet and ENTROPY_MIN_ALPHABET <= distinct < alphabet:
+        alphabet = distinct
     shortfall = _random_entropy(len(token), alphabet) - _shannon_bits(token)
     return shortfall * math.sqrt(len(token)) <= ENTROPY_MAX_SHORTFALL
 
@@ -263,7 +285,7 @@ def _shannon_bits(token: str) -> float:
     return -sum(n / total * math.log2(n / total) for n in Counter(token).values())
 
 
-@functools.lru_cache(maxsize=4096)
+@functools.lru_cache(maxsize=16384)
 def _random_entropy(length: int, alphabet: int) -> float:
     """Expected Shannon entropy, in bits, of a uniformly random token.
 

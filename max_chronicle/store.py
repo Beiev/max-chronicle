@@ -27,6 +27,8 @@ from .redaction import redact
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
+STORED_NAME_MAX_BYTES = 230  # of an archived file name; its temp file adds about 15
+STORED_EXTENSION_MAX_BYTES = 16  # a longer "extension" is part of the name
 DEFAULT_STALE_RUN_TTL_HOURS = 6
 STALE_RUN_STATUS = "stale_failed"
 
@@ -1146,6 +1148,22 @@ def _ensure_bytes_at_path(path: Path, content: bytes, *, sha256: str) -> None:
     _atomic_write_bytes(path, content)
 
 
+def _stored_name(prefix: str, source_name: str) -> str:
+    """``prefix-source_name``, shortened to fit a file name with its temp suffix.
+
+    File names are limited to 255 bytes, and the atomic write adds about 15; a
+    long source name keeps its start and its extension.
+    """
+    budget = STORED_NAME_MAX_BYTES - len(prefix.encode("utf-8")) - 1
+    encoded = source_name.encode("utf-8")
+    if len(encoded) <= budget:
+        return f"{prefix}-{source_name}"
+    extension = Path(source_name).suffix.encode("utf-8")
+    extension = extension if len(extension) <= STORED_EXTENSION_MAX_BYTES else b""
+    head = encoded[: budget - len(extension)].decode("utf-8", errors="ignore")
+    return f"{prefix}-{head}{extension.decode('utf-8')}"
+
+
 def _archive_source(
     source_path: Path,
     *,
@@ -1172,8 +1190,8 @@ def _archive_source(
     sha256 = hashlib.sha256(content).hexdigest()
     # Different files can redact to the same bytes; naming a redacted copy after
     # its source as well keeps each source's row, path, and hash apart.
-    name = source_path.name if content is raw else f"{source_sha256[:16]}-{source_path.name}"
-    storage_path = artifact_dir / artifact_type / sha256[:2] / sha256[2:4] / f"{sha256}-{name}"
+    prefix = sha256 if content is raw else f"{sha256}-{source_sha256[:16]}"
+    storage_path = artifact_dir / artifact_type / sha256[:2] / sha256[2:4] / _stored_name(prefix, source_path.name)
     _ensure_bytes_at_path(storage_path, content, sha256=sha256)
     if content is not raw:
         metadata["source_sha256"] = source_sha256
