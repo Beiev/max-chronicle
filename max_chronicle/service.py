@@ -1630,7 +1630,9 @@ def build_startup_bundle(
     if focus:
         recall = query_memory(manifest, query=focus, domain=domain_id, project=project,
                               task_id=task_id, limit=limit)
-        recall_status = {key: recall[key] for key in ("degraded", "channel_errors", "vector_coverage")}
+        recall_status = {key: recall[key] for key in (
+            "degraded", "channel_errors", "vector_coverage", "relaxed", "no_confident_match", "hint",
+        ) if key in recall}
         recent_events = [event for hit in recall["results"]
                          if (event := fetch_event(config, event_id=hit["event_id"])) is not None]
         if not (project or task_id):

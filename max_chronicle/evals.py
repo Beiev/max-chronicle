@@ -197,6 +197,8 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
             1 / d["first_hit_rank"] if _ranked_within(d, MRR_DEPTH) else 0.0 for d in answerable
         )
         metrics["empty_on_answerable"] = _mean(not d["ranked"] for d in answerable)
+        # The cost of abstaining: answerable questions called unconfident or empty.
+        metrics["abstained_on_answerable"] = _mean(d["abstained"] for d in answerable)
     if unanswerable:
         metrics["abstention_accuracy"] = _mean(d["abstained"] for d in unanswerable)
     updates = [d for d in details if "update_correct" in d]
@@ -252,6 +254,11 @@ def build_report(details: list[dict[str, Any]], *, golden_path: Path | None = No
             "vector_min_similarity": float(
                 os.environ.get("CHRONICLE_VECTOR_MIN_SIMILARITY") or active_profile().min_similarity
             ),
+            "vector_confident_similarity": (
+                float(os.environ["CHRONICLE_VECTOR_CONFIDENT_SIMILARITY"])
+                if os.environ.get("CHRONICLE_VECTOR_CONFIDENT_SIMILARITY", "").strip()
+                else active_profile().confident_similarity
+            ),
         },
         "overall": summarize(details),
         "by_category": _grouped(details, "category"),
@@ -296,7 +303,8 @@ def format_report(report: Mapping[str, Any]) -> str:
     lines = [
         f"Chronicle eval {report['version']}: {report['golden']['cases']} cases, "
         f"embed model {report['settings']['embed_model']}, "
-        f"degraded {_cell(report['overall']['degraded_rate'])}",
+        f"degraded {_cell(report['overall']['degraded_rate'])}, "
+        f"abstained on answerable {_cell(report['overall'].get('abstained_on_answerable'))}",
         "",
     ]
     lines += ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in table]

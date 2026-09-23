@@ -45,6 +45,9 @@ class EmbeddingProfile:
     # Cosine floor for a candidate found by the vector channel alone. Similarity
     # scales differ by model, so each profile carries its own.
     min_similarity: float = 0.65
+    # Cosine at which a vector match is confident evidence (FR-2), or None when
+    # this model's similarity does not tell relevant from unrelated text.
+    confident_similarity: float | None = None
 
 
 # Qwen3-Embedding is instruction-aware on the query side; documents are raw.
@@ -52,12 +55,18 @@ _QWEN3_QUERY = (
     "Instruct: Given a question about past work, decisions and events, "
     "retrieve the memory entries that answer it\nQuery:"
 )
+# Floors were measured with `chronicle eval` on 64 real questions (54 answerable,
+# 10 that memory cannot answer). qwen3-embedding:0.6b: ranking peaks at a 0.45-0.50
+# floor; 0.60 flags 8 of 10 unanswerable questions and 15 of 54 answerable ones
+# as unconfident. nomic-embed-text: its top similarity does not separate the two
+# groups at all (AUC 0.50), so only a lexical match makes it confident.
 PROFILES = {
     profile.model: profile
     for profile in (
         # Multilingual (Russian, Ukrainian, English), 32K context, 1024 dimensions.
         EmbeddingProfile(key="qwen3-embedding:0.6b", model="qwen3-embedding:0.6b", query_prefix=_QWEN3_QUERY,
-                         min_similarity=0.5),
+                         min_similarity=0.5, confident_similarity=0.6),
+        # Not yet measured: calibrate both floors with `chronicle eval` before relying on it.
         EmbeddingProfile(key="qwen3-embedding:4b", model="qwen3-embedding:4b", query_prefix=_QWEN3_QUERY,
                          min_similarity=0.5),
         # English only; kept so an existing index stays usable. Its vectors were
