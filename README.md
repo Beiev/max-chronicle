@@ -131,9 +131,51 @@ and does not require a separately running HTTP service. For supervised HTTP, use
 manifest, schema version and installed code path that answered; `sources_audit` and
 startup source health describe freshness. These are different checks.
 
+### Session brief
+
+`GET /brief` returns a compact read-only brief (FR-12) that a new session reads
+first:
+- open tasks with their latest checkpoint;
+- current facts;
+- decisions from the last 14 days, each with its id;
+- freshness and failed-job warnings;
+- a three-line protocol.
+
+It opens by saying it is data, not instructions. The brief reads through a
+`query_only` connection and answers in milliseconds. It refuses any request that
+carries an `Origin` header or a `Host` outside loopback, so a web page cannot
+read it. Parameters:
+- `cwd`: the working directory;
+- `project`: a project slug that overrides `cwd`;
+- `budget`: 1,000 to 8,000 characters, 6,000 by default;
+- `format=json`: return JSON instead of plain text.
+
+The project comes from `project`, from a configured root that holds `cwd`, or
+from the name of `cwd` itself when that name is a known project. Parent
+directories are not searched, so pass a repository's top level:
+
+```toml
+# SSOT_MANIFEST.toml
+[[projects]]
+id = "atlas"
+roots = ["~/code/atlas", "~/code/atlas-worktrees"]
+```
+
+A session-start hook prints the brief and stays silent when the server is down:
+
+```sh
+dir=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+curl -fsS -m 2 --get --data-urlencode "cwd=$dir" http://127.0.0.1:8093/brief 2>/dev/null || true
+```
+
+Claude Code and Codex add a SessionStart hook's plain standard output to the
+session context; Claude Code keeps up to 10,000 characters, above the brief's
+maximum. Without HTTP, `chronicle brief --cwd DIR` prints the same text. An MCP client can call `startup_bundle(mode="brief")`, which also unlocks
+writes, or read the resource `chronicle://brief/{project}`.
+
 | Tool | Purpose |
 | --- | --- |
-| `startup_bundle` | Task context, checkpoint, current facts, change cursor; unlock writes. |
+| `startup_bundle` | Task context, checkpoint, current facts, change cursor; unlock writes. `mode="brief"`: only the brief. |
 | `query_memory` | Scoped lexical/vector recall with provenance and coverage. |
 | `query_context` | Broader search through source documents and optional Mem0 dump. |
 | `recent_events` | Recent event history. |

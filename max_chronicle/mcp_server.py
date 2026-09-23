@@ -16,19 +16,21 @@ from typing import Annotated, Any, Callable, Literal
 
 import anyio
 import anyio.to_thread
+import re
 from anyio.lowlevel import RunVar
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from . import __version__
 
 from .config import EXIT_CONFIG_ERROR, EXIT_SCHEMA_ACTION, ChronicleConfigError, default_manifest_path
 from .db import MigrationError
 from .runtime_context import load_manifest, load_manifest_cached, parse_when
+from .brief import BRIEF_DEFAULT_CHARS, build_brief
 from .service import (
     DEFAULT_QUERY_MODE,
     add_entity_alias_service,
@@ -83,6 +85,14 @@ AGENT_ARG = Annotated[str, Field(description=(
 ))]
 OPTIONAL_TITLE_ARG = Annotated[str | None, Field(description="Optional snapshot title.")]
 OPTIONAL_FOCUS_ARG = Annotated[str | None, Field(description="Optional focus string.")]
+STARTUP_MODE_ARG = Annotated[
+    Literal["bundle", "brief"],
+    Field(description="bundle: the full startup bundle; brief: only the compact memory brief (FR-12), cheaper."),
+]
+BRIEF_TIMEOUT_S = 2.0  # a session-start hook waits for this, so it must stay short
+# /brief is for processes on this machine. A browser page must not read it: its
+# fetch always sends Origin, and DNS rebinding arrives with a foreign Host (O4).
+_LOOPBACK_HOST = re.compile(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?")
 CAPTURE_ARG = Annotated[
     bool,
     Field(description="Capture a fresh runtime snapshot before building the bundle."),
@@ -478,6 +488,35 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             payload["error"] = error
         return JSONResponse(payload, status_code=200 if db_ok else 503)
 
+    @server.custom_route("/brief", methods=["GET"])
+    async def route_brief(request: Request):
+        if "origin" in request.headers or not _LOOPBACK_HOST.fullmatch(request.headers.get("host", "")):
+            return PlainTextResponse("Forbidden\n", status_code=403)
+        params = request.query_params
+        try:
+            budget = int(params.get("budget", BRIEF_DEFAULT_CHARS))
+            with anyio.fail_after(BRIEF_TIMEOUT_S):
+                brief = await anyio.to_thread.run_sync(
+                    lambda: build_brief(manifest(), cwd=params.get("cwd"), project=params.get("project"),
+                                        max_chars=budget),
+                    abandon_on_cancel=True,
+                )
+        except ValueError as exc:
+            return PlainTextResponse(f"{exc}\n", status_code=400)
+        except Exception as exc:  # noqa: BLE001 — a waiting hook gets an answer, never a hang
+            return PlainTextResponse(f"Brief unavailable: {type(exc).__name__}\n", status_code=503)
+        if params.get("format") == "json":
+            return JSONResponse(brief)
+        return PlainTextResponse(brief["text"])
+
+    @register_resource(
+        "chronicle://brief/{project}",
+        title="Project Memory Brief",
+        description="Compact read-only memory brief for a project: open tasks, current facts, recent decisions, warnings.",
+    )
+    def resource_brief(project: str) -> str:
+        return build_brief(manifest(), project=project)["text"]
+
     @register_resource(
         "chronicle://attach/current",
         title="Current Attach Bundle",
@@ -579,6 +618,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "(domain state, recent durable events, freshness audit) and unlocks the chronicler "
             "write surface for this session. With project and task_id, task_context holds that "
             "task's checkpoint to resume; without task_id it lists open_tasks instead. "
+            "mode='brief' returns only the compact memory brief. "
             "Does not mutate Chronicle unless capture=true."
         ),
     )
@@ -594,8 +634,15 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         task_id: TASK_ARG = None,
         since: CURSOR_ARG = None,
         before: BEFORE_ARG = None,
+        mode: STARTUP_MODE_ARG = "bundle",
         ctx: Context | None = None,
     ) -> dict:
+        if mode == "brief":
+            brief = build_brief(manifest(), project=project)
+            payload = {"brief": brief["text"], "project": brief["project"], "counts": brief["counts"]}
+            payload.update(session_identity(ctx, agent))
+            unlock_startup_gate(ctx)
+            return payload
         effective_capture = capture if profile == CHRONICLER_PROFILE else False
         payload = build_startup_bundle(
             manifest(),

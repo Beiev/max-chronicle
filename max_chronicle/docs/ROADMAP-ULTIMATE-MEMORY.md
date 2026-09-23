@@ -197,8 +197,8 @@ Given an event whose text and evidence file hold a synthetic key, when it
 ## API Contracts
 
 MCP uses `POST /mcp`; liveness uses `GET /health`, which also reports
-`db_path`, `schema_version`, and `target_schema_version` (FR-9). The planned
-brief is `GET /brief?cwd=&agent=&budget=` (FR-12). Existing tools remain. Startup and recall gain optional `project` and `task_id`;
+`db_path`, `schema_version`, and `target_schema_version` (FR-9). The brief is
+`GET /brief?cwd=&project=&budget=&format=` (FR-12). Existing tools remain. Startup and recall gain optional `project` and `task_id`;
 startup also gains `since`. Recording gains optional `request_id`, `session_id`,
 `task_id`, `checkpoint`, and `fact`. Validation uses the existing error envelope.
 
@@ -267,5 +267,5 @@ interface Receipt {
 | FR-9, FR-13 | 0.11.0 |
 | FR-11 | Events, evidence files, generated text artifacts: 0.11.0. Snapshots, imports, Mem0 responses, notes: planned |
 | FR-10 | Planned: note index |
-| FR-12, NFR-4 | Planned: brief and session hooks |
+| FR-12, NFR-4 | Brief (`GET /brief`, `chronicle brief`, `startup_bundle(mode="brief")`, `chronicle://brief/{project}`): 0.12.0; p95 12 ms on a live-size database. Session hooks are operator configuration. |
 | FR-14 | Planned: identity registry |
