@@ -2,15 +2,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import subprocess
 import textwrap
 
 import pytest
 
+# Hermetic by construction: variables exported by an operator's shell must
+# never aim a test (or a CLI subprocess inheriting this environment) at a real
+# workspace. Drop them before max_chronicle is imported, because the config
+# module resolves its defaults at import time. Tests that need them set them
+# explicitly via monkeypatch or a subprocess env.
+for _name in (
+    "CHRONICLE_ROOT",
+    "CHRONICLE_MANIFEST",
+    "CHRONICLE_AUTOMATION_CONFIG",
+    "CHRONICLE_DB",
+    "CHRONICLE_REQUIRE_ROOT",
+    "CHRONICLE_AUTO_MIGRATE",
+):
+    os.environ.pop(_name, None)
+
 from max_chronicle.automation import load_automation_config
 from max_chronicle.runtime_context import load_manifest
-from max_chronicle.store import reset_migration_cache
+from max_chronicle.store import reset_migration_cache, set_read_only_process
 
 # Anchor on the checkout, not on one machine's absolute path.
 CHRONICLE_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "max_chronicle"
@@ -23,10 +39,27 @@ def _offline_embeddings(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_home_root(tmp_path_factory, monkeypatch):
+    """Keep the implicit ~/.max-chronicle fallback inside the test run."""
+    monkeypatch.setattr(
+        "max_chronicle.config.DEFAULT_HOME_ROOT",
+        tmp_path_factory.getbasetemp() / "max-chronicle-home",
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_migration_cache():
     reset_migration_cache()
     yield
     reset_migration_cache()
+
+
+@pytest.fixture(autouse=True)
+def _writable_process():
+    """A test that starts a read-only server must not leave this process read-only."""
+    set_read_only_process(False)
+    yield
+    set_read_only_process(False)
 
 
 @dataclass
