@@ -40,7 +40,8 @@ and measures retrieval before changing it.
   Tokenization MUST keep every letter of the supported languages inside its word,
   including Cyrillic ё, і, ї, є, ґ.
 - FR-3: Writes MUST preserve independent observations, actor/session/task identity,
-  and evidence. Request IDs MUST make retries idempotent and reject changed input.
+  and evidence. Request IDs MUST make retries idempotent and reject changed input,
+  compared after redaction (FR-11).
 - FR-4: Receipts MUST distinguish durable event success from missing/pointer-only
   evidence and failed derived output.
 - FR-5: Startup MUST accept project/task/focus and return relevant evidence,
@@ -53,11 +54,15 @@ and measures retrieval before changing it.
   verify archived content hashes and work without the original source workspace.
 - FR-8: Agent docs MUST describe the implemented contract. Built distributions MUST
   exclude personal data. Local health MUST distinguish availability from data health.
-- FR-9: Opening a database MUST NOT change its schema. An upgrade runs only by an
-  explicit command or a server started with `--migrate`, under the write lock and
-  after an online backup. A database newer than the code, a foreign SQLite file,
-  and duplicate migration numbers MUST be refused. Read-only profiles never create
-  or upgrade a database. Health MUST report the database path and schema version.
+- FR-9: Opening an existing database MUST NOT change its schema. An upgrade runs
+  only by an explicit command, a server started with `--migrate`, or a CLI or
+  library process that opts in with `CHRONICLE_AUTO_MIGRATE`; always under the
+  write lock and after an online backup. A missing database is initialised on
+  first use by a process that may write. A database newer than the code, another
+  application's SQLite file, and duplicate migration numbers MUST be refused. A
+  read-only server opens every connection read-only: it never creates,
+  initialises, upgrades, or writes a database. Health MUST report the database
+  path and schema version.
 - FR-10: Capture stays explicit: agents record events, checkpoints, and facts on
   purpose. Chronicle MAY index notes someone wrote on purpose (such as an agent's
   file memory) as documents and MUST NOT extract memories from transcripts with a
@@ -66,13 +71,15 @@ and measures retrieval before changing it.
   belongs to that project; any other note is global and ranks below project notes
   in a project-scoped query. Documents have no task or domain.
 - FR-11: A content-based secret filter MUST run before anything is stored,
-  indexed, or archived: event text, evidence files, and indexed notes. It redacts
+  indexed, or archived: event text, evidence files, generated text artifacts,
+  snapshots, imports, and indexed notes. It redacts
   likely credentials (known key prefixes, key/token/secret assignments,
   high-entropy strings, but not commit hashes or UUIDs) and reports how many it
   redacted. A secret MUST NOT reach derived output such as outboxes, dumps, or
   briefs.
 - FR-12: `GET /brief` MUST return a read-only startup brief of at most 8,000
-  characters: open checkpoints, current facts, recent decisions with their ids,
+  characters: open checkpoints (the latest checkpoint of each task in scope whose
+  `task.status` fact is not `completed` or `cancelled`), current facts, recent decisions with their ids,
   freshness and degradation warnings, and a three-line protocol, introduced as
   data rather than instructions. It MUST refuse any request that carries an
   `Origin` header or a host outside the loopback allowlist, and it MUST read
@@ -81,8 +88,8 @@ and measures retrieval before changing it.
   by hit@k, MRR@10, abstention, knowledge-update order, and latency; the public
   suite pins which synthetic cases lexical recall passes. Private golden sets and
   their reports stay outside the package.
-- FR-14: Agent, project (with aliases and roots), and domain names MUST come from
-  one registry, and every filter MUST resolve aliases through one scope function.
+- FR-14: Agent, project (with aliases and roots), task, and domain names MUST
+  come from one registry, and every filter MUST resolve aliases through one scope function.
   Stored history is not rewritten; writes keep the raw actor next to the
   canonical one, and cursors issued before the registry keep working.
 
@@ -170,8 +177,14 @@ Given a search change, when the suite runs, then any synthetic case it
   breaks fails the build, and any case it fixes must be added to the pinned set.
 ### AC-17: (FR-14)
 
-Given events written under several spellings of one agent, project, or
-  task, when filtering by any spelling, then all of them are found.
+Given events written under several spellings of one agent, project, task,
+  or domain, when filtering by any spelling, then all of them are found.
+### AC-18: (FR-11)
+
+Given an event whose text and evidence file hold a synthetic key, when it
+  is recorded, then no stored row, index, outbox, ledger, or archived copy holds
+  the key, the receipt counts the redaction, and redaction time stays linear in
+  the input.
 
 ## Edge Cases
 
@@ -189,8 +202,8 @@ brief is `GET /brief?cwd=&agent=&budget=` (FR-12). Existing tools remain. Startu
 startup also gains `since`. Recording gains optional `request_id`, `session_id`,
 `task_id`, `checkpoint`, and `fact`. Validation uses the existing error envelope.
 
-The CLI exits with 2 for a configuration error and 3 when the schema needs an
-explicit migration (FR-9). `chronicle eval --golden FILE` reads one JSON case per
+The CLI and the server exit with 2 when the workspace cannot be resolved (see
+`CHRONICLE_REQUIRE_ROOT`) and with 3 when the schema needs action (FR-9). `chronicle eval --golden FILE` reads one JSON case per
 line and exits 1 when a `--fail-under METRIC=FLOOR` is missed (FR-13):
 
 ```typescript
@@ -231,7 +244,7 @@ interface Receipt {
 | Cursor | Opaque continuation position bound to domain/project/task; includes new observations of old events |
 | Artifact | Existing hash and link; per-file receipt and verified backup inventory |
 | Document | Indexed note (FR-10): source path, content hash, project or global, tombstone; chunks carry document and section headings |
-| Embedding | Keyed by object and model key; the key names the model and its prompt prefixes, so two indexes can coexist during a model change |
+| Embedding | Planned: keyed by object and model key; the key names the model and its prompt prefixes, so two indexes can coexist during a model change (today one vector per event) |
 
 ## Out of Scope
 
@@ -250,8 +263,9 @@ interface Receipt {
 | Requirement | Status |
 | --- | --- |
 | FR-1 to FR-8, NFR-1 to NFR-3 | Implemented in 0.10.0. Recency is still an equal fusion channel. |
-| FR-2 v1.1 (Unicode tokens, relaxed match, `no_confident_match`) | Planned: search correctness |
+| FR-2 v1.1 | Unicode tokens, ё folding, flagged relaxed match: 0.11.0. `no_confident_match`: planned |
 | FR-9, FR-13 | 0.11.0 |
-| FR-10, FR-11 | Planned: note index; the filter ships before the brief |
+| FR-11 | Events, evidence files, generated text artifacts: 0.11.0. Snapshots, imports, Mem0 responses, notes: planned |
+| FR-10 | Planned: note index |
 | FR-12, NFR-4 | Planned: brief and session hooks |
 | FR-14 | Planned: identity registry |
