@@ -158,11 +158,12 @@ can separately report `side_effect_errors` for failed evidence/projection output
   never upgraded as a side effect of connecting: run `chronicle migrate` or start the
   server with `chronicle-mcp --migrate`; both take an online backup
   (`chronicle.db.bak-premigrate-…`) under the same write lock as the upgrade. Without
-  `--migrate` a server refuses to start on an outdated schema, and a read-only server
-  never creates or changes a database. A database newer than the installed code, or
+  `--migrate` a server refuses to start on an outdated schema (exit code 3), and a
+  read-only server never creates or changes a database. A database newer than the installed code, or
   another application's SQLite file, is refused. After installing a release with new
   migrations, migrate before scheduled jobs run: until then they exit with code 3.
-  `CHRONICLE_AUTO_MIGRATE=1` restores upgrade-on-connect. `CHRONICLE_REQUIRE_ROOT=1`
+  `CHRONICLE_AUTO_MIGRATE=1` restores upgrade-on-connect for the CLI and library;
+  a server upgrades only with `--migrate`. `CHRONICLE_REQUIRE_ROOT=1`
   makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
   instead of falling back to `~/.max-chronicle`.
 - **Backups:** independent artifact copies, content-hash inventory, database

@@ -13,6 +13,8 @@ from .bootstrap import bootstrap_legacy
 from .browse import render_browse_help, render_daybook, render_entity_timeline, render_recent_events, render_search_results
 from .config import (
     ENV_CHRONICLE_AUTO_MIGRATE,
+    EXIT_CONFIG_ERROR,
+    EXIT_SCHEMA_ACTION,
     ChronicleConfig,
     ChronicleConfigError,
     default_automation_path,
@@ -84,9 +86,6 @@ def _connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
 
 
 # Exit codes for errors an operator can act on without reading a traceback.
-EXIT_CONFIG_ERROR = 2  # which workspace to use is unclear (see CHRONICLE_REQUIRE_ROOT)
-EXIT_SCHEMA_ACTION = 3  # the schema needs `chronicle migrate`, or a newer release
-
 _STRICT_FAILURE_STATUSES = {"warn", "warning", "critical", "issues", "error", "failed", "failed_soft", "skipped"}
 
 

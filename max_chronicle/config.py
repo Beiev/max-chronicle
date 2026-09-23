@@ -22,8 +22,13 @@ ENV_CHRONICLE_TIMEZONE = "CHRONICLE_TIMEZONE"
 # resolving to the package checkout or ~/.max-chronicle.
 ENV_CHRONICLE_REQUIRE_ROOT = "CHRONICLE_REQUIRE_ROOT"
 # Opt back into upgrading an existing database's schema on first connect.
-# Off by default: upgrades run through `chronicle migrate` or server start.
+# Off by default: upgrades run through `chronicle migrate` or a server started
+# with `--migrate`. A server start ignores this variable; only the flag counts.
 ENV_CHRONICLE_AUTO_MIGRATE = "CHRONICLE_AUTO_MIGRATE"
+
+# Exit codes shared by `chronicle` and `chronicle-mcp`.
+EXIT_CONFIG_ERROR = 2  # which workspace to use is unclear (see CHRONICLE_REQUIRE_ROOT)
+EXIT_SCHEMA_ACTION = 3  # the schema needs `chronicle migrate`, or a newer release
 
 # v8 feature flags — toggle Phase 1 surfaces without editing code.
 ENV_FEATURE_ENTITY_ALIASES = "CHRONICLE_ENABLE_ENTITY_ALIASES"

@@ -26,6 +26,7 @@ from .config import (
     feature_enabled,
 )
 from .db import (
+    APPLICATION_ID,
     SchemaMigrationRequired,
     SchemaPreparation,
     check_schema_policy,
@@ -128,8 +129,10 @@ def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
     ensure_runtime_dirs(config)
     connection = connect(config.db_path)
     try:
-        current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if current != target_schema_version(config):
+        current, application_id = connection.execute(
+            "SELECT user_version, application_id FROM pragma_user_version, pragma_application_id"
+        ).fetchone()
+        if current != target_schema_version(config) or application_id not in (0, APPLICATION_ID):
             # A new database initialises here; an existing one that is behind
             # this code raises unless CHRONICLE_AUTO_MIGRATE opts back in.
             ensure_schema(
@@ -160,7 +163,7 @@ def prepare_database(
                 f"No database at {config.db_path}; a read-only server never creates one. "
                 "Run `chronicle migrate` first."
             )
-        connection = connect(config.db_path)
+        connection = connect(config.db_path, read_only=True)
         try:
             state = read_schema_state(connection, config)
         finally:

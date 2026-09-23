@@ -61,9 +61,7 @@ class SchemaState:
     @property
     def foreign(self) -> bool:
         """Some other application's database: objects without Chronicle history."""
-        if self.application_id not in (0, APPLICATION_ID):
-            return True
-        return not self.applied and self.has_objects
+        return _is_foreign(self.application_id, has_objects=self.has_objects, has_history=bool(self.applied))
 
     @property
     def pending(self) -> tuple[MigrationFile, ...]:
@@ -96,10 +94,47 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
+def _is_foreign(application_id: int, *, has_objects: bool, has_history: bool) -> bool:
+    if application_id not in (0, APPLICATION_ID):
+        return True
+    return has_objects and not has_history
+
+
+def _schema_markers(connection: sqlite3.Connection) -> tuple[int, bool, bool]:
+    """Application id, whether the file holds any object, whether it records a migration."""
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    has_objects = (
+        connection.execute("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1").fetchone()
+        is not None
+    )
+    has_history = (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        is not None
+        and connection.execute("SELECT 1 FROM schema_migrations LIMIT 1").fetchone() is not None
+    )
+    return application_id, has_objects, has_history
+
+
+def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    """Open a database, set up for concurrent use when it is new or Chronicle's.
+
+    A read-only connection, and any connection to another application's file
+    (refused by the schema check right after), leaves the file as found: no
+    auto_vacuum or journal-mode switch. Read-only connections also refuse writes.
+    """
+    if read_only and not db_path.exists():
+        raise FileNotFoundError(f"No database at {db_path}")
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 5000")
+    if read_only:
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+    application_id, has_objects, has_history = _schema_markers(connection)
+    if _is_foreign(application_id, has_objects=has_objects, has_history=has_history):
+        return connection
     # A brand-new database can pick its auto_vacuum mode for free; an existing
     # one needs a full VACUUM to flip it. INCREMENTAL lets maintenance reclaim
     # space with cheap non-exclusive incremental_vacuum steps instead of a full

@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse
 
 from . import __version__
 
-from .config import ChronicleConfigError, default_manifest_path
+from .config import EXIT_CONFIG_ERROR, EXIT_SCHEMA_ACTION, ChronicleConfigError, default_manifest_path
 from .db import MigrationError
 from .runtime_context import load_manifest, load_manifest_cached, parse_when
 from .service import (
@@ -1035,7 +1035,10 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         prepared = prepare_database(config, allow_upgrade=args.migrate and not read_only, read_only=read_only)
     except (ChronicleConfigError, MigrationError, sqlite3.Error, OSError, ValueError) as exc:
         _LOGGER.error("chronicle-mcp cannot start: %s: %s", type(exc).__name__, exc)
-        return 1
+        # The same exit codes as the CLI, so launchers and logs read them alike.
+        if isinstance(exc, ChronicleConfigError):
+            return EXIT_CONFIG_ERROR
+        return EXIT_SCHEMA_ACTION if isinstance(exc, MigrationError) else 1
     if prepared.applied:
         _LOGGER.warning(
             "chronicle-mcp migrated %s from v%d to v%d; backup=%s",

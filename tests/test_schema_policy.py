@@ -23,7 +23,14 @@ import pytest
 from max_chronicle import cli
 import max_chronicle.db as db_module
 import max_chronicle.mcp_server as mcp_server_module
-from max_chronicle.config import MIGRATIONS_DIR, ChronicleConfigError, default_config, resolve_status_root
+from max_chronicle.config import (
+    EXIT_CONFIG_ERROR,
+    EXIT_SCHEMA_ACTION,
+    MIGRATIONS_DIR,
+    ChronicleConfigError,
+    default_config,
+    resolve_status_root,
+)
 from max_chronicle.db import (
     MigrationError,
     SchemaAheadOfCode,
@@ -68,6 +75,17 @@ def _schema_version(db_path: Path) -> int:
 
 def _backups(db_path: Path) -> list[Path]:
     return sorted(db_path.parent.glob(f"{db_path.name}.bak-*"))
+
+
+def _journal_mode(db_path: Path) -> str:
+    with closing(sqlite3.connect(db_path)) as connection:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+
+
+def _in_rollback_journal_mode(db_path: Path) -> Path:
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+    return db_path
 
 
 def _run_cli(monkeypatch, capsys, *argv: str) -> tuple[int, dict]:
@@ -184,6 +202,7 @@ def test_another_applications_sqlite_file_is_left_untouched(tmp_path) -> None:
         connection.execute("CREATE TABLE notes(body TEXT)")
         connection.commit()
     config = _config(db_path)
+    size = db_path.stat().st_size
 
     with closing(connect(db_path)) as connection:
         with pytest.raises(MigrationError, match="not a Chronicle database"):
@@ -194,6 +213,22 @@ def test_another_applications_sqlite_file_is_left_untouched(tmp_path) -> None:
         application_id = connection.execute("PRAGMA application_id").fetchone()[0]
     assert tables == {"notes"}
     assert application_id == 0
+    assert _journal_mode(db_path) == "delete"  # connecting did not switch it to WAL
+    assert db_path.stat().st_size == size and not Path(f"{db_path}-wal").exists()
+
+
+def test_a_foreign_file_with_a_matching_version_is_refused(tmp_path) -> None:
+    db_path = tmp_path / "chronicle.db"
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE schema_migrations(version INTEGER, name TEXT, applied_at_utc TEXT)")
+        connection.execute("INSERT INTO schema_migrations VALUES (1, 'theirs', '2026-01-01T00:00:00Z')")
+        connection.execute(f"PRAGMA user_version = {LATEST_VERSION}")
+        connection.execute("PRAGMA application_id = 123")
+        connection.commit()
+
+    with pytest.raises(MigrationError, match="not a Chronicle database"):
+        with open_connection(_config(db_path)):
+            pass
 
 
 def test_a_swapped_older_file_is_caught_on_the_next_connection(tmp_path) -> None:
@@ -259,11 +294,18 @@ def test_read_only_start_never_creates_or_changes_a_database(tmp_path) -> None:
         prepare_database(missing, allow_upgrade=True, read_only=True)
     assert not missing.db_path.exists()
 
-    db_path = _older_database(tmp_path)
+    db_path = _in_rollback_journal_mode(_older_database(tmp_path))
     with pytest.raises(SchemaMigrationRequired):
         prepare_database(_config(db_path), allow_upgrade=True, read_only=True)
     assert _schema_version(db_path) == LATEST_VERSION - 1
     assert _backups(db_path) == []
+    assert _journal_mode(db_path) == "delete"
+
+    empty = tmp_path / "empty.db"
+    empty.touch()
+    with pytest.raises(SchemaMigrationRequired):
+        prepare_database(_config(empty), allow_upgrade=True, read_only=True)
+    assert empty.stat().st_size == 0 and not Path(f"{empty}-wal").exists()
 
 
 def _outdated_sandbox_database(chronicle_sandbox, tmp_path) -> Path:
@@ -280,7 +322,7 @@ def test_server_without_migrate_refuses_an_outdated_schema(chronicle_sandbox, tm
     with caplog.at_level(logging.ERROR, logger="max_chronicle.mcp"):
         exit_code = mcp_server_module._main()
 
-    assert exit_code == 1
+    assert exit_code == EXIT_SCHEMA_ACTION
     assert "SchemaMigrationRequired" in caplog.text
     assert "--migrate" in caplog.text
     assert _schema_version(db_path) == LATEST_VERSION - 1
@@ -301,7 +343,7 @@ def test_server_refuses_to_start_against_a_newer_schema(chronicle_sandbox, monke
     with caplog.at_level(logging.ERROR, logger="max_chronicle.mcp"):
         exit_code = mcp_server_module._main()
 
-    assert exit_code == 1
+    assert exit_code == EXIT_SCHEMA_ACTION
     assert "SchemaAheadOfCode" in caplog.text
 
 
@@ -313,6 +355,13 @@ def test_require_root_refuses_the_implicit_fallback(tmp_path, monkeypatch) -> No
     assert resolve_status_root(manifest_path=tmp_path / "SSOT_MANIFEST.toml") == tmp_path
     monkeypatch.setenv("CHRONICLE_ROOT", str(tmp_path))
     assert resolve_status_root() == tmp_path
+
+
+def test_a_server_without_a_workspace_exits_like_the_cli(monkeypatch) -> None:
+    monkeypatch.setenv("CHRONICLE_REQUIRE_ROOT", "1")
+    monkeypatch.setattr(sys, "argv", ["chronicle-mcp"])
+
+    assert mcp_server_module._main() == EXIT_CONFIG_ERROR
 
 
 def test_require_root_keeps_help_and_explicit_flags_working(tmp_path, monkeypatch, capsys) -> None:
