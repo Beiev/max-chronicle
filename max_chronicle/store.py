@@ -1771,7 +1771,9 @@ def fetch_events_between(
     limit: int = 500,
     visibility: str = "default",
     exclude_source_kinds: tuple[str, ...] = (),
+    newest: bool = False,
 ) -> list[dict[str, Any]]:
+    """Events in a window, oldest first; with ``newest``, the latest ``limit`` of them."""
     resolved_visibility = _normalize_event_visibility(visibility)
     excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
     with open_connection(config) as connection:
@@ -1800,12 +1802,13 @@ def fetch_events_between(
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?
               AND """ + _event_domain_where_clause("e") + excluded_sql + """
-            ORDER BY e.occurred_at_utc ASC
+            ORDER BY e.occurred_at_utc """ + ("DESC" if newest else "ASC") + """
             LIMIT ?
             """,
             (resolved_visibility, start_utc, end_utc, domain, domain, domain, *excluded_params, limit),
         ).fetchall()
-    return [_event_row_to_entry(row) for row in rows]
+    entries = [_event_row_to_entry(row) for row in rows]
+    return entries[::-1] if newest else entries
 
 
 def _source_kind_exclusion(source_kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:

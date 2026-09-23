@@ -150,7 +150,7 @@ def test_a_run_from_before_fingerprints_is_rewritten_once(loaded_manifest, loade
     assert settled["days"][DAY]["status"] == "existing"
 
 
-def test_a_day_past_the_render_limit_says_so(
+def test_a_day_past_the_read_limit_keeps_its_latest_events(
     loaded_manifest, loaded_automation, chronicle_sandbox, monkeypatch
 ) -> None:
     monkeypatch.setattr(native_automation, "DAYBOOK_EVENT_LIMIT", 2)
@@ -159,7 +159,41 @@ def test_a_day_past_the_render_limit_says_so(
 
     run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
 
-    assert "Showing the first 2 of 3 events" in _daybook_path(chronicle_sandbox, DAY).read_text(encoding="utf-8")
+    daybook = _daybook_path(chronicle_sandbox, DAY).read_text(encoding="utf-8")
+    assert "queue at 10:00" in daybook and "queue at 8:00" not in daybook
+    assert "The latest 2 of 3 events of the day." in daybook
+
+
+def test_a_busy_day_says_how_many_events_the_list_shows(
+    loaded_manifest, loaded_automation, chronicle_sandbox
+) -> None:
+    for minute in range(14):
+        _record(loaded_manifest, f"Processed batch {minute}.", f"2026-09-20T08:{minute:02d}:00Z")
+
+    run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
+
+    daybook = _daybook_path(chronicle_sandbox, DAY).read_text(encoding="utf-8")
+    assert "The latest 12 of 14 events of the day." in daybook
+    assert "Processed batch 13." in daybook and "Processed batch 1." not in daybook
+
+
+def test_a_skipped_day_that_still_has_a_file_is_cleared(
+    loaded_manifest, loaded_automation, chronicle_sandbox
+) -> None:
+    _record(loaded_manifest, "Pasted the staging password into the team chat.", "2026-09-20T08:00:00Z")
+    run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
+    _execute(
+        loaded_manifest,
+        "UPDATE events SET payload_json = json_set(COALESCE(payload_json, '{}'),"
+        " '$.memory_guard.visibility', 'raw_only')",
+    )
+    # A run recorded as skipped while the day's file stayed behind.
+    _execute(loaded_manifest, f"UPDATE curation_runs SET status = 'skipped' WHERE run_key = '{DAY}'")
+
+    result = run_daybook_catchup(loaded_manifest, loaded_automation, now=NEXT_EVENING)
+
+    assert result["days"][DAY]["status"] == "skipped"
+    assert "staging password" not in _daybook_path(chronicle_sandbox, DAY).read_text(encoding="utf-8")
 
 
 def test_hiding_every_event_of_a_day_clears_its_daybook(
