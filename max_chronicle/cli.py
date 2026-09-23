@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import math
 from pathlib import Path
 import sqlite3
 import sys
@@ -25,6 +26,7 @@ from .config import (
     resolve_status_root,
 )
 from .db import MigrationError, connect, database_summary, ensure_schema, read_schema_state
+from .evals import build_report, check_thresholds, format_report, load_golden, run_eval
 from .native_automation import (
     doctor_launchd,
     install_git_hooks,
@@ -753,6 +755,43 @@ def cmd_query_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+def _threshold(value: str) -> tuple[str, float]:
+    name, _, floor = value.partition("=")
+    try:
+        number = float(floor)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected METRIC=FLOOR, got {value!r}") from None
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"the floor must be a finite number, got {value!r}")
+    return name.strip(), number
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    if args.db is not None:
+        manifest = dict(manifest)
+        manifest["paths"] = dict(manifest["paths"])
+        manifest["paths"]["chronicle_db"] = str(args.db)
+    try:
+        cases = load_golden(args.golden)
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    report = build_report(run_eval(manifest, cases), golden_path=args.golden)
+    failures = check_thresholds(report, dict(args.fail_under))
+    report["thresholds"] = {"floors": dict(args.fail_under), "failures": failures}
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.json:
+        _print_json(report)
+    else:
+        print(format_report(report))
+        for failure in failures:
+            print(f"BELOW FLOOR {failure}")
+    return 1 if failures else 0
+
+
 def cmd_browse(args: argparse.Namespace) -> int:
     """Dispatcher for `chronicle browse` subcommands."""
     sub = getattr(args, "browse_command", None)
@@ -1095,6 +1134,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_query_memory.add_argument("--limit", type=int, default=10, help="Maximum results to return")
     p_query_memory.add_argument("--format", choices=["text", "json"], default="text")
     p_query_memory.set_defaults(handler=cmd_query_memory)
+
+    p_eval = sub.add_parser(
+        "eval",
+        help="Score recall against a golden question set (JSONL): hit@k, MRR, abstention, latency",
+    )
+    p_eval.add_argument("--golden", type=Path, required=True, help="Golden set, one JSON case per line")
+    p_eval.add_argument("--json", action="store_true", help="Print the full JSON report")
+    p_eval.add_argument("--out", type=Path, default=None, help="Also write the JSON report to this file")
+    p_eval.add_argument(
+        "--fail-under",
+        type=_threshold,
+        action="append",
+        default=[],
+        metavar="METRIC=FLOOR",
+        help="Exit 1 when an overall metric is below its floor, e.g. hit@5=0.6 (repeatable); "
+        "a failed query always exits 1",
+    )
+    p_eval.set_defaults(handler=cmd_eval)
 
     # ------------------------------------------------------------------
     # browse — human-facing navigation (read-only)
