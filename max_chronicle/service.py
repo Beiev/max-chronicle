@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import unicodedata
 from typing import Any
@@ -1643,7 +1644,9 @@ def build_startup_bundle(
     if focus:
         recall = query_memory(manifest, query=focus, domain=domain_id, project=project,
                               task_id=task_id, limit=limit)
-        recall_status = {key: recall[key] for key in ("degraded", "channel_errors", "vector_coverage")}
+        recall_status = {key: recall[key] for key in (
+            "degraded", "channel_errors", "vector_coverage", "relaxed", "no_confident_match", "hint",
+        ) if key in recall}
         recent_events = [event for hit in recall["results"]
                          if (event := fetch_event(config, event_id=hit["event_id"])) is not None]
         if not (project or task_id):
@@ -2153,24 +2156,25 @@ def record_event(
     )
 
     # Best-effort embedding, computed BEFORE the write transaction — the
-    # Ollama call can take seconds and must not hold the write lock. The row
-    # itself lands inside the same transaction as the event below, so an
-    # event either commits with its embedding or without one (never a
-    # dangling embedding). Failure MUST NOT surface to the caller; the flag
-    # (default ON) lets tests opt out via the env var.
+    # Ollama call can take seconds and must not hold the write lock. The vector
+    # is written after the event commits, in its own transaction; if that
+    # fails, the event stays without one until embed-backfill repairs it.
+    # Failure MUST NOT surface to the caller; the flag (default ON) lets tests
+    # opt out via the env var.
     embedding_vec: list[float] | None = None
     embed_model: str | None = None
     embed_dim: int | None = None
     if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
         try:
-            from .embeddings import embed_text as _embed_text_default, event_embedding_text, EMBED_DIM, EMBED_MODEL
+            from .embeddings import active_profile, embed_document, event_embedding_text
             # _embed_fn_override is popped from entry before normalization
             # so it never reaches payload_json.
-            _embed_fn = _embed_fn_override or _embed_text_default
+            _embed_fn = _embed_fn_override or embed_document
             embed_input = event_embedding_text(normalized_entry)
             if embed_input:
                 embedding_vec = _embed_fn(embed_input)
-                embed_model, embed_dim = EMBED_MODEL, EMBED_DIM
+                if embedding_vec is not None:
+                    embed_model, embed_dim = active_profile().key, len(embedding_vec)
         except Exception:  # noqa: BLE001
             embedding_vec = None  # embedding is non-critical
 
@@ -2196,10 +2200,10 @@ def record_event(
             else:
                 evidence.append({"path": str(path), "status": "missing" if not path.is_file() else "skipped"})
 
-    # One BEGIN IMMEDIATE transaction for dedup lookup + event + embedding +
-    # artifacts + links: a crash mid-way can no longer leave a half-recorded
-    # event, and the up-front write lock avoids the deferred-BEGIN upgrade
-    # deadlock that bypasses busy_timeout.
+    # One BEGIN IMMEDIATE transaction for dedup lookup + event + artifacts +
+    # links: a crash mid-way can no longer leave a half-recorded event, and the
+    # up-front write lock avoids the deferred-BEGIN upgrade deadlock that
+    # bypasses busy_timeout. The vector is written after it commits.
     artifacts_written = 0
     with write_transaction(config) as connection:
         prior_request = request_receipt(connection, normalized_entry)
@@ -2223,15 +2227,6 @@ def record_event(
         if existing:
             stored["dedupe_status"] = "exact_duplicate" if dedupe else "content_hash_match"
             stored["dedupe_window_hours"] = dedupe_window_hours if dedupe else hash_dedup_window
-        if embedding_vec is not None and embed_model is not None and embed_dim is not None:
-            store_event_embedding(
-                config,
-                stored["id"],
-                embedding_vec,
-                embed_model,
-                embed_dim,
-                connection=connection,
-            )
         for staged in staged_artifacts:
             staged["observed_at"] = stored["recorded_at"]
             staged["metadata"]["event_id"] = stored["id"]
@@ -2251,6 +2246,17 @@ def record_event(
             )
             artifacts_written += 1
         observation = record_observation(connection, normalized_entry, stored["id"], evidence)
+    if embedding_vec is not None and embed_model is not None and embed_dim is not None:
+        # A vector is an index entry, not part of the record. Written in its own
+        # transaction, no failure of it can lose the event, not even one that
+        # makes SQLite roll back a whole transaction (a full disk); embed-backfill
+        # repairs the gap.
+        # Insert only: replacing a vector is embed-backfill's job, and a capture
+        # racing a backfill must not put back a vector of a stale dimension.
+        try:
+            store_event_embedding(config, stored["id"], embedding_vec, embed_model, embed_dim, replace=False)
+        except (ValueError, sqlite3.Error):
+            pass
     stored["observation_id"] = observation["observation_id"]
     stored["fact_id"] = observation["fact_id"]
     stored["evidence"] = evidence
@@ -3373,17 +3379,29 @@ def embed_backfill(
     *,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Embed all events that lack an embedding row.
+    """Embed every event the active profile's index lacks.
 
-    Returns counts: {embedded, skipped, failed}.
-    Best-effort — individual failures do not abort the run.
+    Returns counts: {embedded, skipped, failed}, the index's model key, and the
+    model's dimension (None while the backend is unavailable).
+    Best-effort — individual failures do not abort the run, but an unavailable
+    backend (the dimension probe fails) ends it at once with backend_unavailable.
     """
-    from .embeddings import embed_text, event_embedding_text, EMBED_DIM, EMBED_MODEL
+    from .embeddings import BACKFILL_TIMEOUT_S, DIMENSION_PROBE_TEXT, active_profile, embed_document, event_embedding_text
 
     config = _config(manifest)
-    event_ids = fetch_event_ids_without_embedding(config)
+    model_key = active_profile().key
+    # The model's current dimension: a stored vector of another one (the model
+    # behind the key changed) is replaced. Unknown while the backend is down.
+    probe = embed_document(DIMENSION_PROBE_TEXT, timeout=BACKFILL_TIMEOUT_S)
+    dim = len(probe) if probe is not None else None
+    event_ids = fetch_event_ids_without_embedding(config, model_key=model_key, dim=dim)
     if limit is not None:
         event_ids = event_ids[:limit]
+    if probe is None:
+        # The backend is down or hung: calling it once per event would only
+        # repeat the timeout. Nothing was embedded; the next run retries.
+        return {"model_key": model_key, "dim": None, "total_without_embedding": len(event_ids),
+                "embedded": 0, "skipped": 0, "failed": len(event_ids), "backend_unavailable": True}
 
     embedded = 0
     skipped = 0
@@ -3399,18 +3417,21 @@ def embed_backfill(
             if not embed_input:
                 skipped += 1
                 continue
-            vec = embed_text(embed_input)
+            vec = embed_document(embed_input, timeout=BACKFILL_TIMEOUT_S)
             if vec is None:
                 failed += 1
                 continue
-            store_event_embedding(config, event_id, vec, EMBED_MODEL, EMBED_DIM)
+            store_event_embedding(config, event_id, vec, model_key, len(vec))
             embedded += 1
         except Exception:  # noqa: BLE001
             failed += 1
 
     return {
+        "model_key": model_key,
+        "dim": dim,
         "total_without_embedding": len(event_ids),
         "embedded": embedded,
         "skipped": skipped,
         "failed": failed,
+        "backend_unavailable": False,
     }

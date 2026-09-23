@@ -324,7 +324,7 @@ def _schema_template() -> str:
 - normalized_entities
 - event_observations (agent identity, request receipts, checkpoints)
 - facts / episodes / fact_observations / fact_supersessions
-- event_embeddings (optional local vector index)
+- event_vectors (optional local vector index, one per embedding model)
 """
 
 

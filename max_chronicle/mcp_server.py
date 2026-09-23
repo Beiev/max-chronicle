@@ -679,10 +679,12 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         writes=False,
         name="query_memory",
         description=(
-            "PRIMARY recall — start here for 'what do we know about X'. RRF-fused FTS + vector + "
-            "temporal search over Chronicle events; works offline (FTS + temporal) when Ollama is "
-            "down, adds the vector channel automatically when it is up. The `degraded` flag reports "
-            "skipped channels. Independent of the external Mem0/Qdrant stack."
+            "PRIMARY recall — start here for 'what do we know about X'. Fuses full-text and vector "
+            "matches over Chronicle events; recency only breaks ties. Works offline on full text "
+            "when Ollama is down. `degraded` reports skipped channels, `relaxed` a weaker "
+            "word-stem match, and `no_confident_match` that no result is a strong match: treat "
+            "those results as leads and verify them. A weak or empty result does not prove the "
+            "memory is absent. Independent of the external Mem0/Qdrant stack."
         ),
     )
     def tool_query_memory(

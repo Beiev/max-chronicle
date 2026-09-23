@@ -39,7 +39,8 @@ areas; they are not a substitute for project/task identity.
 1. **Start:** call `startup_bundle(project=..., task_id=..., focus=...)` once per
    MCP session. It returns the current task context and unlocks writes.
 2. **Recall:** call `query_memory(query=..., project=..., task_id=...)`. Inspect
-   evidence and `degraded`; empty results mean no suitable evidence was found.
+   evidence, `degraded` and `no_confident_match`. Results without a confident match
+   are leads to verify; a weak or empty result does not prove the memory is absent.
 3. **Record:** use `record_event` for significant decisions, actions, and findings.
    Supply `why` and `source_files` where available. Reuse `request_id` unchanged
    if delivery is uncertain; a changed request requires a new ID. Likely secrets
@@ -156,14 +157,30 @@ can separately report `side_effect_errors` for failed evidence/projection output
   both sides. Evidence must contain every remaining term; when no event or fact
   does, recall retries with word stems, keeps only events holding two thirds of
   the terms, and returns `relaxed: true` because that match is weaker.
-- **Vector:** optional Ollama `nomic-embed-text` index. Model, dimension, scope,
-  and visibility are checked before ranking. `vector_coverage` discloses gaps;
-  `chronicle embed-backfill` repairs missing/incompatible index rows.
+- **Vector:** optional local index built through Ollama. The default model is
+  `qwen3-embedding:0.6b` (multilingual; `ollama pull qwen3-embedding:0.6b`).
+  `CHRONICLE_EMBED_MODEL` selects another; `nomic-embed-text` keeps an index
+  built before 0.12 usable. Every vector is stored under its model, so a new
+  model is backfilled beside the old index and recall reads only the active one.
+  Queries carry the model's retrieval instruction, and an event longer than the
+  model's context is embedded from its start instead of failing. Scope and
+  visibility are checked before ranking. `vector_coverage` discloses gaps, and
+  an active model with no index at all degrades the channel
+  (`embedding_index_empty`). `chronicle embed-backfill` fills the active index.
   If native scheduling is enabled, daily capture also retries up to 10 missing
   or incompatible embeddings per run. Disabling event embeddings disables this repair.
-- **Recency:** reorders relevant candidates; it never supplies unrelated answers.
-- **Threshold:** `CHRONICLE_VECTOR_MIN_SIMILARITY` defaults to `0.65`. Evaluate it
-  on your own corpus; cosine and reciprocal-rank scores are not confidence values.
+- **Recency:** breaks ties between equally relevant candidates; it never supplies
+  or promotes unrelated answers.
+- **Confidence:** `no_confident_match: true`, with a `hint`, when no result holds
+  every query term or reaches the model's confident similarity (`0.6` for
+  `qwen3-embedding:0.6b`; none for `nomic-embed-text`, whose similarity does not
+  tell related from unrelated text). The results are still returned as leads.
+  `CHRONICLE_VECTOR_CONFIDENT_SIMILARITY` overrides the floor.
+- **Threshold:** a candidate found only by the vector channel needs a cosine
+  similarity of at least the model's floor: `0.5` for Qwen3, `0.65` for
+  `nomic-embed-text`. `CHRONICLE_VECTOR_MIN_SIMILARITY` overrides it. Evaluate
+  it on your own corpus with `chronicle eval`; cosine and reciprocal-rank scores
+  are not confidence values.
 - **Writes:** SQLite WAL with full commit synchronization; events, observations,
   facts, and evidence links commit together.
 - **Schema changes:** an empty database initialises on first use. An existing one is
