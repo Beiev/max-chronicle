@@ -33,6 +33,7 @@ PREFIXED = [
     ("anthropic_key", "sk-" + "ant-api03-" + _random(48)),
     ("openrouter_key", "sk-" + "or-v1-" + _random(64, "0123456789abcdef")),
     ("github_token", "gh" + "p_" + _random(36)),
+    ("gitlab_token", "gl" + "pat-" + _random(20)),
     ("huggingface_token", "hf" + "_" + _random(34)),
     ("xai_key", "xa" + "i-" + _random(48)),
     ("runpod_key", "rp" + "a_" + _random(40)),
@@ -86,6 +87,10 @@ def test_values_assigned_to_secret_names_are_redacted(text: str) -> None:
         "token = None",
         "the token expired yesterday",
         "PWD=/Users/someone/project",
+        "I have a basic understanding of the importer",
+        "tokenizer=bert-base-uncased",
+        "passwordless request " + _random(40),
+        "keyboardShortcuts" + _random(40),
     ],
 )
 def test_references_and_ordinary_words_stay(text: str) -> None:
@@ -127,6 +132,10 @@ def test_a_random_token_is_redacted_only_where_the_line_speaks_of_secrets() -> N
         "123e4567-e89b-12d3-a456-426614174000",  # UUID
         "SHA256:" + _random(43),  # SSH fingerprint
         "agent-review-2026-09-checkpoint-0223",  # slug
+        "Harbor_run-video-batch-07-r2-final-cut",  # slug
+        "wan22_i2v_720p_turbo_10steps_v3_final",  # slug
+        "lighthouse-batch8-production-lessons",  # slug of long words
+        "harbor-nightlyRenderQueue-2026-08-31",  # slug with a camel-case part
         "Byzantine_stone_tablet_final_20260915.png",  # file name
     ],
 )
@@ -155,6 +164,95 @@ def test_a_query_string_keeps_everything_but_the_token() -> None:
     assert result.text == "https://api.example.com/items?token=[REDACTED:assigned_secret]&page=2&sort=desc"
 
 
+@pytest.mark.parametrize("name", ["client_secret", "X-Amz-Security-Token", "access_token"])
+def test_a_secret_parameter_ends_at_the_next_parameter(name: str) -> None:
+    result = redact(f"https://app.example.com/callback#state=1&{name}={_random(24)}&expires_in=3600")
+
+    assert result.text == f"https://app.example.com/callback#state=1&{name}=[REDACTED:assigned_secret]&expires_in=3600"
+
+
+@pytest.mark.parametrize(
+    "template",
+    ['password="{}"', '{{"password": "{}"}}', "DB_PASSWORD={}", "password={}"],
+)
+def test_an_ampersand_outside_a_query_string_is_part_of_the_value(template: str) -> None:
+    value = _random(6) + "&" + _random(9)
+
+    result = redact(template.format(value))
+
+    assert result.text == template.format("[REDACTED:assigned_secret]")
+
+
+@pytest.mark.parametrize("credential", ["admin:" + _random(20), "u:" + _random(2)])
+def test_basic_credentials_are_redacted(credential: str) -> None:
+    encoded = base64.b64encode(credential.encode()).decode()
+
+    result = redact(f"Authorization: Basic {encoded}")
+
+    assert result.text == "Authorization: Basic [REDACTED:basic_credential]"
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("ACCESS_TOKEN " + _random(40), "high_entropy"),
+        ("Production key " + _random(40), "labelled_key"),
+        ("authToken: " + _random(40), "assigned_secret"),
+        ('{"api_key":' + " " * 16 + '"' + _random(32) + '"}', "assigned_secret"),
+        ("AWS_SESSION_TOKEN=" + _random(792, ALNUM + "+/"), "assigned_secret"),
+        ("ey" + "J" + _random(20) + ".ey" + "J" + _random(10_000) + "." + _random(43), "jwt"),
+        ("postgres://app:" + _random(1) + "@db.local/main", "url_password"),
+    ],
+    ids=["name-joined-cue", "labelled", "camel-case", "wide-json", "long-session-token", "large-jwt", "short-password"],
+)
+def test_secrets_in_less_common_shapes_are_redacted(text: str, kind: str) -> None:
+    result = redact(text)
+
+    assert result.counts == {kind: 1}
+
+
+@pytest.mark.parametrize(
+    "alphabet",
+    [string.ascii_lowercase + string.digits, string.ascii_uppercase + string.digits, ALNUM, ALNUM + "-_"],
+    ids=["lower-digits", "upper-digits", "alnum", "url-safe"],
+)
+def test_random_keys_of_any_alphabet_are_redacted_near_a_cue(alphabet: str) -> None:
+    rng = random.Random(len(alphabet))
+    keys = ["".join(rng.choice(alphabet) for _ in range(length)) for length in (32, 40, 48, 64) for _ in range(100)]
+
+    missed = [key for key in keys if key in redact(f"token {key}").text]
+
+    assert len(missed) <= len(keys) // 100  # the share-of-maximum threshold missed up to 44%
+
+
+def test_on_a_long_line_only_tokens_near_a_cue_count() -> None:
+    near, far, filler = _random(40), _random(40), "x " * 1200
+
+    result = redact(f"{filler}rotated token {near} {filler}build {far}")
+
+    assert near not in result.text and far in result.text
+    assert result.counts == {"high_entropy": 1}
+
+
+def test_an_encoded_image_beside_a_token_field_is_kept_whole() -> None:
+    token = _random(40)
+    image = base64.b64encode(random.Random(3).randbytes(3000)).decode("ascii")
+
+    result = redact(json.dumps({"access_token": token, "image": image, "note": "auth token"}))
+
+    assert token not in result.text and image in result.text
+    assert result.counts == {"assigned_secret": 1}
+
+
+@pytest.mark.parametrize("key", ["AWS_SECRET_ACCESS_KEY", "accessToken", "clientSecret"])
+def test_a_value_under_any_secret_name_is_redacted_whole(key: str) -> None:
+    redacted, counts = redact_value({key: _random(24), "keyboard": "qwerty-" + _random(12)})
+
+    assert redacted[key] == "[REDACTED:assigned_secret]"
+    assert redacted["keyboard"].startswith("qwerty-")
+    assert counts == {"assigned_secret": 1}
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -165,9 +263,32 @@ def test_a_query_string_keeps_everything_but_the_token() -> None:
         "api_key=" * 130_000,
         "https://a:" * 100_000,
         "ey" + "J" + "a" * 1_000_000,
+        ("ey" + "J-") * 250_000,
         "Bearer " * 150_000,
+        "Basic " * 170_000,
+        "key: " * 200_000,
+        "?token=" * 140_000,
+        "aToken: " * 125_000,
+        ("token " + "A" * 1024 + " ") * 1000,
+        "token " + base64.b64encode(random.Random(9).randbytes(750_000)).decode("ascii"),
     ],
-    ids=["underscores", "dots", "pluses", "open-key-blocks", "assignments", "url-schemes", "jwt-head", "bearers"],
+    ids=[
+        "underscores",
+        "dots",
+        "pluses",
+        "open-key-blocks",
+        "assignments",
+        "url-schemes",
+        "jwt-head",
+        "jwt-heads",
+        "bearers",
+        "basics",
+        "key-labels",
+        "query-tokens",
+        "camel-tokens",
+        "near-blob-runs",
+        "base64-line",
+    ],
 )
 def test_redaction_time_stays_linear_on_hostile_input(text: str) -> None:
     started = time.perf_counter()
@@ -254,6 +375,25 @@ def test_evidence_files_are_archived_redacted(loaded_manifest, tmp_path, monkeyp
     assert secret not in content and "[REDACTED:runpod_key]" in content
     assert json.loads(metadata)["redactions"] == {"runpod_key": 1}
     assert note.read_text(encoding="utf-8").count(secret) == 1  # the source file is never touched
+
+
+def test_files_that_redact_alike_keep_their_own_provenance(loaded_manifest, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CHRONICLE_FEATURE_EVENT_EMBEDDINGS", "0")
+    notes = []
+    for folder in ("first", "second"):
+        note = tmp_path / folder / "pod-notes.md"
+        note.parent.mkdir()
+        note.write_text("RunPod API key: " + "rp" + "a_" + _random(40) + "\n", encoding="utf-8")
+        notes.append(note)
+
+    for note in notes:
+        service.record_event(loaded_manifest, {"agent": "agent-a", "text": "Documented a pod", "source_files": [str(note)]})
+
+    with open_connection(config_from_manifest(loaded_manifest)) as connection:
+        rows = connection.execute("SELECT sha256, source_path, metadata_json FROM artifacts").fetchall()
+    assert len({row["sha256"] for row in rows}) == 1  # both notes redact to the same bytes
+    provenance = {row["source_path"]: json.loads(row["metadata_json"])["source_sha256"] for row in rows}
+    assert provenance == {str(note): hashlib.sha256(note.read_bytes()).hexdigest() for note in notes}
 
 
 def test_encoded_blobs_are_archived_unchanged(loaded_manifest, tmp_path, monkeypatch) -> None:

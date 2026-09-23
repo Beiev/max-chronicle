@@ -1170,7 +1170,10 @@ def _archive_source(
         redaction = None
     content = raw if redaction is None or not redaction.count else redaction.text.encode("utf-8")
     sha256 = hashlib.sha256(content).hexdigest()
-    storage_path = artifact_dir / artifact_type / sha256[:2] / sha256[2:4] / f"{sha256}-{source_path.name}"
+    # Different files can redact to the same bytes; naming a redacted copy after
+    # its source as well keeps each source's row, path, and hash apart.
+    name = source_path.name if content is raw else f"{source_sha256[:16]}-{source_path.name}"
+    storage_path = artifact_dir / artifact_type / sha256[:2] / sha256[2:4] / f"{sha256}-{name}"
     _ensure_bytes_at_path(storage_path, content, sha256=sha256)
     if content is not raw:
         metadata["source_sha256"] = source_sha256

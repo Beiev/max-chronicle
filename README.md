@@ -159,9 +159,11 @@ can separately report `side_effect_errors` for failed evidence/projection output
   `[REDACTED:<kind>]` before an event (with its checkpoint and fact), a UTF-8
   evidence file, or a generated text artifact (daybook, commit summary, audit
   report) is stored. It catches known key prefixes, values assigned to secret
-  names, labelled keys (`key: <random>`), bearer tokens, URL passwords, private
-  key blocks, and high-entropy tokens on a short line that mentions a token,
-  password, or secret. Hex digests and UUIDs never count as high-entropy tokens.
+  names, labelled keys (`key: <random>`), bearer and basic credentials, URL
+  passwords, private key blocks, and high-entropy tokens near a word such as
+  token, password, secret, or API key (anywhere on a short line, within 256
+  characters on a long one). Hex digests, UUIDs, and pieces of long base64 runs
+  (encoded images) never count as high-entropy tokens.
   Identifiers such as `request_id` and paths are left as given, the source file is
   never modified, and binary evidence is archived unchanged. Not filtered yet:
   snapshot excerpts, legacy imports, and Mem0 responses. Time is linear in the
