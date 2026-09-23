@@ -1833,7 +1833,7 @@ def search_events(
                       WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
                       OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
                           AND json_extract(obs.payload_json,'$.fact_id')=f.id))))
-                ORDER BY rank, e.id
+                ORDER BY rank, e.occurred_at_utc DESC, e.id
                 LIMIT ? OFFSET ?
                 """,
                 (resolved_visibility, fts_query, domain, domain, domain,

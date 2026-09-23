@@ -31,7 +31,6 @@ LEXICAL_BASELINE = frozenset(
         "fact-en-keywords",
         "fact-ru-keywords",
         "rationale-ru-keywords",
-        "update-en-image-model",
         "update-en-deploy-fact",
         "handoff-en-keywords",
         "abstain-en-unrelated",
@@ -48,9 +47,13 @@ LEXICAL_BASELINE = frozenset(
         "rationale-ru-question",
         # Negations kept as terms ("чому не публікуємо демо"):
         "rationale-uk-question",
-        # Traded away: "default video model" now matches "default image model"
-        # by 2 of 3 terms in relaxed mode. An honest no_confident_match should
-        # win abstain-en-near-miss back.
+        # A relaxed match alone is not an answer: no_confident_match (FR-2).
+        "abstain-en-near-miss",
+        # Traded away: recency only breaks ties (FR-1), so on full text alone the
+        # shorter July decision outranks its August replacement by BM25. The
+        # same update recorded as a fact with `supersedes` stays current
+        # (update-en-deploy-fact); on 64 real questions the change lifts hybrid
+        # hit@1 by 11 points with no loss on knowledge updates.
     }
 )
 

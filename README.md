@@ -39,7 +39,8 @@ areas; they are not a substitute for project/task identity.
 1. **Start:** call `startup_bundle(project=..., task_id=..., focus=...)` once per
    MCP session. It returns the current task context and unlocks writes.
 2. **Recall:** call `query_memory(query=..., project=..., task_id=...)`. Inspect
-   evidence and `degraded`; empty results mean no suitable evidence was found.
+   evidence, `degraded` and `no_confident_match`. Results without a confident match
+   are leads to verify; a weak or empty result does not prove the memory is absent.
 3. **Record:** use `record_event` for significant decisions, actions, and findings.
    Supply `why` and `source_files` where available. Reuse `request_id` unchanged
    if delivery is uncertain; a changed request requires a new ID. Likely secrets
@@ -163,7 +164,13 @@ can separately report `side_effect_errors` for failed evidence/projection output
   (`embedding_index_empty`). `chronicle embed-backfill` fills the active index.
   If native scheduling is enabled, daily capture also retries up to 10 missing
   or incompatible embeddings per run. Disabling event embeddings disables this repair.
-- **Recency:** reorders relevant candidates; it never supplies unrelated answers.
+- **Recency:** breaks ties between equally relevant candidates; it never supplies
+  or promotes unrelated answers.
+- **Confidence:** `no_confident_match: true`, with a `hint`, when no result holds
+  every query term or reaches the model's confident similarity (`0.6` for
+  `qwen3-embedding:0.6b`; none for `nomic-embed-text`, whose similarity does not
+  tell related from unrelated text). The results are still returned as leads.
+  `CHRONICLE_VECTOR_CONFIDENT_SIMILARITY` overrides the floor.
 - **Threshold:** a candidate found only by the vector channel needs a cosine
   similarity of at least the model's floor: `0.5` for Qwen3, `0.65` for
   `nomic-embed-text`. `CHRONICLE_VECTOR_MIN_SIMILARITY` overrides it. Evaluate

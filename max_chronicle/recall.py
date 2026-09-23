@@ -16,6 +16,24 @@ from .store import (
     search_fact_events,
 )
 
+ENV_MIN_SIMILARITY = "CHRONICLE_VECTOR_MIN_SIMILARITY"
+ENV_CONFIDENT_SIMILARITY = "CHRONICLE_VECTOR_CONFIDENT_SIMILARITY"
+NO_CONFIDENT_MATCH_HINT = (
+    "No result is a confident match: treat these results as leads and verify them, or "
+    "rephrase the query. A weak or empty result does not prove the memory is absent."
+)
+
+
+def _similarity_setting(name: str, default: float | None) -> float | None:
+    """A cosine setting from the environment, or the profile's default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    value = float(raw)
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
+
 
 def query_memory(
     manifest: dict[str, Any],
@@ -26,11 +44,13 @@ def query_memory(
     project: str | None = None,
     task_id: str | None = None,
 ) -> dict[str, Any]:
-    """Fuse relevant lexical/vector candidates, then apply a recency prior.
+    """Fuse relevant lexical/vector candidates; recency only breaks ties.
 
     RRF scores are ranking signals, not confidence. A cosine floor (the active
     embedding profile's, or CHRONICLE_VECTOR_MIN_SIMILARITY) rejects weak
-    vector-only candidates; exact lexical hits need no embedding.
+    vector-only candidates; exact lexical hits need no embedding. The response
+    says ``no_confident_match`` unless a result holds every query term or
+    reaches the profile's confident similarity (FR-2).
     """
     from .embeddings import active_profile, cosine, embed_query, unpack_vector
     from .memory import event_provenance
@@ -42,9 +62,8 @@ def query_memory(
     if task_id and not project:
         raise ValueError("task_id requires project")
     profile = active_profile()
-    threshold = float(os.environ.get("CHRONICLE_VECTOR_MIN_SIMILARITY") or profile.min_similarity)
-    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
-        raise ValueError("CHRONICLE_VECTOR_MIN_SIMILARITY must be between 0 and 1")
+    threshold = _similarity_setting(ENV_MIN_SIMILARITY, profile.min_similarity)
+    confident_floor = _similarity_setting(ENV_CONFIDENT_SIMILARITY, profile.confident_similarity)
     config = config_from_manifest(manifest)
     scope = dict(domain=domain, project=project, task_id=task_id)
     pool = fetch_recall_pool(config, model_key=profile.key, **scope)
@@ -109,9 +128,9 @@ def query_memory(
         "missing_or_incompatible": len(pool) - len(compatible),
     }
 
-    vector_ids = sorted(similarities, key=lambda eid: (-similarities[eid], eid))[
-        : max(limit * 4, 40)
-    ]
+    # Equal similarity (such as the same text recorded twice) ranks the newer event first.
+    newest_first = sorted(similarities, key=lambda eid: (eligible[eid]["occurred_at_utc"], eid), reverse=True)
+    vector_ids = sorted(newest_first, key=lambda eid: -similarities[eid])[: max(limit * 4, 40)]
     vector_ranks = {eid: rank for rank, eid in enumerate(vector_ids)}
     candidates = set(fts) | set(vector_ranks)
     recent_ids = sorted(
@@ -120,12 +139,9 @@ def query_memory(
         reverse=True,
     )
     recency = {eid: rank for rank, eid in enumerate(recent_ids)}
+    # Relevance alone scores a candidate; recency only breaks ties (FR-1).
     scores = {
-        eid: sum(
-            1 / (60 + rank)
-            for rank in (fts.get(eid), vector_ranks.get(eid), recency[eid])
-            if rank is not None
-        )
+        eid: sum(1 / (60 + rank) for rank in (fts.get(eid), vector_ranks.get(eid)) if rank is not None)
         for eid in candidates
     }
     ranked = sorted(candidates, key=lambda eid: (-scores[eid], recency[eid], eid))[
@@ -169,13 +185,29 @@ def query_memory(
         + (["vector"] if vector_available else [])
         + (["temporal"] if candidates else [])
     )
-    return {
+    # Confident evidence holds every query term (a relaxed match does not) or is
+    # as close as this model gets only for related text.
+    confident = any(
+        (hit["channels"]["fts_rank"] is not None and not relaxed)
+        or (
+            confident_floor is not None
+            and hit["channels"]["vector_similarity"] is not None
+            and hit["channels"]["vector_similarity"] >= confident_floor
+        )
+        for hit in results
+    )
+    response = {
         "query": query,
         **scope,
         "results": results,
         "relaxed": relaxed,
+        "no_confident_match": not confident,
         "channels_used": channels,
         "degraded": bool(errors),
         "channel_errors": errors,
         "vector_coverage": coverage,
+        "similarity_floors": {"min": threshold, "confident": confident_floor},
     }
+    if not confident:
+        response["hint"] = NO_CONFIDENT_MATCH_HINT
+    return response
