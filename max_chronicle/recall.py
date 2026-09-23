@@ -54,11 +54,13 @@ def query_memory(
         wanted = max(limit * 4, 40)
         hits = search_events(config, query=query, limit=wanted, current_only=True, **scope)
         fact_hits = search_fact_events(config, query=query, limit=wanted, **scope)
-        if not hits and not fact_hits:
-            # No event or fact holds every term: accept events whose stems cover
-            # most of them, and say so, since such a match is weaker (FR-2).
+        if not any(hit["id"] in eligible for hit in hits) and not any(e in eligible for e in fact_hits):
+            # No event or fact in scope holds every term: accept events whose
+            # stems cover most of them, and say so, since such a match is
+            # weaker (FR-2). A hit outside the pool, such as a fact recorded
+            # after the pool was read, is not evidence here either.
             hits = search_events(config, query=query, limit=wanted, current_only=True, relaxed=True, **scope)
-            relaxed = bool(hits)
+            relaxed = any(hit["id"] in eligible for hit in hits)
         fts = {
             hit["id"]: rank for rank, hit in enumerate(hits) if hit["id"] in eligible
         }

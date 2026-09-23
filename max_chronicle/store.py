@@ -1671,6 +1671,8 @@ def search_events(
     page_size = limit * RELAXED_CANDIDATE_FACTOR if relaxed else limit
     kept: list[sqlite3.Row] = []
     with open_connection(config) as connection:
+        if relaxed:
+            connection.execute("BEGIN")  # every page reads one snapshot, so offsets hold
         for page in range(RELAXED_MAX_PAGES if relaxed else 1):
             rows = connection.execute(
                 """
@@ -1714,11 +1716,7 @@ def search_events(
             if not relaxed:
                 kept = rows
                 break
-            seen = {row["id"] for row in kept}  # a write between pages can shift a row
-            kept += [
-                row for row in rows
-                if row["id"] not in seen and covers(terms, " ".join(filter(None, (row["text"], row["why"]))))
-            ]
+            kept += [row for row in rows if covers(terms, " ".join(filter(None, (row["text"], row["why"]))))]
             if len(kept) >= limit or len(rows) < page_size:
                 break
     return [_event_row_to_entry(row) for row in kept[:limit]]

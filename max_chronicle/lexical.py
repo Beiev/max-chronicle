@@ -18,13 +18,31 @@ import unicodedata
 # Letters, digits, and the joiners that keep "gpt-image-2" or "v0.11.0" whole.
 _TERM = re.compile(r"[\w$+.\-]+")
 _EDGE_JOINERS = "$+.-_"
-# A word as FTS5's unicode61 tokenizer sees one: letters and digits only, so
-# "_", "-", and "." separate words ("gpt_image_2" is gpt, image, 2).
-_INDEX_WORD = re.compile(r"[^\W_]+")
 RELAXED_STEM_MIN_LENGTH = 5  # shorter words must match whole
 RELAXED_SUFFIX_LENGTH = 2  # letters an inflection may change at the end
 RELAXED_STEM_FLOOR = 4
 RELAXED_MIN_COVERAGE = 2 / 3  # share of query terms relaxed evidence must contain
+# A word as FTS5's unicode61 tokenizer sees one: letters and digits only, so
+# "_", "-", and "." separate words ("gpt_image_2" is gpt, image, 2).
+_INDEX_WORD = re.compile(r"[^\W_]+")
+# What the index does to text, done to queries too: the triggers of migration
+# 0011 fold ё into е; unicode61 treats ς as σ and drops the combining marks
+# U+0300-U+036F, so a decomposed ё or й loses its mark on both sides.
+_FOLD = {ord("ё"): "е", ord("ς"): "σ", **dict.fromkeys(range(0x300, 0x370))}
+
+
+def _latin_bases() -> dict[int, str]:
+    """unicode61's remove_diacritics=1: a Latin letter with one accent is its base."""
+    table = {}
+    for code in (*range(0xC0, 0x250), *range(0x1E00, 0x1F00)):
+        parts = unicodedata.normalize("NFD", chr(code))
+        if len(parts) == 2 and parts[0].isascii() and parts[0].isalpha():
+            table[code] = parts[0].lower()
+    return table
+
+
+# A letter with two accents (ệ) or of another script (й) stays as written.
+_LATIN_BASES = _latin_bases()
 
 # Negations (not, no, не, нет, ни) and "may" stay searchable: they change what a
 # question asks, and May is a month.
@@ -50,8 +68,8 @@ STOPWORDS = frozenset(
 
 
 def fold(text: str) -> str:
-    """Normalize, case-fold, and merge ё into е, as the full-text indexes store text."""
-    return unicodedata.normalize("NFC", text).casefold().replace("ё", "е")
+    """Lowercase text as the full-text indexes store it (not casefold: ß stays ß)."""
+    return text.lower().translate(_FOLD)
 
 
 def query_terms(query: str) -> list[str]:
@@ -69,20 +87,8 @@ def query_terms(query: str) -> list[str]:
 
 
 def index_words(text: str) -> list[str]:
-    """The words of ``text`` as the full-text index holds them.
-
-    Mirrors unicode61 with its default remove_diacritics=1: accents on Latin
-    letters are dropped (café is cafe), other scripts keep theirs (й is not и).
-    """
-    kept: list[str] = []
-    latin_base = False
-    for char in unicodedata.normalize("NFD", fold(text)):
-        if not unicodedata.combining(char):
-            latin_base = char.isascii()
-        elif latin_base:
-            continue
-        kept.append(char)
-    return _INDEX_WORD.findall(unicodedata.normalize("NFC", "".join(kept)))
+    """The words of ``text`` as the full-text index holds them (unicode61)."""
+    return _INDEX_WORD.findall(fold(text).translate(_LATIN_BASES))
 
 
 def _phrase(term: str) -> str:

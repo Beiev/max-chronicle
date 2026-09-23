@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 import shutil
 
 import pytest
 
-from max_chronicle import embeddings, service
+from max_chronicle import embeddings, recall, service, store
 from max_chronicle.config import MIGRATIONS_DIR, default_config
 from max_chronicle.db import apply_migrations, connect
 from max_chronicle.lexical import covers, query_terms, relaxed_query, strict_query
@@ -27,9 +27,23 @@ from max_chronicle.store import config_from_manifest, search_events, search_fact
         ("почему не работает бэкап?", ["не", "работает", "бэкап"]),
         ("what did we decide in May?", ["decide", "may"]),
         ("Е\u0308лка в холле", ["елка", "холле"]),
+        ("отчёт за маи\u0306", ["отчет", "маи"]),
+        ("Straße plan", ["straße", "plan"]),
         ("что это?", ["что", "это"]),
     ],
-    ids=["ru-question", "yo", "uk", "en-question", "joiners", "negation", "month", "decomposed-yo", "only-function-words"],
+    ids=[
+        "ru-question",
+        "yo",
+        "uk",
+        "en-question",
+        "joiners",
+        "negation",
+        "month",
+        "decomposed-yo",
+        "decomposed-short-i",
+        "sharp-s",
+        "only-function-words",
+    ],
 )
 def test_query_terms_keep_content_words_only(query: str, terms: list[str]) -> None:
     assert query_terms(query) == terms
@@ -53,7 +67,9 @@ def test_relaxed_evidence_must_cover_two_thirds_of_the_terms() -> None:
 def test_coverage_reads_words_as_the_index_does() -> None:
     assert covers(query_terms("dropped gpt_image_2"), "We dropped gpt-image-2 in July.")
     assert covers(query_terms("cafe menu"), "Café menu updated.")
+    assert covers(query_terms("straße plan"), "Straße plan approved.")
     assert not covers(query_terms("gpt-image dropped today"), "We dropped the gptimage model.")
+    assert not covers(query_terms("viet budget missing"), "Việt budget")  # two accents stay
 
 
 @pytest.fixture()
@@ -85,6 +101,12 @@ def test_project_and_domain_slugs_are_not_searchable_text(loaded_manifest, lexic
 
     assert _found(loaded_manifest, "chronicle") == []
     assert _found(loaded_manifest, "global") == []
+
+
+def test_a_decomposed_query_finds_decomposed_text(loaded_manifest, lexical_only) -> None:
+    event_id = _record(loaded_manifest, "Отчёт за маи\u0306 отправлен.")
+
+    assert _found(loaded_manifest, "маи\u0306") == [event_id]
 
 
 def test_folding_survives_an_update(loaded_manifest, lexical_only) -> None:
@@ -133,16 +155,82 @@ def test_a_strict_fact_match_keeps_recall_strict(loaded_manifest, lexical_only) 
     assert [hit["event_id"] for hit in result["results"]] == [decided] and result["relaxed"] is False
 
 
-def test_relaxed_search_reads_past_rows_that_hold_one_rare_term(loaded_manifest, lexical_only) -> None:
+def _rare_term_corpus(manifest: dict) -> str:
+    """Rows holding one rare term outrank the one row holding most terms."""
     for number in range(20):
-        _record(loaded_manifest, f"Alpha note {number}." if number % 2 else f"Beta note {number}.")
+        _record(manifest, f"Alpha note {number}." if number % 2 else f"Beta note {number}.")
     for number in range(6):
-        _record(loaded_manifest, f"Gamma gamma gamma, sample {number}.")
-    target = _record(loaded_manifest, "Alpha and beta agree.")
+        _record(manifest, f"Gamma gamma gamma, sample {number}.")
+    return _record(manifest, "Alpha and beta agree.")
+
+
+def test_relaxed_search_reads_past_rows_that_hold_one_rare_term(loaded_manifest, lexical_only) -> None:
+    target = _rare_term_corpus(loaded_manifest)
 
     found = _found(loaded_manifest, "alpha beta gamma", limit=1, relaxed=True)
 
     assert found == [target]
+
+
+def test_relaxed_pages_read_one_snapshot(loaded_manifest, lexical_only, monkeypatch) -> None:
+    target = _rare_term_corpus(loaded_manifest)
+    config = config_from_manifest(loaded_manifest)
+    original = store.open_connection
+    first_page: list[str] = []
+
+    class Cursor:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def fetchall(self):
+            rows = self.cursor.fetchall()
+            if not first_page and rows and "rank" in rows[0].keys():
+                first_page.extend(row["id"] for row in rows)
+                # Another agent rewrites those rows before the next page is read.
+                with original(config) as writer, writer:
+                    writer.executemany("UPDATE events SET text = 'unrelated note' WHERE id = ?", [(i,) for i in first_page])
+            return rows
+
+    class Connection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, *args, **kwargs):
+            return Cursor(self.connection.execute(*args, **kwargs))
+
+    @contextmanager
+    def interleaved(active_config):
+        with original(active_config) as connection:
+            yield Connection(connection)
+
+    monkeypatch.setattr(store, "open_connection", interleaved)
+
+    found = [hit["id"] for hit in store.search_events(config, query="alpha beta gamma", limit=1, relaxed=True)]
+
+    assert first_page and found == [target]
+
+
+def test_a_fact_recorded_after_the_pool_does_not_block_relaxed_recall(
+    loaded_manifest, lexical_only, monkeypatch
+) -> None:
+    target = _record(loaded_manifest, "Alpha and beta agree on the alternative.")
+    original = recall.fetch_recall_pool
+
+    def pool_then_fact(*args, **kwargs):
+        pool = original(*args, **kwargs)
+        _record(
+            loaded_manifest,
+            "Decision recorded.",
+            task_id="ship",
+            fact={"slot": "platform", "value": "alpha beta gamma", "kind": "decision"},
+        )
+        return pool
+
+    monkeypatch.setattr(recall, "fetch_recall_pool", pool_then_fact)
+
+    result = service.query_memory(loaded_manifest, query="alpha beta gamma")
+
+    assert [hit["event_id"] for hit in result["results"]] == [target] and result["relaxed"] is True
 
 
 def test_the_migration_refolds_existing_rows(tmp_path) -> None:
