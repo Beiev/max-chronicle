@@ -77,7 +77,9 @@ def _passing(report: dict[str, Any]) -> set[str]:
         detail["id"]
         for detail in report["cases"]
         if (
-            detail["first_hit_rank"] is not None and detail["first_hit_rank"] <= 5
+            detail["first_hit_rank"] is not None
+            and detail["first_hit_rank"] <= 5
+            and detail.get("update_correct", True)
             if detail["expected"]
             else detail["abstained"]
         )
@@ -164,6 +166,18 @@ def test_a_failing_query_is_a_scored_miss_and_the_run_goes_on() -> None:
     assert summarize(details)["errors"] == 1
 
 
+def test_a_failing_query_never_counts_as_abstaining() -> None:
+    def recall(manifest, *, query, limit, **scope):
+        raise RuntimeError("database is locked")
+
+    details = run_eval({}, [_case("unknowable")], recall=recall)
+    report = {"overall": summarize(details)}
+
+    assert details[0]["abstained"] is False
+    assert report["overall"]["abstention_accuracy"] == 0.0
+    assert check_thresholds(report, {}) == ["errors: 1 queries failed"]
+
+
 def test_thresholds_name_every_metric_below_its_floor() -> None:
     report = {"overall": {"hit@5": 0.5, "abstention_accuracy": 1.0}}
 
@@ -189,6 +203,8 @@ VALID = {"id": "a", "query": "q", "category": "fact", "expected": ["event:1"]}
         (json.dumps(VALID | {"stale": ["event:1"]}), "both expected and stale"),
         (json.dumps(VALID | {"scope": {"agent": "codex"}}), "scope maps domain, project, task_id"),
         (json.dumps(VALID | {"lang": ""}), "lang must be a non-empty string"),
+        (json.dumps(VALID | {"expected": ["event:1", "event:1"]}), "a reference is listed twice"),
+        (json.dumps(VALID | {"scope": {"task_id": "ship"}}), "a task_id scope needs its project"),
     ],
 )
 def test_an_invalid_case_names_its_file_and_line(tmp_path, line: str, message: str) -> None:
@@ -238,9 +254,9 @@ def test_the_eval_command_writes_the_report_and_enforces_floors(
     )
     report_path = tmp_path / "results" / "baseline.json"
 
-    def run(*extra: str) -> int:
+    def run(*extra: str, top: tuple[str, ...] = ()) -> int:
         args = build_parser().parse_args(
-            ["--manifest", str(chronicle_sandbox.manifest_path), "eval", "--golden", str(golden), *extra]
+            ["--manifest", str(chronicle_sandbox.manifest_path), *top, "eval", "--golden", str(golden), *extra]
         )
         return args.handler(args)
 
@@ -253,6 +269,15 @@ def test_the_eval_command_writes_the_report_and_enforces_floors(
     capsys.readouterr()
     assert run("--fail-under", "hit@5=0.9") == 1
     assert "BELOW FLOOR hit@5" in capsys.readouterr().out
+
+    elsewhere = tmp_path / "elsewhere.db"
+    assert run("--json", top=("--db", str(elsewhere))) == 0
+    assert json.loads(capsys.readouterr().out)["overall"]["hit@5"] == 0.0  # an empty store, not the manifest's
+    assert elsewhere.exists()
+
+    with pytest.raises(SystemExit) as refused:
+        run("--fail-under", "hit@5=nan")
+    assert refused.value.code == 2
 
     golden.write_text("{}\n", encoding="utf-8")
     assert run() == 2

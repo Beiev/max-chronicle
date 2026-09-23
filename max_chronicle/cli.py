@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import math
 from pathlib import Path
 import sqlite3
 import sys
@@ -722,13 +723,20 @@ def cmd_query_memory(args: argparse.Namespace) -> int:
 def _threshold(value: str) -> tuple[str, float]:
     name, _, floor = value.partition("=")
     try:
-        return name.strip(), float(floor)
+        number = float(floor)
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected METRIC=FLOOR, got {value!r}") from None
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"the floor must be a finite number, got {value!r}")
+    return name.strip(), number
 
 
 def cmd_eval(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
+    if args.db is not None:
+        manifest = dict(manifest)
+        manifest["paths"] = dict(manifest["paths"])
+        manifest["paths"]["chronicle_db"] = str(args.db)
     try:
         cases = load_golden(args.golden)
     except (OSError, ValueError) as exc:
@@ -1100,7 +1108,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="METRIC=FLOOR",
-        help="Exit 1 when an overall metric is below its floor, e.g. hit@5=0.6 (repeatable)",
+        help="Exit 1 when an overall metric is below its floor, e.g. hit@5=0.6 (repeatable); "
+        "a failed query always exits 1",
     )
     p_eval.set_defaults(handler=cmd_eval)
 
