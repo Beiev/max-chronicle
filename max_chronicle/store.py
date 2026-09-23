@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import mimetypes
-import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -36,9 +35,12 @@ from .db import (
     utc_now,
 )
 from .lexical import covers, query_terms, relaxed_query, strict_query
+from .redaction import redact
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
+STORED_NAME_MAX_BYTES = 230  # of an archived file name; its temp file adds about 15
+STORED_EXTENSION_MAX_BYTES = 16  # a longer "extension" is part of the name
 RELAXED_CANDIDATE_FACTOR = 5  # relaxed FTS rows read per page, per result wanted
 RELAXED_MAX_PAGES = 4  # a relaxed search reads at most this many pages
 DEFAULT_STALE_RUN_TTL_HOURS = 6
@@ -1250,39 +1252,55 @@ def _ensure_bytes_at_path(path: Path, content: bytes, *, sha256: str) -> None:
     _atomic_write_bytes(path, content)
 
 
-def _copy_source_to_content_addressed_path(
+def _stored_name(prefix: str, source_name: str) -> str:
+    """``prefix-source_name``, shortened to fit a file name with its temp suffix.
+
+    File names are limited to 255 bytes, and the atomic write adds about 15; a
+    long source name keeps its start and its extension.
+    """
+    budget = STORED_NAME_MAX_BYTES - len(prefix.encode("utf-8")) - 1
+    encoded = source_name.encode("utf-8")
+    if len(encoded) <= budget:
+        return f"{prefix}-{source_name}"
+    extension = Path(source_name).suffix.encode("utf-8")
+    extension = extension if len(extension) <= STORED_EXTENSION_MAX_BYTES else b""
+    head = encoded[: budget - len(extension)].decode("utf-8", errors="ignore")
+    return f"{prefix}-{head}{extension.decode('utf-8')}"
+
+
+def _archive_source(
     source_path: Path,
     *,
     artifact_type: str,
     source_sha256: str,
-    source_name: str,
     artifact_dir: Path,
+    metadata: dict[str, Any],
 ) -> tuple[Path, str]:
-    relative_storage = Path(artifact_type) / source_sha256[:2] / source_sha256[2:4] / f"{source_sha256}-{source_name}"
-    storage_path = artifact_dir / relative_storage
-    storage_path.parent.mkdir(parents=True, exist_ok=True)
-    if _path_matches_sha256(storage_path, source_sha256):
-        return storage_path, source_sha256
+    """Copy a source into the content-addressed store, redacting likely secrets.
 
-    temp_name: str | None = None
+    A UTF-8 text file holding a likely secret is archived as a redacted copy
+    under its own hash; ``metadata`` records the source hash and what was
+    redacted. Binary files and clean text are archived byte for byte. Either
+    way the bytes inspected are the bytes stored: the file is read once.
+    """
+    raw = source_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != source_sha256:
+        raise RuntimeError(f"Artifact source changed while copying: {source_path}")
     try:
-        with tempfile.NamedTemporaryFile("wb", dir=storage_path.parent, prefix=f".{storage_path.name}.", suffix=".tmp", delete=False) as target:
-            temp_name = target.name
-            with source_path.open("rb") as source:
-                shutil.copyfileobj(source, target, length=1024 * 1024)
-            target.flush()
-            os.fsync(target.fileno())
-        temp_path = Path(temp_name)
-        copied_sha256 = _file_sha256(temp_path)
-        if copied_sha256 != source_sha256:
-            temp_path.unlink(missing_ok=True)
-            raise RuntimeError(f"Artifact source changed while copying: {source_path}")
-        os.replace(temp_path, storage_path)
-        return storage_path, copied_sha256
-    except Exception:
-        if temp_name is not None:
-            Path(temp_name).unlink(missing_ok=True)
-        raise
+        redaction = redact(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        redaction = None
+    content = raw if redaction is None or not redaction.count else redaction.text.encode("utf-8")
+    sha256 = hashlib.sha256(content).hexdigest()
+    # Different files can redact to the same bytes; naming a redacted copy after
+    # its source as well keeps each source's row, path, and hash apart.
+    prefix = sha256 if content is raw else f"{sha256}-{source_sha256[:16]}"
+    storage_path = artifact_dir / artifact_type / sha256[:2] / sha256[2:4] / _stored_name(prefix, source_path.name)
+    _ensure_bytes_at_path(storage_path, content, sha256=sha256)
+    if content is not raw:
+        metadata["source_sha256"] = source_sha256
+        metadata["redactions"] = dict(redaction.counts)
+    return storage_path, sha256
 
 
 def _artifact_extension(path: Path) -> str:
@@ -2066,12 +2084,12 @@ def stage_artifact_from_path(
         return None
 
     if storage_mode == "copy":
-        storage_path, sha256 = _copy_source_to_content_addressed_path(
+        storage_path, sha256 = _archive_source(
             source_path,
             artifact_type=artifact_type,
             source_sha256=sha256,
-            source_name=source_path.name,
             artifact_dir=config.artifact_dir,
+            metadata=artifact_metadata,
         )
         resolved_storage_path = str(storage_path)
     else:
@@ -2163,12 +2181,12 @@ def store_artifact_from_path(
         return None
 
     if storage_mode == "copy":
-        storage_path, sha256 = _copy_source_to_content_addressed_path(
+        storage_path, sha256 = _archive_source(
             source_path,
             artifact_type=artifact_type,
             source_sha256=sha256,
-            source_name=source_path.name,
             artifact_dir=config.artifact_dir,
+            metadata=artifact_metadata,
         )
         resolved_storage_path = str(storage_path)
     else:
@@ -2229,7 +2247,8 @@ def store_artifact_text(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     observed_at = observed_at_utc or utc_now()
-    payload = content.encode("utf-8")
+    redaction = redact(content)
+    payload = redaction.text.encode("utf-8")
     sha256 = _bytes_sha256(payload)
     if len(payload) > config.artifact_max_copy_bytes:
         raise ValueError(
@@ -2243,6 +2262,8 @@ def store_artifact_text(
     artifact_metadata = dict(metadata or {})
     artifact_metadata.setdefault("source_name", filename)
     artifact_metadata.setdefault("source_size", len(payload))
+    if redaction.count:
+        artifact_metadata["redactions"] = dict(redaction.counts)
 
     with open_connection(config) as connection, connection:
         resolved_entity_id = entity_id

@@ -25,6 +25,7 @@ from .config import (
 )
 from .db import database_summary
 from .recall import query_memory
+from .redaction import redact_value
 from .projections import render_job_search_status, render_status_generated_block, update_status_file
 from .runtime_context import (
     append_jsonl,
@@ -507,6 +508,23 @@ def _resolve_source_trust_tier(source: dict[str, Any] | None) -> tuple[str, str]
     if normalized in VALID_TRUST_TIERS:
         return normalized, "explicit"
     return _derived_source_trust_tier(source), "invalid"
+
+
+# Identifiers, paths, and machine values: never free text, so never redacted.
+_UNREDACTED_ENTRY_KEYS = frozenset(
+    {
+        "id", "request_id", "session_id", "agent", "domain", "category", "project",
+        "task_id", "recorded_at", "occurred_at", "entity_id", "entity_type",
+        "source_files", "slot", "kind", "supersedes", "mem0_status", "memory_guard",
+        "content_hash", "skip_generic_source_archives",
+    }
+)
+
+
+def _redact_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+    """Redact likely secrets in every free-text field of an entry, nested ones too."""
+    redacted, counts = redact_value(entry, skip_keys=_UNREDACTED_ENTRY_KEYS)
+    return redacted, dict(counts)
 
 
 def _normalize_record_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -2070,7 +2088,9 @@ def record_event(
 ) -> dict[str, Any]:
     # Pop private test/injection keys before any serialization path sees them.
     _embed_fn_override = entry.pop("_embed_fn", None)
-    normalized_entry = _normalize_record_entry(entry)
+    # Redact before anything derives from the text: hashes, embeddings, the
+    # stored row, the Mem0 outbox, and compatibility ledgers.
+    normalized_entry, redactions = _redact_entry(_normalize_record_entry(entry))
     from .memory import validate_entry, request_receipt, record_observation
     validate_entry(normalized_entry)
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
@@ -2155,6 +2175,8 @@ def record_event(
             if staged is not None:
                 staged_artifacts.append(staged)
                 evidence.append({"path": str(path), "status": staged["metadata"].get("storage_mode", "archived"), "sha256": staged["sha256"]})
+                if staged["metadata"].get("redactions"):
+                    evidence[-1]["redactions"] = staged["metadata"]["redactions"]
             else:
                 evidence.append({"path": str(path), "status": "missing" if not path.is_file() else "skipped"})
 
@@ -2168,7 +2190,7 @@ def record_event(
         if prior_request is not None:
             previous = fetch_event(config, event_id=prior_request["event_id"], connection=connection)
             return {**previous, "chronicle_status": "existing", "chronicle_db_path": str(config.db_path),
-                    "chronicle_error": None, "artifacts_written": 0,
+                    "chronicle_error": None, "artifacts_written": 0, **({"redactions": redactions} if redactions else {}),
                     "observation_id": prior_request["observation_id"], "fact_id": prior_request["fact_id"],
                     "evidence": prior_request["evidence"], "dedupe_status": "request_id_match"}
         existing = None
@@ -2227,8 +2249,8 @@ def record_event(
         ledger_row = dict(stored)
         ledger_row["source_files"] = entry.get("source_files") or []
         ledger_row["mem0_status"] = entry.get("mem0_status")
-        ledger_row["mem0_error"] = entry.get("mem0_error")
-        ledger_row["mem0_raw"] = entry.get("mem0_raw")
+        ledger_row["mem0_error"] = normalized_entry.get("mem0_error")
+        ledger_row["mem0_raw"] = normalized_entry.get("mem0_raw")
         try:
             append_jsonl(_compat_path(manifest, "ledger_file"), ledger_row)
         except OSError as exc:
@@ -2239,6 +2261,8 @@ def record_event(
             stored["compat_ledger_error"] = f"{type(exc).__name__}: {exc}"
 
     stored["artifacts_written"] = artifacts_written
+    if redactions:
+        stored["redactions"] = redactions
     return stored
 
 
