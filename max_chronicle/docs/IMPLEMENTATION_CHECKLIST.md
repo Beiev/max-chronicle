@@ -10,3 +10,13 @@ The active contract is [Shared agent memory](ROADMAP-ULTIMATE-MEMORY.md).
 - [x] Existing tests and migration integrity checks pass.
 - [x] Clean wheel/source archive and neutral fresh-workspace smoke test pass.
 - [x] Operator installation upgraded and availability verified separately.
+
+## v1.1
+
+- [ ] Explicit schema upgrades after a backup; stray servers cannot migrate (FR-9).
+- [ ] Golden-set eval with a pinned synthetic baseline (FR-13).
+- [ ] Unicode-aware lexical recall, flagged relaxed fallback, `no_confident_match` (FR-2).
+- [ ] Secret filter on write, archive, and index (FR-11).
+- [ ] Brief endpoint and session hooks for Claude and Codex (FR-12, NFR-4).
+- [ ] Index of explicitly written notes with project/global scoping (FR-10).
+- [ ] Identity registry and one scope function (FR-14).

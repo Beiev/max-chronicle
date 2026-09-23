@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import math
 from pathlib import Path
 import sqlite3
 import sys
@@ -11,8 +12,21 @@ from zoneinfo import ZoneInfo
 
 from .bootstrap import bootstrap_legacy
 from .browse import render_browse_help, render_daybook, render_entity_timeline, render_recent_events, render_search_results
-from .config import ChronicleConfig, default_config, ensure_runtime_dirs
-from .db import apply_migrations, connect, database_summary
+from .config import (
+    ENV_CHRONICLE_AUTO_MIGRATE,
+    EXIT_CONFIG_ERROR,
+    EXIT_SCHEMA_ACTION,
+    ChronicleConfig,
+    ChronicleConfigError,
+    default_automation_path,
+    default_config,
+    default_manifest_path,
+    ensure_runtime_dirs,
+    feature_enabled,
+    resolve_status_root,
+)
+from .db import MigrationError, connect, database_summary, ensure_schema, read_schema_state
+from .evals import build_report, check_thresholds, format_report, load_golden, run_eval
 from .native_automation import (
     doctor_launchd,
     install_git_hooks,
@@ -73,6 +87,7 @@ def _connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+# Exit codes for errors an operator can act on without reading a traceback.
 _STRICT_FAILURE_STATUSES = {"warn", "warning", "critical", "issues", "error", "failed", "failed_soft", "skipped"}
 
 
@@ -105,14 +120,15 @@ def _config_from_args(args: argparse.Namespace) -> ChronicleConfig:
 def cmd_migrate(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     with _connection(config) as connection:
-        applied = apply_migrations(connection, config)
+        prepared = ensure_schema(connection, config, allow_upgrade=True)
         summary = database_summary(connection)
     payload = {
         "db_path": str(config.db_path),
         "applied": [
             {"version": item.version, "name": item.name, "path": str(item.path)}
-            for item in applied
+            for item in prepared.applied
         ],
+        "backup_path": str(prepared.backup_path) if prepared.backup_path else None,
         "summary": summary,
     }
     return _print_json(payload)
@@ -121,7 +137,11 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 def cmd_import_legacy(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     with _connection(config) as connection:
-        apply_migrations(connection, config)
+        ensure_schema(
+            connection,
+            config,
+            allow_upgrade=feature_enabled(ENV_CHRONICLE_AUTO_MIGRATE, default=False),
+        )
         result = bootstrap_legacy(connection, config, queue_mem0=args.queue_mem0)
         summary = database_summary(connection)
     payload = {
@@ -142,15 +162,31 @@ def cmd_status(args: argparse.Namespace) -> int:
         }
         return _print_json(payload)
 
+    # Read-only on the schema: `status` used to apply pending migrations as a
+    # side effect, which made a diagnostic command an unannounced upgrade.
     with _connection(config) as connection:
-        apply_migrations(connection, config)
-        summary = database_summary(connection)
-    payload = {
+        state = read_schema_state(connection, config)
+        up_to_date = not state.pending and not state.unknown and not state.foreign
+        summary = database_summary(connection) if up_to_date else None
+    payload: dict[str, object] = {
         "db_path": str(config.db_path),
         "exists": True,
+        "schema": {
+            "current_version": state.current_version,
+            "target_version": state.target_version,
+            "pending": [item.version for item in state.pending],
+            "unknown": list(state.unknown),
+        },
         "summary": summary,
     }
-    return _print_json(payload)
+    if state.foreign:
+        payload["message"] = "This is not a Chronicle database; Chronicle will not modify it."
+    elif state.unknown:
+        payload["message"] = "The database is newer than this code; upgrade max-chronicle."
+    elif state.pending:
+        payload["message"] = "The schema is behind this code; run `chronicle migrate` (it backs up first)."
+    _print_json(payload)
+    return 0 if up_to_date else EXIT_SCHEMA_ACTION
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -542,6 +578,7 @@ def cmd_curate_daybook(args: argparse.Namespace) -> int:
         automation,
         target_date=args.date,
         trigger_source=args.trigger_source,
+        regenerate=True,
     )
     return _print_json(payload)
 
@@ -718,6 +755,43 @@ def cmd_query_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+def _threshold(value: str) -> tuple[str, float]:
+    name, _, floor = value.partition("=")
+    try:
+        number = float(floor)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected METRIC=FLOOR, got {value!r}") from None
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"the floor must be a finite number, got {value!r}")
+    return name.strip(), number
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    if args.db is not None:
+        manifest = dict(manifest)
+        manifest["paths"] = dict(manifest["paths"])
+        manifest["paths"]["chronicle_db"] = str(args.db)
+    try:
+        cases = load_golden(args.golden)
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    report = build_report(run_eval(manifest, cases), golden_path=args.golden)
+    failures = check_thresholds(report, dict(args.fail_under))
+    report["thresholds"] = {"floors": dict(args.fail_under), "failures": failures}
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.json:
+        _print_json(report)
+    else:
+        print(format_report(report))
+        for failure in failures:
+            print(f"BELOW FLOOR {failure}")
+    return 1 if failures else 0
+
+
 def cmd_browse(args: argparse.Namespace) -> int:
     """Dispatcher for `chronicle browse` subcommands."""
     sub = getattr(args, "browse_command", None)
@@ -774,17 +848,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override path to chronicle.db",
     )
+    # Resolved after parsing (see main): computing them here made `--help` and
+    # explicit flags fail whenever the default workspace could not be resolved.
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=default_config().manifest_path,
-        help="Path to SSOT_MANIFEST.toml",
+        default=None,
+        help="Path to SSOT_MANIFEST.toml (default: the workspace's)",
     )
     parser.add_argument(
         "--automation-config",
         type=Path,
-        default=default_config().automation_path,
-        help="Path to CHRONICLE_AUTOMATION.toml",
+        default=None,
+        help="Path to CHRONICLE_AUTOMATION.toml (default: the workspace's)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -975,7 +1051,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_curate = sub.add_parser("curate", help="Chronicle curator entrypoints")
     curate_sub = p_curate.add_subparsers(dest="curate_command", required=True)
-    p_daybook = curate_sub.add_parser("daybook", help="Generate a daybook markdown artifact from Chronicle delta")
+    p_daybook = curate_sub.add_parser(
+        "daybook",
+        help="Write a day's daybook; rewrites it when that day's events changed, retries a skipped day",
+    )
     p_daybook.add_argument("--date", default=None, help="Local date YYYY-MM-DD")
     p_daybook.add_argument("--trigger-source", default="manual", help="Trigger source label")
     p_daybook.set_defaults(handler=cmd_curate_daybook)
@@ -1056,6 +1135,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_query_memory.add_argument("--format", choices=["text", "json"], default="text")
     p_query_memory.set_defaults(handler=cmd_query_memory)
 
+    p_eval = sub.add_parser(
+        "eval",
+        help="Score recall against a golden question set (JSONL): hit@k, MRR, abstention, latency",
+    )
+    p_eval.add_argument("--golden", type=Path, required=True, help="Golden set, one JSON case per line")
+    p_eval.add_argument("--json", action="store_true", help="Print the full JSON report")
+    p_eval.add_argument("--out", type=Path, default=None, help="Also write the JSON report to this file")
+    p_eval.add_argument(
+        "--fail-under",
+        type=_threshold,
+        action="append",
+        default=[],
+        metavar="METRIC=FLOOR",
+        help="Exit 1 when an overall metric is below its floor, e.g. hit@5=0.6 (repeatable); "
+        "a failed query always exits 1",
+    )
+    p_eval.set_defaults(handler=cmd_eval)
+
     # ------------------------------------------------------------------
     # browse — human-facing navigation (read-only)
     # ------------------------------------------------------------------
@@ -1088,10 +1185,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_error(exc: Exception, *, exit_code: int) -> int:
+    print(json.dumps({"status": "error", "error_type": type(exc).__name__, "error": str(exc)}, ensure_ascii=False, indent=2))
+    return exit_code
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return args.handler(args)
+    try:
+        # `init` creates a workspace, so it must not require one to exist.
+        if args.command != "init":
+            # An explicit path names the workspace; only without one do the
+            # environment and the implicit fallback come into play.
+            root = resolve_status_root(manifest_path=args.manifest, automation_path=args.automation_config)
+            if args.manifest is None:
+                args.manifest = default_manifest_path(root)
+            if args.automation_config is None:
+                args.automation_config = default_automation_path(root)
+        return args.handler(args)
+    except ChronicleConfigError as exc:
+        return _print_error(exc, exit_code=EXIT_CONFIG_ERROR)
+    except MigrationError as exc:
+        return _print_error(exc, exit_code=EXIT_SCHEMA_ACTION)
 
 
 if __name__ == "__main__":

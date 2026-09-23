@@ -41,6 +41,7 @@ evidence; do not point tests at a real Chronicle database. Add behavioral tests
 for new contracts, including two-agent handoff, retries, and failure paths.
 
 Schema changes require a new numbered migration; do not edit applied migrations.
+Migration numbers are unique; loading fails on a duplicate.
 Keep existing CLI/MCP entrypoints compatible and update README/examples alongside
 the implementation. Keep changes focused; avoid broad style-only rewrites.
 

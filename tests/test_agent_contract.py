@@ -1666,6 +1666,13 @@ def test_health_route_reports_db_ok(chronicle_sandbox) -> None:
     assert payload["pid"] == os.getpid()
     assert isinstance(payload["uptime_s"], int)
     assert payload["version"]
+    # Which database, manifest and installed code answered: a stale checkout
+    # shadowing the release, or a wrong root, is visible without a shell.
+    assert payload["db_path"] == str(chronicle_sandbox.chronicle_db)
+    assert payload["manifest_path"] == str(chronicle_sandbox.manifest_path)
+    assert payload["schema_version"] >= 10
+    assert payload["schema_version"] == payload["target_schema_version"]
+    assert Path(payload["module_path"]).name == "max_chronicle"
 
 
 def test_offload_limiters_are_scoped_per_event_loop(chronicle_sandbox) -> None:

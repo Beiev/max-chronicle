@@ -36,6 +36,7 @@ from .store import (
     fetch_latest_projection_run,
     fetch_latest_snapshot,
     fetch_mem0_outbox_entries,
+    fingerprint_events_between,
     finish_automation_run,
     finish_backup_run,
     finish_curation_run,
@@ -77,6 +78,15 @@ MEM0_OUTBOX_PRUNE_AFTER_DAYS = 30
 MEM0_OUTBOX_PRUNE_BATCH = 5000
 WAL_CHECKPOINT_THRESHOLD_BYTES = 64 * 1024 * 1024
 DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
+# A daybook run also completes recent days whose daybook is missing or older
+# than their events, so a run delayed past midnight cannot lose a day.
+DAYBOOK_CATCHUP_DAYS = 3
+# The daybook's own summary events are never evidence of a day's activity.
+# Matched by source, not category: an agent's own daily_summary still counts.
+DAYBOOK_SOURCE_KIND = "chronicle_curator.daybook"
+# Events read for one daybook, the newest first. The fingerprint covers all.
+DAYBOOK_EVENT_LIMIT = 1000
+DAYBOOK_KEY_EVENTS = 12  # the "Key Events" list shows the latest this many
 DEFAULT_BACKUP_SPACE_MARGIN_BYTES = 512 * 1024 * 1024
 
 
@@ -778,6 +788,7 @@ def _render_deterministic_daybook(
     snapshot: dict[str, Any] | None,
     audit_status: dict[str, Any] | None,
     backup_status: dict[str, Any] | None,
+    event_count: int | None = None,
 ) -> str:
     decisions = [event for event in events if event.get("why")]
     blockers = [event for event in events if "block" in (event.get("category") or "") or "block" in event.get("text", "").casefold()]
@@ -790,7 +801,11 @@ def _render_deterministic_daybook(
         "## Key Events",
     ]
     if events:
-        for event in events[-12:]:
+        shown = events[-DAYBOOK_KEY_EVENTS:]
+        total = len(events) if event_count is None else event_count
+        if total > len(shown):
+            lines.append(f"_The latest {len(shown)} of {total} events of the day._")
+        for event in shown:
             lines.append(f"- {event['recorded_at']} | {event.get('category') or 'note'} | {event['text']}")
     else:
         lines.append("- No durable events recorded.")
@@ -845,6 +860,7 @@ def _compose_daybook(
     snapshot: dict[str, Any] | None,
     audit_status: dict[str, Any] | None,
     backup_status: dict[str, Any] | None,
+    event_count: int | None = None,
 ) -> tuple[str, str, str | None]:
     # The deterministic skeleton is the sole daybook output. MiniMax was cut
     # 2026-05-19; there is no longer an LLM narrative path.
@@ -854,6 +870,7 @@ def _compose_daybook(
         snapshot=snapshot,
         audit_status=audit_status,
         backup_status=backup_status,
+        event_count=event_count,
     )
     return deterministic, "ok", None
 
@@ -976,16 +993,104 @@ def run_git_commit_hook(
     return {"status": "stored", "event_id": stored["id"], "hook_event": hook_row}
 
 
+def _daybook_unchanged(
+    config, *, local_date: str, event_count: int, fingerprint: str, daybook_path: Path
+) -> dict[str, Any] | None:
+    """Return the existing daybook run when regenerating it would change nothing."""
+    existing = fetch_curation_run(config, curation_type="daybook", run_key=local_date)
+    if existing is None:
+        return None
+    status = existing.get("status")
+    payload = existing.get("payload") or {}
+    if status in {"ok", "failed_soft"}:
+        # A run from before fingerprints has none, so it is rewritten once.
+        return existing if payload.get("event_fingerprint") == fingerprint else None
+    if status == "skipped" and event_count == 0 and not daybook_path.exists():
+        return existing
+    return None
+
+
+def run_daybook_catchup(
+    manifest: dict[str, Any],
+    automation: AutomationConfig,
+    *,
+    trigger_source: str = "manual",
+    now: datetime | None = None,
+    lookback_days: int = DAYBOOK_CATCHUP_DAYS,
+) -> dict[str, Any]:
+    """Write today's daybook and repair recent completed days.
+
+    A run delayed past midnight (sleep, a late catch-up) used to summarise the
+    new, empty day and never the one that just ended. Here each of the last
+    `lookback_days` days, oldest first, gets a daybook if it has none or its
+    events changed since, then today does.
+    """
+    config = config_from_manifest(manifest)
+    today = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(config.timezone)).date()
+    days = [(today - timedelta(days=offset)).isoformat() for offset in range(lookback_days, -1, -1)]
+    results: dict[str, dict[str, Any]] = {}
+    for day in days:
+        try:
+            results[day] = run_daybook(
+                manifest, automation, target_date=day, trigger_source=trigger_source, regenerate=True
+            )
+        except Exception as exc:  # job boundary: one broken day must not cost the others
+            results[day] = {"status": "failed", **_exception_details(exc)}
+    statuses = {result["status"] for result in results.values()}
+    if "failed" in statuses:
+        status = "failed"
+    elif "failed_soft" in statuses:
+        status = "failed_soft"
+    elif "ok" in statuses:
+        status = "ok"
+    else:
+        status = "skipped"
+    written = [result for result in results.values() if result.get("event_id")]
+    latest = written[-1] if written else {}
+    # The newest daybook written this run, where a single-day run reports it.
+    return {
+        "status": status,
+        "days": results,
+        "event_id": latest.get("event_id"),
+        "artifact_id": latest.get("artifact_id"),
+        "path": latest.get("path"),
+    }
+
+
 def run_daybook(
     manifest: dict[str, Any],
     automation: AutomationConfig,
     *,
     target_date: str | None = None,
     trigger_source: str = "manual",
+    regenerate: bool = False,
 ) -> dict[str, Any]:
+    """Write the daybook for one local day.
+
+    With regenerate, an existing daybook is rewritten when the day's events
+    changed since it was generated, and a skipped or failed attempt is
+    retried; an unchanged day stays a no-op ("existing").
+    """
     config = config_from_manifest(manifest)
     start_dt, end_dt = _local_day_bounds(config, target_date)
     local_date = start_dt.astimezone(ZoneInfo(config.timezone)).strftime("%Y-%m-%d")
+    window = {
+        "start_utc": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_utc": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "exclude_source_kinds": (DAYBOOK_SOURCE_KIND,),
+    }
+    daybook_path = automation.daybook_dir / local_date[:4] / f"{local_date}.md"
+    if regenerate:
+        event_count, fingerprint = fingerprint_events_between(config, **window)
+        unchanged = _daybook_unchanged(
+            config,
+            local_date=local_date,
+            event_count=event_count,
+            fingerprint=fingerprint,
+            daybook_path=daybook_path,
+        )
+        if unchanged is not None:
+            return {"status": "existing", "run": unchanged, "reason": "unchanged"}
     run_id, created = start_curation_run(
         config,
         curation_type="daybook",
@@ -994,6 +1099,7 @@ def run_daybook(
         prompt_sha256=None,
         payload={"trigger_source": trigger_source},
         stale_ttl_hours=_stale_run_ttl_hours(automation),
+        supersede_finished=regenerate,
     )
     if not created:
         existing = fetch_curation_run(config, curation_type="daybook", run_key=local_date)
@@ -1001,19 +1107,24 @@ def run_daybook(
 
     failure_details: dict[str, Any] | None = None
     try:
-        events = fetch_events_between(
-            config,
-            start_utc=start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end_utc=end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            limit=1000,
-        )
+        # Read the day only once the claim is held, fingerprint first: an event
+        # landing in between is then rendered but not fingerprinted, so the
+        # next run regenerates instead of missing it.
+        event_count, fingerprint = fingerprint_events_between(config, **window)
+        events = fetch_events_between(config, **window, limit=DAYBOOK_EVENT_LIMIT, newest=True)
         latest_backup = fetch_latest_backup_run(config, successful_only=True)
         latest_audit = fetch_latest_curation_run(config, curation_type="weekly_audit")
         snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
 
         if not events:
+            result = {"status": "skipped", "run_id": run_id, "reason": "no_events"}
+            if daybook_path.exists():
+                # Every event of the day is hidden now: the file stops showing
+                # their text. Archived copies keep history (hiding is not erasing).
+                _atomic_write_text(daybook_path, f"# {local_date}\n\nNo visible events for this day.\n")
+                result["cleared"] = str(daybook_path)
             finish_curation_run(config, run_id=run_id, status="skipped", notes="No durable delta for this date.")
-            return {"status": "skipped", "run_id": run_id, "reason": "no_events"}
+            return result
 
         content, llm_status, llm_error = _compose_daybook(
             automation,
@@ -1022,11 +1133,9 @@ def run_daybook(
             snapshot=snapshot,
             audit_status=latest_audit,
             backup_status=latest_backup,
+            event_count=event_count,
         )
-
-        daybook_dir = automation.daybook_dir / local_date[:4]
-        daybook_dir.mkdir(parents=True, exist_ok=True)
-        daybook_path = daybook_dir / f"{local_date}.md"
+        daybook_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(daybook_path, content)
 
         artifact = _store_text_artifact(
@@ -1057,7 +1166,7 @@ def run_daybook(
                 "mem0_raw": None,
             },
             append_compat=True,
-            source_kind="chronicle_curator.daybook",
+            source_kind=DAYBOOK_SOURCE_KIND,
             imported_from=f"chronicle.curate.daybook:{trigger_source}",
         )
         link_artifact(
@@ -1074,7 +1183,9 @@ def run_daybook(
             status="ok" if llm_status == "ok" else "failed_soft",
             payload={
                 "local_date": local_date,
-                "event_count": len(events),
+                "event_count": event_count,
+                "event_fingerprint": fingerprint,
+                "events_rendered": len(events),
                 "daybook_path": str(daybook_path),
                 "llm_error": llm_error,
             },
@@ -2376,17 +2487,22 @@ def run_automation_job(
 
     if job_name == "daybook":
         def _daybook(run_id: str) -> dict[str, Any]:
-            result = run_daybook(manifest, automation, trigger_source=trigger_source)
+            result = run_daybook_catchup(manifest, automation, trigger_source=trigger_source, now=local_now)
             finish_automation_run(
                 config,
                 run_id=run_id,
-                status=result["status"] if result["status"] != "existing" else "ok",
+                status=result["status"],
                 details=result,
                 event_id=result.get("event_id"),
             )
             return result | {"run_id": run_id}
 
-        return _dispatch(daily_key, _daybook)
+        # One row per invocation, not per day: a run after midnight used to
+        # claim the new day's key and turn that evening's scheduled run into a
+        # no-op. Which days need a daybook is decided per day, from events.
+        # Microseconds and the UTC offset keep keys unique across quick
+        # repeats and the DST fall-back hour.
+        return _dispatch(local_now.isoformat(timespec="microseconds"), _daybook)
 
     if job_name == "mem0-dump":
         def _mem0_dump(run_id: str) -> dict[str, Any]:
