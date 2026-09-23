@@ -89,6 +89,8 @@ def _parse_case(raw: Any) -> GoldenCase:
         raise ValueError(f"category must be one of: {', '.join(CATEGORIES)}")
     expected = _refs(raw.get("expected"), "expected")
     stale = _refs(raw.get("stale", []), "stale")
+    if len(set(expected)) != len(expected) or len(set(stale)) != len(stale):
+        raise ValueError("a reference is listed twice")
     if (category == "abstention") != (not expected):
         raise ValueError("abstention cases, and only they, have no expected evidence")
     if set(stale) & set(expected):
@@ -100,6 +102,8 @@ def _parse_case(raw: Any) -> GoldenCase:
         or not all(isinstance(value, str) and value.strip() for value in scope.values())
     ):
         raise ValueError(f"scope maps {', '.join(SCOPE_KEYS)} to non-empty strings")
+    if "task_id" in scope and "project" not in scope:
+        raise ValueError("a task_id scope needs its project")
     lang = raw.get("lang", "und")
     if not isinstance(lang, str) or not lang.strip():
         raise ValueError("lang must be a non-empty string")
@@ -160,8 +164,9 @@ def _score_case(
         "ranked": ranked,
         "first_hit_rank": ranks[0] if ranks else None,
         "found_at_5": len(expected & set(ranked[:RECALL_AT])),
-        # An explicit "nothing confident" signal counts even with candidates.
-        "abstained": bool(response.get("no_confident_match")) or not ranked,
+        # An explicit "nothing confident" signal counts even with candidates;
+        # a failed query abstained from nothing.
+        "abstained": error is None and (bool(response.get("no_confident_match")) or not ranked),
         "degraded": bool(response.get("degraded")),
         "channel_errors": sorted((response.get("channel_errors") or {}).keys()),
         "latency_ms": round(latency_ms, 2),
@@ -263,6 +268,8 @@ def _grouped(details: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any
 def check_thresholds(report: Mapping[str, Any], thresholds: Mapping[str, float]) -> list[str]:
     """Return one message per overall metric below its floor."""
     failures = []
+    if report["overall"].get("errors"):
+        failures.append(f"errors: {report['overall']['errors']} queries failed")
     for name, floor in thresholds.items():
         value = report["overall"].get(name)
         if not isinstance(value, (int, float)):
