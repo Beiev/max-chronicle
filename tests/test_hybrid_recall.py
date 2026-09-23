@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from max_chronicle import service, store
+from max_chronicle.config import MIGRATIONS_DIR
 from max_chronicle.embeddings import cosine, pack_vector, unpack_vector, EMBED_DIM
 from max_chronicle.runtime_context import load_manifest
 from max_chronicle.store import (
@@ -524,7 +525,7 @@ class TestEmbedBackfillCli:
 
 
 def test_migrate_is_idempotent_v10(chronicle_sandbox) -> None:
-    """Applying migrations twice results in exactly 10 applied, user_version=10."""
+    """Applying migrations twice applies every file once and records the latest version."""
     first = _cli(
         "--db",
         str(chronicle_sandbox.chronicle_db),
@@ -545,10 +546,11 @@ def test_migrate_is_idempotent_v10(chronicle_sandbox) -> None:
     )
     first_payload = json.loads(first.stdout)
     second_payload = json.loads(second.stdout)
-    assert len(first_payload["applied"]) == 10, first_payload["applied"]
+    latest = max(int(path.name[:4]) for path in MIGRATIONS_DIR.glob("*.sql"))
+    assert len(first_payload["applied"]) == latest, first_payload["applied"]
     assert second_payload["applied"] == []
-    assert first_payload["summary"]["user_version"] == 10
-    assert second_payload["summary"]["user_version"] == 10
+    assert first_payload["summary"]["user_version"] == latest
+    assert second_payload["summary"]["user_version"] == latest
 
 
 def test_weak_positive_vector_match_does_not_answer_unrelated_query(loaded_manifest, monkeypatch):

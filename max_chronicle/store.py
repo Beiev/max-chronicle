@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import mimetypes
-import re
 import shutil
 import sqlite3
 import tempfile
@@ -24,9 +23,11 @@ from .config import (
     ensure_runtime_dirs,
 )
 from .db import apply_migrations, connect, utc_now
+from .lexical import covers, query_terms, relaxed_query, strict_query
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
+RELAXED_CANDIDATE_FACTOR = 5  # relaxed FTS rows fetched per result kept
 DEFAULT_STALE_RUN_TTL_HOURS = 6
 STALE_RUN_STATUS = "stale_failed"
 
@@ -319,15 +320,9 @@ def _project_from_entity_id(entity_id: str | None) -> str | None:
     return entity_id.split(":", 1)[1]
 
 
-def _fts_query(query: str) -> str:
-    tokens = [
-        token.replace('"', '""')
-        for token in re.findall(r"[A-Za-zА-Яа-я0-9$+._-]+", query.casefold())
-        if len(token) >= 2
-    ]
-    if not tokens:
-        return '""'
-    return " AND ".join(f'"{token}"' for token in tokens)
+def _fts_query(query: str, *, relaxed: bool = False) -> str:
+    terms = query_terms(query)
+    return relaxed_query(terms) if relaxed else strict_query(terms)
 
 
 def _ensure_entity(
@@ -1661,9 +1656,13 @@ def search_events(
     project: str | None = None,
     task_id: str | None = None,
     current_only: bool = False,
+    relaxed: bool = False,
 ) -> list[dict[str, Any]]:
+    """Rank events matching every query term, or with ``relaxed``, most of them by stem."""
     resolved_visibility = _normalize_event_visibility(visibility)
-    fts_query = _fts_query(query)
+    fts_query = _fts_query(query, relaxed=relaxed)
+    # A relaxed match is re-checked for coverage below, so take a wider cut first.
+    fetch_limit = limit * RELAXED_CANDIDATE_FACTOR if relaxed else limit
     with open_connection(config) as connection:
         rows = connection.execute(
             """
@@ -1702,8 +1701,14 @@ def search_events(
             LIMIT ?
             """,
             (resolved_visibility, fts_query, domain, domain, domain,
-             project, project, task_id, task_id, current_only, limit),
+             project, project, task_id, task_id, current_only, fetch_limit),
         ).fetchall()
+    if relaxed:
+        terms = query_terms(query)
+        rows = [
+            row for row in rows
+            if covers(terms, " ".join(filter(None, (row["text"], row["why"], row["circumstances"]))))
+        ][:limit]
     return [_event_row_to_entry(row) for row in rows]
 
 

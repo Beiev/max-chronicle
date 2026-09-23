@@ -17,6 +17,7 @@ import pytest
 from zoneinfo import ZoneInfo
 
 import max_chronicle.native_automation as native_automation_module
+from max_chronicle.config import MIGRATIONS_DIR
 from max_chronicle.db import database_summary
 from max_chronicle.native_automation import (
     doctor_launchd,
@@ -104,10 +105,11 @@ def test_migrate_is_idempotent(chronicle_sandbox) -> None:
     )
     first_payload = json.loads(first.stdout)
     second_payload = json.loads(second.stdout)
-    assert len(first_payload["applied"]) == 10
+    latest = max(int(path.name[:4]) for path in MIGRATIONS_DIR.glob("*.sql"))
+    assert len(first_payload["applied"]) == latest
     assert second_payload["applied"] == []
-    assert first_payload["summary"]["user_version"] == 10
-    assert second_payload["summary"]["user_version"] == 10
+    assert first_payload["summary"]["user_version"] == latest
+    assert second_payload["summary"]["user_version"] == latest
 
 
 def test_repair_stale_runs_cli_reports_and_marks_both_run_tables(chronicle_sandbox, loaded_manifest) -> None:

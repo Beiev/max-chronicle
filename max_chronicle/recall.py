@@ -49,10 +49,18 @@ def query_memory(
     eligible = {row["id"]: row for row in pool}
     errors: dict[str, str] = {}
     fts: dict[str, int] = {}
+    relaxed = False
     try:
         hits = search_events(
             config, query=query, limit=max(limit * 4, 40), current_only=True, **scope
         )
+        if not hits:
+            # No evidence holds every term: accept stems covering most of them,
+            # and say so, since such a match is weaker evidence (FR-2).
+            hits = search_events(
+                config, query=query, limit=max(limit * 4, 40), current_only=True, relaxed=True, **scope
+            )
+            relaxed = bool(hits)
         fts = {
             hit["id"]: rank for rank, hit in enumerate(hits) if hit["id"] in eligible
         }
@@ -170,6 +178,7 @@ def query_memory(
         "query": query,
         **scope,
         "results": results,
+        "relaxed": relaxed,
         "channels_used": channels,
         "degraded": bool(errors),
         "channel_errors": errors,

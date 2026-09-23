@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION
 from .db import utc_now  # re-exported: one timestamp format for the whole package
+from .lexical import fold, query_terms
 
 
 def read_toml(path: Path) -> dict[str, Any]:
@@ -149,15 +150,15 @@ def file_meta(path: Path) -> dict[str, Any]:
 
 
 def tokenize(query: str) -> list[str]:
-    return [token for token in re.findall(r"[A-Za-zА-Яа-я0-9$+._-]+", query.casefold()) if len(token) >= 2]
+    return query_terms(query)
 
 
 def score_text(haystack: str, tokens: list[str], raw_query: str) -> float:
-    lowered = haystack.casefold()
+    lowered = fold(haystack)
     if not lowered:
         return 0.0
     token_hits = sum(1 for token in tokens if token in lowered)
-    exact_bonus = 1.5 if raw_query.casefold() in lowered else 0.0
+    exact_bonus = 1.5 if fold(raw_query) in lowered else 0.0
     return float(token_hits) + exact_bonus
 
 
