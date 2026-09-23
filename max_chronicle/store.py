@@ -27,7 +27,8 @@ from .lexical import covers, query_terms, relaxed_query, strict_query
 
 
 POINTER_ONLY_STORAGE_PREFIX = "pointer://"
-RELAXED_CANDIDATE_FACTOR = 5  # relaxed FTS rows fetched per result kept
+RELAXED_CANDIDATE_FACTOR = 5  # relaxed FTS rows read per page, per result wanted
+RELAXED_MAX_PAGES = 4  # a relaxed search reads at most this many pages
 DEFAULT_STALE_RUN_TTL_HOURS = 6
 STALE_RUN_STATUS = "stale_failed"
 
@@ -1658,58 +1659,69 @@ def search_events(
     current_only: bool = False,
     relaxed: bool = False,
 ) -> list[dict[str, Any]]:
-    """Rank events matching every query term, or with ``relaxed``, most of them by stem."""
+    """Rank events matching every query term, or with ``relaxed``, most of them by stem.
+
+    A relaxed match is re-checked for coverage, and BM25 can rank a row holding
+    one rare term above rows holding most terms, so relaxed rows are read page
+    by page until ``limit`` rows pass or ``RELAXED_MAX_PAGES`` pages are read.
+    """
     resolved_visibility = _normalize_event_visibility(visibility)
     fts_query = _fts_query(query, relaxed=relaxed)
-    # A relaxed match is re-checked for coverage below, so take a wider cut first.
-    fetch_limit = limit * RELAXED_CANDIDATE_FACTOR if relaxed else limit
+    terms = query_terms(query)
+    page_size = limit * RELAXED_CANDIDATE_FACTOR if relaxed else limit
+    kept: list[sqlite3.Row] = []
     with open_connection(config) as connection:
-        rows = connection.execute(
-            """
-            SELECT
-                e.id,
-                e.occurred_at_utc,
-                e.actor,
-                e.category,
-                e.entity_id,
-                e.text,
-                e.why,
-                e.circumstances,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at,
-                bm25(events_fts) AS rank
-            FROM events_fts
-            JOIN events AS e
-                ON e.id = events_fts.event_id
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
-            WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
-              AND events_fts MATCH ?
-              AND """ + _event_domain_where_clause("e") + """
-              AND (? IS NULL OR e.title = ?)
-              AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
-              AND (? = 0 OR NOT EXISTS (SELECT 1 FROM facts f
-                  WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
-                  OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
-                      AND json_extract(obs.payload_json,'$.fact_id')=f.id))))
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (resolved_visibility, fts_query, domain, domain, domain,
-             project, project, task_id, task_id, current_only, fetch_limit),
-        ).fetchall()
-    if relaxed:
-        terms = query_terms(query)
-        rows = [
-            row for row in rows
-            if covers(terms, " ".join(filter(None, (row["text"], row["why"], row["circumstances"]))))
-        ][:limit]
-    return [_event_row_to_entry(row) for row in rows]
+        for page in range(RELAXED_MAX_PAGES if relaxed else 1):
+            rows = connection.execute(
+                """
+                SELECT
+                    e.id,
+                    e.occurred_at_utc,
+                    e.actor,
+                    e.category,
+                    e.entity_id,
+                    e.text,
+                    e.why,
+                    e.circumstances,
+                    e.mem0_status,
+                    e.mem0_error,
+                    e.payload_json,
+                    o.status AS outbox_status,
+                    o.last_error AS outbox_last_error,
+                    o.payload_json AS outbox_payload_json,
+                    o.synced_at_utc AS outbox_synced_at,
+                    bm25(events_fts) AS rank
+                FROM events_fts
+                JOIN events AS e
+                    ON e.id = events_fts.event_id
+                LEFT JOIN mem0_outbox AS o
+                    ON o.event_id = e.id AND o.operation = 'add'
+                WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
+                  AND events_fts MATCH ?
+                  AND """ + _event_domain_where_clause("e") + """
+                  AND (? IS NULL OR e.title = ?)
+                  AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
+                  AND (? = 0 OR NOT EXISTS (SELECT 1 FROM facts f
+                      WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
+                      OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
+                          AND json_extract(obs.payload_json,'$.fact_id')=f.id))))
+                ORDER BY rank, e.id
+                LIMIT ? OFFSET ?
+                """,
+                (resolved_visibility, fts_query, domain, domain, domain,
+                 project, project, task_id, task_id, current_only, page_size, page * page_size),
+            ).fetchall()
+            if not relaxed:
+                kept = rows
+                break
+            seen = {row["id"] for row in kept}  # a write between pages can shift a row
+            kept += [
+                row for row in rows
+                if row["id"] not in seen and covers(terms, " ".join(filter(None, (row["text"], row["why"]))))
+            ]
+            if len(kept) >= limit or len(rows) < page_size:
+                break
+    return [_event_row_to_entry(row) for row in kept[:limit]]
 
 
 def search_fact_events(

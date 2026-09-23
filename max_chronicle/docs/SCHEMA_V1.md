@@ -16,14 +16,14 @@ The core storage model:
 
 Current operational database version:
 
-- `PRAGMA user_version = 10`
+- `PRAGMA user_version = 11`
 - latest applied migration: `0011_fold_fulltext.sql`
 - next migration number: `0012`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
 Migration `0009` adds `event_embeddings` (float32 BLOB vectors) backing the hybrid `query_memory` recall.
-Migration `0011` rebuilds `events_fts` (event text, why, circumstances; no longer the project slug in `title`) and `facts_fts` (now contentful) with ё folded into е, because FTS5's unicode61 tokenizer keeps the two apart.
+Migration `0011` rebuilds `events_fts` (event text and why only; no longer the project and domain slugs in `title` and `circumstances`) and `facts_fts` (now contentful) with ё folded into е, because FTS5's unicode61 tokenizer keeps the two apart.
 
 ## Core Tables
 

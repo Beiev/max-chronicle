@@ -46,6 +46,8 @@ LEXICAL_BASELINE = frozenset(
         "fact-uk-keywords",
         "fact-en-backups-question",
         "rationale-ru-question",
+        # Negations kept as terms ("чому не публікуємо демо"):
+        "rationale-uk-question",
         # Traded away: "default video model" now matches "default image model"
         # by 2 of 3 terms in relaxed mode. An honest no_confident_match should
         # win abstain-en-near-miss back.

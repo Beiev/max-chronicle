@@ -51,22 +51,18 @@ def query_memory(
     fts: dict[str, int] = {}
     relaxed = False
     try:
-        hits = search_events(
-            config, query=query, limit=max(limit * 4, 40), current_only=True, **scope
-        )
-        if not hits:
-            # No evidence holds every term: accept stems covering most of them,
-            # and say so, since such a match is weaker evidence (FR-2).
-            hits = search_events(
-                config, query=query, limit=max(limit * 4, 40), current_only=True, relaxed=True, **scope
-            )
+        wanted = max(limit * 4, 40)
+        hits = search_events(config, query=query, limit=wanted, current_only=True, **scope)
+        fact_hits = search_fact_events(config, query=query, limit=wanted, **scope)
+        if not hits and not fact_hits:
+            # No event or fact holds every term: accept events whose stems cover
+            # most of them, and say so, since such a match is weaker (FR-2).
+            hits = search_events(config, query=query, limit=wanted, current_only=True, relaxed=True, **scope)
             relaxed = bool(hits)
         fts = {
             hit["id"]: rank for rank, hit in enumerate(hits) if hit["id"] in eligible
         }
-        for rank, event_id in enumerate(
-            search_fact_events(config, query=query, limit=max(limit * 4, 40), **scope)
-        ):
+        for rank, event_id in enumerate(fact_hits):
             if event_id in eligible:
                 fts[event_id] = min(fts.get(event_id, rank), rank)
     except Exception as exc:
