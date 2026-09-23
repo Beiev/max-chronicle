@@ -132,6 +132,9 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
         connection.execute("PRAGMA query_only = ON")
         return connection
+    # Settings of this connection only: they change nothing in the file.
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA synchronous = FULL")
     application_id, has_objects, has_history = _schema_markers(connection)
     if _is_foreign(application_id, has_objects=has_objects, has_history=has_history):
         return connection
@@ -162,8 +165,6 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
                 raise
         if attempt < CONNECT_WAL_RETRIES:
             time.sleep(0.02 * (2 ** attempt) + random.uniform(0.0, 0.03))
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA synchronous = FULL")
     return connection
 
 

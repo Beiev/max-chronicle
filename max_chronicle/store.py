@@ -120,26 +120,61 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
     return config
 
 
+_READ_ONLY_PROCESS = False
+
+
+def set_read_only_process(enabled: bool) -> None:
+    """Open every later connection of this process read-only (a read-only server).
+
+    Such a process never creates, initialises, upgrades, or writes a database:
+    a missing or outdated one is an error, and a write raises.
+    """
+    global _READ_ONLY_PROCESS
+    _READ_ONLY_PROCESS = enabled
+
+
+_SCHEMA_PROBE = (
+    "SELECT user_version, application_id, EXISTS ("
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ") FROM pragma_user_version, pragma_application_id"
+)
+
+
 @contextmanager
 def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
     # Yields a scoped connection and closes it on exit. sqlite3.Connection's own
     # `__exit__` only commits/rollbacks — without this wrapper, `with open_connection(...)`
     # leaked ~10MB of page cache + prepared statements per call, compounding inside
     # the long-lived MCP daemon. Callers still wrap in `with connection:` for a txn.
-    ensure_runtime_dirs(config)
-    connection = connect(config.db_path)
-    try:
-        current, application_id = connection.execute(
-            "SELECT user_version, application_id FROM pragma_user_version, pragma_application_id"
-        ).fetchone()
-        if current != target_schema_version(config) or application_id not in (0, APPLICATION_ID):
-            # A new database initialises here; an existing one that is behind
-            # this code raises unless CHRONICLE_AUTO_MIGRATE opts back in.
-            ensure_schema(
-                connection,
-                config,
-                allow_upgrade=feature_enabled(ENV_CHRONICLE_AUTO_MIGRATE, default=False),
+    if _READ_ONLY_PROCESS:
+        if not config.db_path.exists():
+            raise SchemaMigrationRequired(
+                f"No database at {config.db_path}; a read-only server never creates one."
             )
+        connection = connect(config.db_path, read_only=True)
+    else:
+        ensure_runtime_dirs(config)
+        connection = connect(config.db_path)
+    try:
+        current, application_id, has_history = connection.execute(_SCHEMA_PROBE).fetchone()
+        current_schema = (
+            current == target_schema_version(config)
+            and application_id in (0, APPLICATION_ID)
+            and has_history
+        )
+        if not current_schema:
+            if _READ_ONLY_PROCESS:
+                check_schema_policy(
+                    read_schema_state(connection, config), config, allow_upgrade=False, allow_init=False
+                )
+            else:
+                # A new database initialises here; anything else that is not
+                # current raises unless CHRONICLE_AUTO_MIGRATE opts back in.
+                ensure_schema(
+                    connection,
+                    config,
+                    allow_upgrade=feature_enabled(ENV_CHRONICLE_AUTO_MIGRATE, default=False),
+                )
         yield connection
     finally:
         connection.close()

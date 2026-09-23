@@ -56,6 +56,7 @@ from .store import (
     fetch_recent_events,
     open_connection,
     prepare_database,
+    set_read_only_process,
     target_schema_version,
 )
 from .memory import Checkpoint, FactInput
@@ -1039,6 +1040,8 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         if isinstance(exc, ChronicleConfigError):
             return EXIT_CONFIG_ERROR
         return EXIT_SCHEMA_ACTION if isinstance(exc, MigrationError) else 1
+    if read_only:
+        set_read_only_process(True)
     if prepared.applied:
         _LOGGER.warning(
             "chronicle-mcp migrated %s from v%d to v%d; backup=%s",

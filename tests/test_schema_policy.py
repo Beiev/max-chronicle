@@ -40,7 +40,13 @@ from max_chronicle.db import (
     read_schema_state,
 )
 from max_chronicle.runtime_context import load_manifest
-from max_chronicle.store import config_from_manifest, open_connection, prepare_database, reset_migration_cache
+from max_chronicle.store import (
+    config_from_manifest,
+    open_connection,
+    prepare_database,
+    reset_migration_cache,
+    set_read_only_process,
+)
 
 LATEST_VERSION = max(int(path.name[:4]) for path in MIGRATIONS_DIR.glob("*.sql"))
 
@@ -215,6 +221,49 @@ def test_another_applications_sqlite_file_is_left_untouched(tmp_path) -> None:
     assert application_id == 0
     assert _journal_mode(db_path) == "delete"  # connecting did not switch it to WAL
     assert db_path.stat().st_size == size and not Path(f"{db_path}-wal").exists()
+
+
+def test_a_foreign_file_without_migration_history_is_refused_even_at_the_current_version(tmp_path) -> None:
+    db_path = tmp_path / "chronicle.db"
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE notes(body TEXT)")
+        connection.execute(f"PRAGMA user_version = {LATEST_VERSION}")
+        connection.commit()
+
+    with pytest.raises(MigrationError, match="not a Chronicle database"):
+        with open_connection(_config(db_path)):
+            pass
+
+
+def test_every_connection_enforces_foreign_keys(tmp_path) -> None:
+    config = _config(tmp_path / "chronicle.db")
+
+    with open_connection(config) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_a_read_only_process_never_creates_upgrades_or_writes(tmp_path) -> None:
+    current = _config(tmp_path / "current.db")
+    with open_connection(current) as connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS probe(x INTEGER)")
+        connection.commit()
+    older = _config(_older_database(tmp_path, tmp_path / "older.db"))
+    missing = _config(tmp_path / "missing.db")
+    set_read_only_process(True)
+
+    with open_connection(current) as connection:
+        assert connection.execute("SELECT count(*) FROM probe").fetchone()[0] == 0
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("INSERT INTO probe VALUES (1)")
+    with pytest.raises(SchemaMigrationRequired):
+        with open_connection(older):
+            pass
+    with pytest.raises(SchemaMigrationRequired, match="never creates"):
+        with open_connection(missing):
+            pass
+
+    assert not missing.db_path.exists()
+    assert _schema_version(older.db_path) == LATEST_VERSION - 1
 
 
 def test_a_foreign_file_with_a_matching_version_is_refused(tmp_path) -> None:

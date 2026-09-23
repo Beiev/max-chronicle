@@ -26,7 +26,7 @@ for _name in (
 
 from max_chronicle.automation import load_automation_config
 from max_chronicle.runtime_context import load_manifest
-from max_chronicle.store import reset_migration_cache
+from max_chronicle.store import reset_migration_cache, set_read_only_process
 
 # Anchor on the checkout, not on one machine's absolute path.
 CHRONICLE_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "max_chronicle"
@@ -52,6 +52,14 @@ def _reset_migration_cache():
     reset_migration_cache()
     yield
     reset_migration_cache()
+
+
+@pytest.fixture(autouse=True)
+def _writable_process():
+    """A test that starts a read-only server must not leave this process read-only."""
+    set_read_only_process(False)
+    yield
+    set_read_only_process(False)
 
 
 @dataclass
