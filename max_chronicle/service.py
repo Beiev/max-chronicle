@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import unicodedata
 from typing import Any
@@ -2147,14 +2148,15 @@ def record_event(
     embed_dim: int | None = None
     if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
         try:
-            from .embeddings import embed_text as _embed_text_default, event_embedding_text, EMBED_DIM, EMBED_MODEL
+            from .embeddings import active_profile, embed_document, event_embedding_text
             # _embed_fn_override is popped from entry before normalization
             # so it never reaches payload_json.
-            _embed_fn = _embed_fn_override or _embed_text_default
+            _embed_fn = _embed_fn_override or embed_document
             embed_input = event_embedding_text(normalized_entry)
             if embed_input:
                 embedding_vec = _embed_fn(embed_input)
-                embed_model, embed_dim = EMBED_MODEL, EMBED_DIM
+                if embedding_vec is not None:
+                    embed_model, embed_dim = active_profile().key, len(embedding_vec)
         except Exception:  # noqa: BLE001
             embedding_vec = None  # embedding is non-critical
 
@@ -2208,14 +2210,21 @@ def record_event(
             stored["dedupe_status"] = "exact_duplicate" if dedupe else "content_hash_match"
             stored["dedupe_window_hours"] = dedupe_window_hours if dedupe else hash_dedup_window
         if embedding_vec is not None and embed_model is not None and embed_dim is not None:
-            store_event_embedding(
-                config,
-                stored["id"],
-                embedding_vec,
-                embed_model,
-                embed_dim,
-                connection=connection,
-            )
+            # A vector is an index entry, not part of the record: failing to
+            # store it must not lose the event; embed-backfill repairs the gap.
+            connection.execute("SAVEPOINT event_vector")
+            try:
+                store_event_embedding(
+                    config,
+                    stored["id"],
+                    embedding_vec,
+                    embed_model,
+                    embed_dim,
+                    connection=connection,
+                )
+            except (ValueError, sqlite3.Error):
+                connection.execute("ROLLBACK TO event_vector")
+            connection.execute("RELEASE event_vector")
         for staged in staged_artifacts:
             staged["observed_at"] = stored["recorded_at"]
             staged["metadata"]["event_id"] = stored["id"]
@@ -3357,15 +3366,16 @@ def embed_backfill(
     *,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Embed all events that lack an embedding row.
+    """Embed every event the active profile's index lacks.
 
-    Returns counts: {embedded, skipped, failed}.
+    Returns counts: {embedded, skipped, failed} and the index's model key.
     Best-effort — individual failures do not abort the run.
     """
-    from .embeddings import embed_text, event_embedding_text, EMBED_DIM, EMBED_MODEL
+    from .embeddings import BACKFILL_TIMEOUT_S, active_profile, embed_document, event_embedding_text
 
     config = _config(manifest)
-    event_ids = fetch_event_ids_without_embedding(config)
+    model_key = active_profile().key
+    event_ids = fetch_event_ids_without_embedding(config, model_key=model_key)
     if limit is not None:
         event_ids = event_ids[:limit]
 
@@ -3383,16 +3393,17 @@ def embed_backfill(
             if not embed_input:
                 skipped += 1
                 continue
-            vec = embed_text(embed_input)
+            vec = embed_document(embed_input, timeout=BACKFILL_TIMEOUT_S)
             if vec is None:
                 failed += 1
                 continue
-            store_event_embedding(config, event_id, vec, EMBED_MODEL, EMBED_DIM)
+            store_event_embedding(config, event_id, vec, model_key, len(vec))
             embedded += 1
         except Exception:  # noqa: BLE001
             failed += 1
 
     return {
+        "model_key": model_key,
         "total_without_embedding": len(event_ids),
         "embedded": embedded,
         "skipped": skipped,

@@ -233,7 +233,7 @@ def _percentile(ordered: list[float], percent: int) -> float | None:
 
 def build_report(details: list[dict[str, Any]], *, golden_path: Path | None = None) -> dict[str, Any]:
     """Wrap scored cases in a self-describing report with group breakdowns."""
-    from .embeddings import EMBED_MODEL
+    from .embeddings import active_profile
 
     golden: dict[str, Any] = {"cases": len(details)}
     if golden_path is not None:
@@ -248,8 +248,10 @@ def build_report(details: list[dict[str, Any]], *, golden_path: Path | None = No
         "golden": golden,
         "settings": {
             "limit": RECALL_LIMIT,
-            "embed_model": EMBED_MODEL,
-            "vector_min_similarity": os.environ.get("CHRONICLE_VECTOR_MIN_SIMILARITY", "0.65"),
+            "embed_model": active_profile().key,
+            "vector_min_similarity": float(
+                os.environ.get("CHRONICLE_VECTOR_MIN_SIMILARITY") or active_profile().min_similarity
+            ),
         },
         "overall": summarize(details),
         "by_category": _grouped(details, "category"),

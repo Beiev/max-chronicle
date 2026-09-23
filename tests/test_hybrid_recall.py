@@ -19,7 +19,7 @@ import pytest
 
 from max_chronicle import service, store
 from max_chronicle.config import MIGRATIONS_DIR
-from max_chronicle.embeddings import cosine, pack_vector, unpack_vector, EMBED_DIM
+from max_chronicle.embeddings import cosine, pack_vector, unpack_vector
 from max_chronicle.runtime_context import load_manifest
 from max_chronicle.store import (
     config_from_manifest,
@@ -33,6 +33,15 @@ from max_chronicle.store import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# These tests run under the nomic-embed-text profile: 768-dimensional vectors
+# stored under its model key, and its 0.65 cosine floor.
+EMBED_DIM = 768
+
+
+@pytest.fixture(autouse=True)
+def _nomic_profile(monkeypatch):
+    monkeypatch.setenv("CHRONICLE_EMBED_MODEL", "nomic-embed-text")
 
 def _make_vec(seed: float, dim: int = EMBED_DIM) -> list[float]:
     """Deterministic unit vector based on seed (for reproducible tests)."""
@@ -431,7 +440,7 @@ def _cli(*args: str) -> subprocess.CompletedProcess:
 
 class TestEmbedBackfillCli:
     def test_embed_backfill_populates_missing_embeddings(self, chronicle_sandbox) -> None:
-        """embed-backfill with mocked embed_text populates event_embeddings."""
+        """embed-backfill with mocked embed_text populates event_vectors."""
         from max_chronicle.store import config_from_manifest, fetch_event_ids_without_embedding
 
         manifest = load_manifest(chronicle_sandbox.manifest_path)
@@ -507,7 +516,7 @@ class TestEmbedBackfillCli:
 
         call_count = [0]
 
-        def _count_and_return(text: str) -> list[float]:
+        def _count_and_return(text: str, **_options) -> list[float]:
             call_count[0] += 1
             return _make_vec(float(call_count[0]))
 

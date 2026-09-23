@@ -1873,12 +1873,20 @@ def search_fact_events(
 def fetch_recall_pool(
     config: ChronicleConfig, *, domain: str | None = None,
     project: str | None = None, task_id: str | None = None,
+    model_key: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Scope eligible events before vector ranking; include missing index rows."""
+    """Scope eligible events before vector ranking; include missing index rows.
+
+    Each event carries its vector for ``model_key`` (the active embedding
+    profile by default), or None when that index lacks it.
+    """
+    from .embeddings import active_profile
+
+    key = model_key or active_profile().key
     with open_connection(config) as connection:
         rows = connection.execute(
-            """SELECT e.id, e.occurred_at_utc, ee.model, ee.dim, ee.vector
-            FROM events e LEFT JOIN event_embeddings ee ON ee.event_id = e.id
+            """SELECT e.id, e.occurred_at_utc, ev.model_key, ev.dim, ev.vector
+            FROM events e LEFT JOIN event_vectors ev ON ev.event_id = e.id AND ev.model_key = ?
             WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
               AND """ + _event_domain_where_clause("e") + """
               AND (? IS NULL OR e.title = ?)
@@ -1888,7 +1896,7 @@ def fetch_recall_pool(
                   OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
                       AND json_extract(obs.payload_json,'$.fact_id')=f.id)))
             ORDER BY e.occurred_at_utc DESC, e.id
-            """, (domain, domain, domain, project, project, task_id, task_id),
+            """, (key, domain, domain, domain, project, project, task_id, task_id),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -4024,21 +4032,21 @@ def store_event_embedding(
     config: ChronicleConfig,
     event_id: str,
     vector: list[float],
-    model: str,
+    model_key: str,
     dim: int,
     *,
     connection: sqlite3.Connection | None = None,
 ) -> None:
-    """Upsert an embedding row for *event_id*.
+    """Upsert the vector of *event_id* under *model_key*.
 
-    Packs *vector* as a float32 BLOB and writes it into event_embeddings.
-    Idempotent — calling twice with the same event_id replaces the row.
+    Packs *vector* as a float32 BLOB into event_vectors. Idempotent: storing
+    again for the same event and key replaces the row; other keys are kept.
     """
-    from .embeddings import pack_vector  # local import avoids circular at module load
-    import math
+    from .embeddings import FLOAT32_MAX, pack_vector  # local import avoids circular at module load
 
-    if len(vector) != dim or not vector or not all(math.isfinite(x) for x in vector) or not any(vector):
-        raise ValueError("Embedding must have the declared dimension and finite, nonzero values")
+    # abs(x) <= FLOAT32_MAX also rejects NaN and infinities.
+    if len(vector) != dim or not vector or not all(abs(x) <= FLOAT32_MAX for x in vector) or not any(vector):
+        raise ValueError("Embedding must have the declared dimension and nonzero float32 values")
 
     blob = pack_vector(vector)
     now = utc_now()
@@ -4046,15 +4054,14 @@ def store_event_embedding(
     def _persist(active_connection: sqlite3.Connection) -> None:
         active_connection.execute(
             """
-            INSERT INTO event_embeddings(event_id, model, dim, vector, created_at_utc)
+            INSERT INTO event_vectors(event_id, model_key, dim, vector, created_at_utc)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(event_id) DO UPDATE SET
-                model          = excluded.model,
+            ON CONFLICT(event_id, model_key) DO UPDATE SET
                 dim            = excluded.dim,
                 vector         = excluded.vector,
                 created_at_utc = excluded.created_at_utc
             """,
-            (event_id, model, dim, blob, now),
+            (event_id, model_key, dim, blob, now),
         )
 
     if connection is not None:
@@ -4066,28 +4073,32 @@ def store_event_embedding(
 
 def fetch_all_event_embeddings(
     config: ChronicleConfig,
+    *,
+    model_key: str | None = None,
 ) -> list[tuple[str, list[float]]]:
-    """Return all (event_id, unpacked_vector) tuples from event_embeddings."""
-    from .embeddings import unpack_vector  # local import
+    """Return (event_id, vector) pairs of one index, the active profile's by default."""
+    from .embeddings import active_profile, unpack_vector  # local import
 
     with open_connection(config) as connection:
         rows = connection.execute(
-            "SELECT event_id, vector FROM event_embeddings"
+            "SELECT event_id, vector FROM event_vectors WHERE model_key = ?",
+            (model_key or active_profile().key,),
         ).fetchall()
     return [(row["event_id"], unpack_vector(row["vector"])) for row in rows]
 
 
-def fetch_event_ids_without_embedding(config: ChronicleConfig) -> list[str]:
-    """Return missing or incompatible rows so backfill can repair model changes."""
-    from .embeddings import EMBED_MODEL, EMBED_DIM
+def fetch_event_ids_without_embedding(config: ChronicleConfig, *, model_key: str | None = None) -> list[str]:
+    """Events the index of ``model_key`` (the active profile's by default) lacks or holds malformed."""
+    from .embeddings import active_profile
+
     with open_connection(config) as connection:
         rows = connection.execute(
             """
             SELECT e.id
             FROM events AS e
-            LEFT JOIN event_embeddings AS ee ON ee.event_id = e.id
-            WHERE ee.event_id IS NULL OR ee.model != ? OR ee.dim != ? OR length(ee.vector) != ?
+            LEFT JOIN event_vectors AS ev ON ev.event_id = e.id AND ev.model_key = ?
+            WHERE ev.event_id IS NULL OR length(ev.vector) != ev.dim * 4
             ORDER BY e.occurred_at_utc DESC
-            """, (EMBED_MODEL, EMBED_DIM, EMBED_DIM * 4),
+            """, (model_key or active_profile().key,),
         ).fetchall()
     return [row["id"] for row in rows]

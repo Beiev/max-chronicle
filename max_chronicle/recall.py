@@ -28,10 +28,11 @@ def query_memory(
 ) -> dict[str, Any]:
     """Fuse relevant lexical/vector candidates, then apply a recency prior.
 
-    RRF scores are ranking signals, not confidence. A configurable cosine floor
-    rejects weak vector-only candidates; exact lexical hits need no embedding.
+    RRF scores are ranking signals, not confidence. A cosine floor (the active
+    embedding profile's, or CHRONICLE_VECTOR_MIN_SIMILARITY) rejects weak
+    vector-only candidates; exact lexical hits need no embedding.
     """
-    from .embeddings import EMBED_DIM, EMBED_MODEL, cosine, embed_text, unpack_vector
+    from .embeddings import active_profile, cosine, embed_query, unpack_vector
     from .memory import event_provenance
 
     if not isinstance(query, str) or not query.strip():
@@ -40,12 +41,13 @@ def query_memory(
         raise ValueError("limit must be between 1 and 100")
     if task_id and not project:
         raise ValueError("task_id requires project")
-    threshold = float(os.environ.get("CHRONICLE_VECTOR_MIN_SIMILARITY", "0.65"))
+    profile = active_profile()
+    threshold = float(os.environ.get("CHRONICLE_VECTOR_MIN_SIMILARITY") or profile.min_similarity)
     if not math.isfinite(threshold) or not 0 <= threshold <= 1:
         raise ValueError("CHRONICLE_VECTOR_MIN_SIMILARITY must be between 0 and 1")
     config = config_from_manifest(manifest)
     scope = dict(domain=domain, project=project, task_id=task_id)
-    pool = fetch_recall_pool(config, **scope)
+    pool = fetch_recall_pool(config, model_key=profile.key, **scope)
     eligible = {row["id"]: row for row in pool}
     errors: dict[str, str] = {}
     fts: dict[str, int] = {}
@@ -70,15 +72,9 @@ def query_memory(
     except Exception as exc:
         errors["fts"] = f"{type(exc).__name__}: {exc}"
 
-    compatible = [
-        r
-        for r in pool
-        if r["model"] == EMBED_MODEL
-        and r["dim"] == EMBED_DIM
-        and r["vector"] is not None
-        and len(r["vector"]) == EMBED_DIM * 4
-    ]
+    compatible = [r for r in pool if r["vector"] is not None and len(r["vector"]) == r["dim"] * 4]
     coverage = {
+        "model_key": profile.key,
         "eligible": len(pool),
         "compatible": len(compatible),
         "missing_or_incompatible": len(pool) - len(compatible),
@@ -86,15 +82,15 @@ def query_memory(
     similarities: dict[str, float] = {}
     vector_available = False
     try:
-        query_vec = embed_text(query)
+        query_vec = embed_query(query)
         if query_vec is None:
             errors["vector"] = "embedding_backend_unavailable"
-        elif (
-            len(query_vec) != EMBED_DIM
-            or not all(math.isfinite(x) for x in query_vec)
-            or not any(query_vec)
-        ):
+        elif not all(math.isfinite(x) for x in query_vec) or not any(query_vec):
             errors["vector"] = "invalid_query_embedding"
+        elif pool and not compatible:
+            # The active model has no index yet (run embed-backfill); a partial
+            # index still ranks what it holds, and coverage discloses the rest.
+            errors["vector"] = "embedding_index_empty"
         else:
             vector_available = bool(compatible)
             for row in compatible:
@@ -107,8 +103,6 @@ def query_memory(
                         similarities[row["id"]] = similarity
                 except (ValueError, TypeError) as exc:
                     errors["vector"] = f"invalid_stored_embedding: {exc}"
-            if len(compatible) < len(pool):
-                errors.setdefault("vector", "embedding_index_incomplete")
     except Exception as exc:
         errors["vector"] = f"{type(exc).__name__}: {exc}"
 

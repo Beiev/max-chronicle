@@ -55,7 +55,8 @@ The generated workspace is intentionally additive and local. It does not modify 
 
 These are not required for the core system to work:
 
-- Mem0 mirror and local Ollama vector recall
+- Mem0 mirror
+- local vector recall through Ollama: `ollama pull qwen3-embedding:0.6b`, then `chronicle embed-backfill`
 - launchd scheduling
 - external digest feeds
 - repo hook automation
