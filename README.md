@@ -151,14 +151,24 @@ can separately report `side_effect_errors` for failed evidence/projection output
   both sides. Evidence must contain every remaining term; when no event or fact
   does, recall retries with word stems, keeps only events holding two thirds of
   the terms, and returns `relaxed: true` because that match is weaker.
-- **Vector:** optional Ollama `nomic-embed-text` index. Model, dimension, scope,
-  and visibility are checked before ranking. `vector_coverage` discloses gaps;
-  `chronicle embed-backfill` repairs missing/incompatible index rows.
+- **Vector:** optional local index built through Ollama. The default model is
+  `qwen3-embedding:0.6b` (multilingual; `ollama pull qwen3-embedding:0.6b`).
+  `CHRONICLE_EMBED_MODEL` selects another; `nomic-embed-text` keeps an index
+  built before 0.12 usable. Every vector is stored under its model, so a new
+  model is backfilled beside the old index and recall reads only the active one.
+  Queries carry the model's retrieval instruction, and an event longer than the
+  model's context is embedded from its start instead of failing. Scope and
+  visibility are checked before ranking. `vector_coverage` discloses gaps, and
+  an active model with no index at all degrades the channel
+  (`embedding_index_empty`). `chronicle embed-backfill` fills the active index.
   If native scheduling is enabled, daily capture also retries up to 10 missing
   or incompatible embeddings per run. Disabling event embeddings disables this repair.
 - **Recency:** reorders relevant candidates; it never supplies unrelated answers.
-- **Threshold:** `CHRONICLE_VECTOR_MIN_SIMILARITY` defaults to `0.65`. Evaluate it
-  on your own corpus; cosine and reciprocal-rank scores are not confidence values.
+- **Threshold:** a candidate found only by the vector channel needs a cosine
+  similarity of at least the model's floor: `0.5` for Qwen3, `0.65` for
+  `nomic-embed-text`. `CHRONICLE_VECTOR_MIN_SIMILARITY` overrides it. Evaluate
+  it on your own corpus with `chronicle eval`; cosine and reciprocal-rank scores
+  are not confidence values.
 - **Writes:** SQLite WAL with full commit synchronization; events, observations,
   facts, and evidence links commit together.
 - **Schema changes:** an empty database initialises on first use. An existing one is

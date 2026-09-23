@@ -466,7 +466,7 @@ def test_record_event_is_atomic_across_event_artifact_and_embedding(loaded_manif
         artifacts = connection.execute(
             "SELECT COUNT(*) FROM artifacts WHERE source_path = ?", (str(source_file),)
         ).fetchone()[0]
-        embeddings = connection.execute("SELECT COUNT(*) FROM event_embeddings").fetchone()[0]
+        embeddings = connection.execute("SELECT COUNT(*) FROM event_vectors").fetchone()[0]
 
     assert events == 0, "event survived a failed artifact link — transaction was not atomic"
     assert artifacts == 0
@@ -502,7 +502,7 @@ def test_record_event_commits_event_artifact_and_embedding_together(loaded_manif
             "SELECT COUNT(*) FROM artifact_links WHERE target_id = ?", (stored["id"],)
         ).fetchone()[0]
         embeddings = connection.execute(
-            "SELECT COUNT(*) FROM event_embeddings WHERE event_id = ?", (stored["id"],)
+            "SELECT COUNT(*) FROM event_vectors WHERE event_id = ?", (stored["id"],)
         ).fetchone()[0]
     assert links == 1
     assert embeddings == 1

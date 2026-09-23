@@ -11,7 +11,7 @@ from max_chronicle.store import config_from_manifest, open_connection
 @pytest.fixture(autouse=True)
 def offline(monkeypatch):
     monkeypatch.setenv("CHRONICLE_FEATURE_EVENT_EMBEDDINGS", "0")
-    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda _: None)
+    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda *args, **kwargs: None)
 
 
 def record(manifest, text="Use the local ledger", **fields):

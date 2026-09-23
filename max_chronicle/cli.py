@@ -1113,7 +1113,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_embed_backfill = sub.add_parser(
         "embed-backfill",
-        help="Embed all Chronicle events that lack a vector embedding (requires Ollama)",
+        help="Embed the events the active embedding model's index lacks (requires Ollama)",
     )
     p_embed_backfill.add_argument(
         "--limit",
