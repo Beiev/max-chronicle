@@ -379,6 +379,16 @@ def _retire_stale_curation_run(
     )
 
 
+def _supersede_curation_run(connection: sqlite3.Connection, row: sqlite3.Row, *, marked_at_utc: str) -> None:
+    """Keep a finished run as history and free its run_key for a regeneration."""
+    payload = _load_json(row["payload_json"])
+    payload["superseded"] = {"at_utc": marked_at_utc, "original_run_key": row["run_key"]}
+    connection.execute(
+        "UPDATE curation_runs SET run_key = ?, payload_json = ? WHERE id = ?",
+        (f"{row['run_key']}:superseded:{row['id']}", _json(payload), row["id"]),
+    )
+
+
 def to_local_iso(timestamp: str, timezone_name: str) -> str:
     local_tz = ZoneInfo(timezone_name)
     return _parse_iso(timestamp).astimezone(local_tz).isoformat(timespec="seconds")
@@ -1858,8 +1868,12 @@ def fetch_events_between(
     domain: str | None = None,
     limit: int = 500,
     visibility: str = "default",
+    exclude_source_kinds: tuple[str, ...] = (),
+    newest: bool = False,
 ) -> list[dict[str, Any]]:
+    """Events in a window, oldest first; with ``newest``, the latest ``limit`` of them."""
     resolved_visibility = _normalize_event_visibility(visibility)
+    excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
     with open_connection(config) as connection:
         rows = connection.execute(
             """
@@ -1885,13 +1899,56 @@ def fetch_events_between(
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?
-              AND """ + _event_domain_where_clause("e") + """
-            ORDER BY e.occurred_at_utc ASC
+              AND """ + _event_domain_where_clause("e") + excluded_sql + """
+            ORDER BY e.occurred_at_utc """ + ("DESC" if newest else "ASC") + """
             LIMIT ?
             """,
-            (resolved_visibility, start_utc, end_utc, domain, domain, domain, limit),
+            (resolved_visibility, start_utc, end_utc, domain, domain, domain, *excluded_params, limit),
         ).fetchall()
-    return [_event_row_to_entry(row) for row in rows]
+    entries = [_event_row_to_entry(row) for row in rows]
+    return entries[::-1] if newest else entries
+
+
+def _source_kind_exclusion(source_kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    if not source_kinds:
+        return "", ()
+    placeholders = ", ".join("?" for _ in source_kinds)
+    return f"\n              AND COALESCE(e.source_kind, '') NOT IN ({placeholders})", tuple(source_kinds)
+
+
+def fingerprint_events_between(
+    config: ChronicleConfig,
+    *,
+    start_utc: str,
+    end_utc: str,
+    exclude_source_kinds: tuple[str, ...] = (),
+) -> tuple[int, str]:
+    """Count and sha256 of every visible event in a window, with no row limit.
+
+    A change signal that also moves when an event is edited, hidden or swapped
+    for another while the count stays the same.
+    """
+    excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
+    digest = hashlib.sha256()
+    count = 0
+    with open_connection(config) as connection:
+        rows = connection.execute(
+            """
+            SELECT e.id, e.category, e.text, e.why
+            FROM events AS e
+            WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
+              AND e.occurred_at_utc >= ?
+              AND e.occurred_at_utc <= ?""" + excluded_sql + """
+            ORDER BY e.occurred_at_utc ASC, e.id ASC
+            """,
+            (start_utc, end_utc, *excluded_params),
+        )
+        for row in rows:
+            count += 1
+            # JSON keeps field boundaries and NULL apart from "" unambiguous.
+            fields = [row["id"], row["category"], row["text"], row["why"]]
+            digest.update(json.dumps(fields, ensure_ascii=False).encode("utf-8") + b"\n")
+    return count, digest.hexdigest()
 
 
 def start_ingest_run(
@@ -2805,11 +2862,20 @@ def start_curation_run(
     prompt_sha256: str | None = None,
     payload: dict[str, Any] | None = None,
     stale_ttl_hours: float | int = DEFAULT_STALE_RUN_TTL_HOURS,
+    supersede_finished: bool = False,
 ) -> tuple[str, bool]:
+    """Claim the (curation_type, run_key) lease for a new run.
+
+    A finished run normally keeps the key, so a repeat is a no-op. With
+    supersede_finished the finished row stays as history under a moved key
+    and a new run starts; a live running row still blocks.
+    """
     run_id = str(uuid.uuid4())
     started_at = utc_now()
     started_dt = _parse_iso(started_at)
-    with open_connection(config) as connection, connection:
+    # Read-then-write under the write lock: two claimers of one key serialise,
+    # and the second sees the first's running row instead of racing its INSERT.
+    with write_transaction(config) as connection:
         existing = connection.execute(
             """
             SELECT id, status, run_key, started_at_utc, payload_json
@@ -2841,6 +2907,8 @@ def start_curation_run(
                     reason="stale_failed row retired before new run",
                     move_run_key=True,
                 )
+            elif supersede_finished:
+                _supersede_curation_run(connection, existing, marked_at_utc=started_at)
             else:
                 return existing["id"], False
         connection.execute(

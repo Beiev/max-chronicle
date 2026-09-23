@@ -576,6 +576,7 @@ def cmd_curate_daybook(args: argparse.Namespace) -> int:
         automation,
         target_date=args.date,
         trigger_source=args.trigger_source,
+        regenerate=True,
     )
     return _print_json(payload)
 
@@ -1011,7 +1012,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_curate = sub.add_parser("curate", help="Chronicle curator entrypoints")
     curate_sub = p_curate.add_subparsers(dest="curate_command", required=True)
-    p_daybook = curate_sub.add_parser("daybook", help="Generate a daybook markdown artifact from Chronicle delta")
+    p_daybook = curate_sub.add_parser(
+        "daybook",
+        help="Write a day's daybook; rewrites it when that day's events changed, retries a skipped day",
+    )
     p_daybook.add_argument("--date", default=None, help="Local date YYYY-MM-DD")
     p_daybook.add_argument("--trigger-source", default="manual", help="Trigger source label")
     p_daybook.set_defaults(handler=cmd_curate_daybook)
