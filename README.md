@@ -166,6 +166,10 @@ can separately report `side_effect_errors` for failed evidence/projection output
   a server upgrades only with `--migrate`. `CHRONICLE_REQUIRE_ROOT=1`
   makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
   instead of falling back to `~/.max-chronicle`.
+- **Read-only servers:** SQLite reads a WAL database through its `-wal` and `-shm`
+  files, so even a read-only server creates them when they are missing. Next to a
+  live writer they already exist. To serve a copy from a read-only directory,
+  switch the copy to `PRAGMA journal_mode = DELETE` first.
 - **Backups:** independent artifact copies, content-hash inventory, database
   integrity checks, and verification after relocation. Legacy backups disclose
   incomplete inventory coverage. Choose a separate backup device for disk failure.

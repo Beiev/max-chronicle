@@ -235,6 +235,21 @@ def test_a_foreign_file_without_migration_history_is_refused_even_at_the_current
             pass
 
 
+@pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+def test_an_empty_migration_history_is_refused_at_the_current_version(tmp_path, read_only) -> None:
+    db_path = tmp_path / "chronicle.db"
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE unrelated(body TEXT)")
+        connection.execute("CREATE TABLE schema_migrations(version INTEGER, name TEXT, applied_at_utc TEXT)")
+        connection.execute(f"PRAGMA user_version = {LATEST_VERSION}")
+        connection.commit()
+    set_read_only_process(read_only)
+
+    with pytest.raises(MigrationError, match="not a Chronicle database"):
+        with open_connection(_config(db_path)):
+            pass
+
+
 def test_every_connection_enforces_foreign_keys(tmp_path) -> None:
     config = _config(tmp_path / "chronicle.db")
 

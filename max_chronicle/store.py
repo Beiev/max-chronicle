@@ -156,11 +156,13 @@ def open_connection(config: ChronicleConfig) -> Iterator[sqlite3.Connection]:
         ensure_runtime_dirs(config)
         connection = connect(config.db_path)
     try:
-        current, application_id, has_history = connection.execute(_SCHEMA_PROBE).fetchone()
+        current, application_id, has_history_table = connection.execute(_SCHEMA_PROBE).fetchone()
         current_schema = (
             current == target_schema_version(config)
             and application_id in (0, APPLICATION_ID)
-            and has_history
+            and has_history_table
+            # An empty history is no history: any file can hold such a table.
+            and connection.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations)").fetchone()[0]
         )
         if not current_schema:
             if _READ_ONLY_PROCESS:
