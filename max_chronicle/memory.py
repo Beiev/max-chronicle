@@ -333,7 +333,11 @@ def _decode_cursor(value: str, scope: list) -> int:
 
 
 def _open_tasks(connection, where: str, params: tuple, limit: int) -> list[dict]:
-    """The latest checkpoint of each task in scope whose task.status fact is not closed (FR-12)."""
+    """The latest checkpoint of each task in scope whose task.status is not closed (FR-12).
+
+    A task's status is its newest visible task.status fact in any domain: a
+    quarantined completion does not close it, and a later reopening wins.
+    """
     closed = ",".join("?" for _ in CLOSED_TASK_STATUSES)
     rows = connection.execute(
         """SELECT * FROM (
@@ -341,11 +345,15 @@ def _open_tasks(connection, where: str, params: tuple, limit: int) -> list[dict]
             FROM event_observations o JOIN events e ON e.id=o.event_id
             WHERE """ + where + """ AND o.task_id IS NOT NULL
               AND json_type(o.payload_json,'$.checkpoint')='object'
-        ) AS c WHERE latest = 1 AND NOT EXISTS (
-            SELECT 1 FROM current_facts f WHERE f.slot_key='task.status'
+        ) AS c WHERE latest = 1 AND COALESCE((
+            SELECT lower(trim(f.value_key)) FROM current_facts f
+            JOIN events fe ON fe.id=json_extract(f.attributes_json,'$.event_id')
+            WHERE f.slot_key='task.status'
               AND json_extract(f.attributes_json,'$.project') IS c.project
               AND json_extract(f.attributes_json,'$.task_id')=c.task_id
-              AND lower(trim(f.value_key)) IN (""" + closed + """))
+              AND COALESCE(json_extract(fe.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+            ORDER BY f.recorded_at_utc DESC, f.id DESC LIMIT 1
+        ), '') NOT IN (""" + closed + """)
         ORDER BY seq DESC LIMIT ?""",
         (*params, *CLOSED_TASK_STATUSES, limit),
     ).fetchall()
