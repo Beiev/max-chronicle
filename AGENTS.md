@@ -16,6 +16,7 @@ any operator's personal workspace.
 - `memory.py`: explicit observations, checkpoints, request IDs, fact revisions.
 - `recall.py` / `embeddings.py`: eligible candidates, ranking, local vector backend.
 - `store.py` / `db.py`: transactions, archive primitives, migrations.
+- `redaction.py`: content-based secret filter applied before anything is stored.
 - `mcp_server.py` / `cli.py`: thin, documented client adapters.
 - `native_automation.py`: optional scheduling, backups, restore checks.
 - `scaffold.py`: neutral new-workspace templates.
@@ -27,6 +28,7 @@ any operator's personal workspace.
 - Retrying a request cannot duplicate or change its committed observation.
 - Scope/visibility filters apply before ranking; unrelated recency is not evidence.
 - External recall failure cannot prevent canonical local writes.
+- Likely secrets are redacted before storage, archiving, or any derived output.
 - Checkpoints record actual verification, uncertainty, and concrete next steps.
 - A committed write and incomplete derived output have separate receipts.
 - Backups must verify content, not only counts, and work without the source tree.

@@ -42,7 +42,9 @@ areas; they are not a substitute for project/task identity.
    evidence and `degraded`; empty results mean no suitable evidence was found.
 3. **Record:** use `record_event` for significant decisions, actions, and findings.
    Supply `why` and `source_files` where available. Reuse `request_id` unchanged
-   if delivery is uncertain; a changed request requires a new ID.
+   if delivery is uncertain; a changed request requires a new ID. Likely secrets
+   (API keys, tokens, passwords) are redacted before anything is stored, in the
+   event and in archived evidence files; the receipt's `redactions` counts them.
 4. **Hand off:** attach a `checkpoint` to `record_event` before a context switch.
    Record what was actually verified and what remains unknown.
 5. **Resume:** the next agent reads `task_context.checkpoint`, `current_facts`, and
@@ -153,6 +155,13 @@ can separately report `side_effect_errors` for failed evidence/projection output
   on your own corpus; cosine and reciprocal-rank scores are not confidence values.
 - **Writes:** SQLite WAL with full commit synchronization; events, observations,
   facts, and evidence links commit together.
+- **Secrets:** a content-based filter replaces likely credentials with
+  `[REDACTED:<kind>]` before an event, its checkpoint or fact, or a UTF-8 evidence
+  file is stored: known key prefixes, values assigned to secret names, bearer
+  tokens, URL passwords, private key blocks, and high-entropy tokens on a line
+  that mentions a key, token, or password. Hex digests and UUIDs are never treated
+  as secrets. Identifiers such as `request_id` and paths are left as given, the
+  source file is never modified, and binary evidence is archived unchanged.
 - **Backups:** independent artifact copies, content-hash inventory, database
   integrity checks, and verification after relocation. Legacy backups disclose
   incomplete inventory coverage. Choose a separate backup device for disk failure.
