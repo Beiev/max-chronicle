@@ -1576,6 +1576,19 @@ def _build_startup_entity_digest(
     return result
 
 
+# Mem0 sync bookkeeping: plumbing, not memory, so a startup bundle leaves it out.
+_SYNC_FIELDS = frozenset({"mem0_status", "mem0_error", "mem0_raw", "mem0_synced_at"})
+
+
+def _startup_event(event: dict[str, Any], *, shown_checkpoint: str | None) -> dict[str, Any]:
+    """An event as a startup bundle shows it: no sync bookkeeping, and no second
+    copy of the checkpoint that task_context already carries."""
+    trimmed = {key: value for key, value in event.items() if key not in _SYNC_FIELDS}
+    if shown_checkpoint is not None and trimmed.get("id") == shown_checkpoint:
+        trimmed.pop("checkpoint", None)
+    return trimmed
+
+
 def build_startup_bundle(
     manifest: dict[str, Any],
     *,
@@ -1589,6 +1602,7 @@ def build_startup_bundle(
     project: str | None = None,
     task_id: str | None = None,
     since: str | None = None,
+    before: str | None = None,
 ) -> dict[str, Any]:
     """Build a startup brief bundle for an agent, assembled directly without nesting attach_bundle.
 
@@ -1612,7 +1626,7 @@ def build_startup_bundle(
     if domain_id not in manifest["domain_map"]:
         raise ValueError(f"Unknown domain {domain_id!r}; use a manifest domain and project/task_id for task scope")
     context = read_task_context(manifest, domain=domain_id, project=project,
-                                task_id=task_id, since=since, limit=limit)
+                                task_id=task_id, since=since, before=before, limit=limit)
     # 1. Resolve snapshot (reuse or capture)
     snapshot = _resolve_activation_snapshot(
         manifest,
@@ -1654,6 +1668,8 @@ def build_startup_bundle(
         recent_events = _filter_events_by_visibility(
             snapshot.get("recent_ledger", [])[:limit]
         )
+    shown_checkpoint = (context.get("checkpoint") or {}).get("event_id")
+    recent_events = [_startup_event(event, shown_checkpoint=shown_checkpoint) for event in recent_events]
 
     # 3. Build enriched sources (full content or truncated)
     sources = _build_startup_sources(manifest, domain_id, compact=compact)
