@@ -339,3 +339,70 @@ def test_the_same_text_under_two_spellings_of_a_task_is_one_event(loaded_manifes
                                                     "project": "alpha", "task_id": "launch-plan"}, dedupe=True)
 
     assert second["id"] == first["id"] and second["dedupe_status"] == "exact_duplicate"
+
+
+# Second review of #13.
+
+
+@pytest.mark.parametrize("first_agent", [None, "mcp"])
+def test_a_retry_cannot_change_the_author_of_an_earlier_request(loaded_manifest, first_agent) -> None:
+    fields = {"domain": "global", "text": "Shipped the release", "request_id": "retry-author"}
+    service.record_event(loaded_manifest, {**fields, **({"agent": first_agent} if first_agent else {})})
+
+    with pytest.raises(ValueError, match="different input"):
+        service.record_event(loaded_manifest, {**fields, "agent": "different-author"})
+
+
+@pytest.mark.parametrize("agent", ["Review_Bot", "My Agent", "Орбита-бот"])
+def test_a_retry_of_a_0_12_request_keeps_its_agent_spelling(loaded_manifest, agent) -> None:
+    from max_chronicle.memory import _hash, _request_input
+
+    arguments = {"text": "Retried across a deploy", "request_id": f"retry-{len(agent)}", "agent": agent}
+    first = _record(loaded_manifest, **arguments)
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config) as connection, connection:
+        stored = json.loads(connection.execute("SELECT payload_json FROM event_observations WHERE request_id=?",
+                                               (arguments["request_id"],)).fetchone()[0])
+        legacy = _hash(_request_input(stored) | {"agent": agent.strip().lower()})  # what 0.12.0's MCP server stored
+        connection.execute("UPDATE event_observations SET request_hash=? WHERE request_id=?",
+                           (legacy, arguments["request_id"]))
+
+    retried = _record(loaded_manifest, **arguments)
+
+    assert (retried["id"], retried["chronicle_status"]) == (first["id"], "existing")
+
+
+def test_a_secret_in_a_name_is_never_stored(loaded_manifest, chronicle_sandbox) -> None:
+    key = "sk-" + "proj-" + base64.urlsafe_b64encode(bytes(range(40))).decode().rstrip("=")
+    receipt = service.record_event(loaded_manifest, {"agent": f"bot {key}", "domain": "global", "text": "Named badly",
+                                                     "project": f"atlas {key}", "task_id": f"plan {key}"})
+
+    assert sum(receipt["redactions"].values()) >= 3
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config) as connection:
+        stored = json.dumps([[tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
+                             for table in ("events", "event_observations")])
+    assert key not in stored
+    ledger = chronicle_sandbox.status_root / "ssot-ledger.jsonl"
+    assert not ledger.exists() or key not in ledger.read_text(encoding="utf-8")
+
+
+def test_an_event_under_an_old_spelling_dedupes_with_its_canonical_name(loaded_manifest) -> None:
+    first = service.record_event(loaded_manifest, {"agent": "a", "domain": "global", "text": "Draft ready",
+                                                   "project": "old-atlas", "task_id": "plan"}, dedupe=True)
+    manifest = {**loaded_manifest, "projects": [{"id": "atlas", "aliases": ["old-atlas"]}]}
+
+    second = service.record_event(manifest, {"agent": "a", "domain": "global", "text": "Draft ready",
+                                             "project": "atlas", "task_id": "plan"}, dedupe=True)
+
+    assert second["id"] == first["id"] and second["dedupe_status"] == "exact_duplicate"
+
+
+def test_content_hash_dedupe_folds_the_task_id(loaded_manifest, monkeypatch) -> None:
+    monkeypatch.setenv("CHRONICLE_ENABLE_EVENT_HASH_DEDUP", "1")
+    fields = {"agent": "a", "domain": "global", "text": "Draft ready", "project": "alpha"}
+    first = service.record_event(loaded_manifest, {**fields, "task_id": "Launch_plan"}, source_kind="agent_command")
+
+    second = service.record_event(loaded_manifest, {**fields, "task_id": "launch-plan"}, source_kind="agent_command")
+
+    assert second["id"] == first["id"] and second["dedupe_status"] == "content_hash_match"

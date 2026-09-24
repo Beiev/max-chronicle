@@ -580,9 +580,10 @@ def _find_recent_exact_duplicate(
         if delta_hours > window_hours:
             continue
         if (
-            (existing.get("domain") or "global") == entry["domain"]
+            # Older events keep the spelling they were written with (FR-14).
+            config.identities.domain(existing.get("domain") or "global") == entry["domain"]
             and (existing.get("category") or "note") == entry["category"]
-            and (existing.get("project") or "") == (entry.get("project") or "")
+            and (config.identities.project(existing.get("project")) or "") == (entry.get("project") or "")
             # One task under any spelling of its id (FR-14).
             and fold(existing.get("task_id") or "") == fold(entry.get("task_id") or "")
             and existing.get("checkpoint") == entry.get("checkpoint")
@@ -2128,12 +2129,12 @@ def record_event(
     validate_entry(normalized_entry)
     config = _config(manifest)
     # Canonical names for the agent, project and domain; the given spellings
-    # stay beside them (FR-14). A given spelling is caller text, so it passes
-    # the secret filter like any other.
+    # stay beside them (FR-14). A name is caller text, and an undeclared one is
+    # kept as given, so every name passes the secret filter like any text.
     config.identities.canonical_entry(normalized_entry)
-    for raw_key in ("actor_raw", "project_raw", "domain_raw"):
-        if raw_key in normalized_entry:
-            normalized_entry[raw_key], found = redact_value(normalized_entry[raw_key])
+    for name_key in ("agent", "project", "domain", "task_id", "actor_raw", "project_raw", "domain_raw"):
+        if isinstance(normalized_entry.get(name_key), str):
+            normalized_entry[name_key], found = redact_value(normalized_entry[name_key])
             for kind, count in found.items():
                 redactions[kind] = redactions.get(kind, 0) + count
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
@@ -2160,8 +2161,8 @@ def record_event(
         project=normalized_entry.get("project"),
         why=normalized_entry.get("why"),
     )
-    if normalized_entry.get("task_id"):
-        content_hash = _sha256_text(content_hash + ":" + normalized_entry["task_id"])
+    if normalized_entry.get("task_id"):  # one task under any spelling of its id (FR-14)
+        content_hash = _sha256_text(content_hash + ":" + fold(normalized_entry["task_id"]))
     if normalized_entry.get("checkpoint") or normalized_entry.get("fact"):
         content_hash = _sha256_text(content_hash + json.dumps(
             [normalized_entry.get("checkpoint"), normalized_entry.get("fact")],
