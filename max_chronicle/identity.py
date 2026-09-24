@@ -51,14 +51,19 @@ def fold_sql(expression: str) -> str:
     return f"lower(replace(replace(trim({expression}), ' ', '-'), '_', '-'))"
 
 
+def _list(entry: dict[str, Any], key: str, kind: str, name: str) -> list[str]:
+    """A list-valued key of a registry entry; a bare string is a mistake, not a list of letters."""
+    value = entry.get(key) or []
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"[[{kind}]] {name!r}: {key} must be a list of names")
+    return [str(item) for item in value if str(item).strip()]
+
+
 def _names(entry: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     name = str(entry.get("id") or "").strip()
     if not name:
         raise ValueError(f"Every [[{kind}]] entry in the manifest needs an id")
-    aliases = entry.get("aliases") or []
-    if isinstance(aliases, str) or not isinstance(aliases, list):
-        raise ValueError(f"[[{kind}]] {name!r}: aliases must be a list of names")
-    return name, [fold(name)] + [fold(str(alias)) for alias in aliases if str(alias).strip()]
+    return name, [fold(name)] + [fold(alias) for alias in _list(entry, "aliases", kind, name)]
 
 
 @dataclass(frozen=True, eq=False)
@@ -78,7 +83,8 @@ class Names:
                 owner = canonical.setdefault(form, name)
                 if owner != name:
                     raise ValueError(f"The {kind} spelling {form!r} belongs to both {owner!r} and {name!r}")
-            spellings[name] = tuple(dict.fromkeys(forms))
+            # Two entries with one id add up: neither loses its spellings.
+            spellings[name] = tuple(dict.fromkeys(spellings.get(name, ()) + tuple(forms)))
         return cls(canonical, spellings)
 
     def resolve(self, name: str | None) -> str | None:
@@ -91,6 +97,28 @@ class Names:
         """Every folded spelling of the identity *name* stands for."""
         resolved = self.resolve(name) or ""
         return self.spellings.get(resolved, (fold(resolved),))
+
+
+class DomainMap(dict):
+    """``manifest["domain_map"]`` that also answers for a domain's other spellings (FR-14)."""
+
+    def __init__(self, domains: dict[str, Any], names: Names) -> None:
+        super().__init__(domains)
+        self._names = names
+
+    def _key(self, key: Any) -> Any:
+        if isinstance(key, str) and not dict.__contains__(self, key):
+            return self._names.resolve(key) or key
+        return key
+
+    def __getitem__(self, key: Any) -> Any:
+        return super().__getitem__(self._key(key))
+
+    def __contains__(self, key: object) -> bool:
+        return super().__contains__(self._key(key))
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return super().get(self._key(key), default)
 
 
 @dataclass(frozen=True)
@@ -122,7 +150,7 @@ class Scope:
     @property
     def key(self) -> list[str | None]:
         """The scope a cursor is bound to: the same for every spelling of it."""
-        return [self.domain, self.project, fold(self.task_id) if self.task_id else None]
+        return [fold(name) if name else None for name in (self.domain, self.project, self.task_id)]
 
     def where(
         self,
@@ -169,23 +197,27 @@ class Registry:
     def from_manifest(cls, manifest: dict[str, Any] | None) -> Registry:
         """The registry declared by *manifest* ([[projects]], [[domains]], [[agents]])."""
         manifest = manifest or {}
-        agents = {entry["id"]: entry for entry in DEFAULT_AGENTS}
-        for entry in manifest.get("agents", []):
-            name, _ = _names(entry, "agents")
-            agents[name] = {**entry, "id": name}
+        agents: dict[str, dict[str, list[str]]] = {}
+        declared: set[str] = set()
+        for from_manifest, entries in ((False, DEFAULT_AGENTS), (True, manifest.get("agents", []))):
+            for entry in entries:
+                name, _ = _names(entry, "agents")
+                fields = {key: _list(entry, key, "agents", name) for key in ("aliases", "prefixes", "contains")}
+                if from_manifest and name not in declared:
+                    agents.pop(name, None)  # the manifest's first entry for an id replaces the built-in one
+                    declared.add(name)
+                merged = agents.setdefault(name, {"aliases": [], "prefixes": [], "contains": []})
+                for key, values in fields.items():
+                    merged[key] += values  # more entries with the id add up
         aliases: dict[str, str] = {}
         rules: list[AgentRule] = []
         for name, entry in agents.items():
-            _, forms = _names(entry, "agents")
-            for form in forms:
+            for form in [fold(name)] + [fold(alias) for alias in entry["aliases"]]:
                 owner = aliases.setdefault(form, name)
                 if owner != name:
                     raise ValueError(f"The agents spelling {form!r} belongs to both {owner!r} and {name!r}")
-            rule = AgentRule(
-                name,
-                tuple(fold(str(item)) for item in entry.get("prefixes", []) if str(item).strip()),
-                tuple(fold(str(item)) for item in entry.get("contains", []) if str(item).strip()),
-            )
+            rule = AgentRule(name, tuple(fold(item) for item in entry["prefixes"]),
+                             tuple(fold(item) for item in entry["contains"]))
             if rule.prefixes or rule.contains:
                 rules.append(rule)
         return cls(

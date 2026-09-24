@@ -16,7 +16,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .identity import Registry, Scope, fold_sql
+from .identity import UNKNOWN_AGENT, Registry, Scope, fold_sql
 from .store import config_from_manifest, open_connection
 
 Item = Annotated[str, Field(min_length=1, max_length=1000)]
@@ -102,28 +102,48 @@ def validate_entry(entry: dict[str, Any]) -> None:
         entry["fact"] = FactInput.model_validate(entry["fact"]).model_dump()
 
 
+_REQUEST_KEYS = (
+    "domain",
+    "project",
+    "task_id",
+    "text",
+    "why",
+    "category",
+    "id",
+    "recorded_at",
+    "source_files",
+    "checkpoint",
+    "fact",
+)
+
+
+def _request_input(entry: dict[str, Any]) -> dict[str, Any]:
+    """What the caller sent: names as given, before the registry made them canonical."""
+    material = {key: entry.get(key) for key in _REQUEST_KEYS}
+    for key in ("project", "domain"):
+        if entry.get(f"{key}_raw") is not None:
+            material[key] = entry[f"{key}_raw"]
+    return material
+
+
 def request_hash(entry: dict[str, Any]) -> str:
-    # A transport reconnect may assign a new session ID to the same retried
-    # operation. The original observation keeps its originating session. An
-    # agent taken from the session rather than named by the caller can change
-    # the same way, so only a named agent is part of the input (W6).
-    keys = (
-        "domain",
-        "project",
-        "task_id",
-        "text",
-        "why",
-        "category",
-        "id",
-        "recorded_at",
-        "source_files",
-        "checkpoint",
-        "fact",
-    )
-    material = {key: entry.get(key) for key in keys}
+    # A retry resends the same input. A transport reconnect may assign a new
+    # session ID to it; the original observation keeps its originating session.
+    # Names count as given, so a registry change between a write and its retry
+    # changes nothing. An agent taken from the session or the MCP client rather
+    # than named by the caller can change on a reconnect, so only a named agent
+    # is part of the input (W6).
+    material = _request_input(entry)
     if entry.get("agent_source", "explicit") == "explicit":
-        material["agent"] = entry.get("agent")
+        material["agent"] = entry.get("actor_raw", entry.get("agent"))
     return _hash(material)
+
+
+def _earlier_request_hashes(entry: dict[str, Any]) -> set[str]:
+    """The hashes 0.12.0 stored for the same input: with an agent always, spelled as given or canonical."""
+    material = _request_input(entry)
+    return {_hash(material | {"agent": agent})
+            for agent in {entry.get("actor_raw"), entry.get("agent"), UNKNOWN_AGENT}}
 
 
 def request_receipt(
@@ -136,7 +156,7 @@ def request_receipt(
     ).fetchone()
     if row is None:
         return None
-    if row["request_hash"] != request_hash(entry):
+    if row["request_hash"] != request_hash(entry) and row["request_hash"] not in _earlier_request_hashes(entry):
         raise ValueError(
             "request_id already exists with different input; use a new request_id"
         )
@@ -170,8 +190,10 @@ def record_observation(
     identities: Registry | None = None,
 ) -> dict:
     fingerprint = request_hash(entry)
+    # The author is part of an observation even when it is not part of the
+    # request: two agents confirming the same text are two observations.
     observation_hash = _hash(
-        [fingerprint, entry.get("session_id"), evidence, entry.get("request_id")]
+        [fingerprint, entry.get("agent"), entry.get("session_id"), evidence, entry.get("request_id")]
     )
     previous = connection.execute(
         "SELECT * FROM event_observations WHERE event_id = ? AND observation_hash = ?",
@@ -217,8 +239,12 @@ def record_observation(
     )
 
 
-def _current_fact(connection, entry: dict[str, Any], slot: str, identities: Registry):
-    """The active fact for *slot* in the entry's scope, under any spelling of its names (FR-14)."""
+def _active_facts(connection, entry: dict[str, Any], slot: str, identities: Registry) -> list:
+    """The active facts for *slot* in the entry's scope under any spelling of its names, newest first (FR-14).
+
+    More than one is a conflict that predates the registry: the spellings were
+    separate slots when those facts were recorded.
+    """
     scope = identities.scope(domain=entry["domain"], project=entry.get("project"), task_id=entry.get("task_id"))
     project, task = "json_extract(group_id,'$[0]')", "json_extract(group_id,'$[1]')"
     where, params = scope.where(domain="domain", project=project, task=task)
@@ -229,15 +255,16 @@ def _current_fact(connection, entry: dict[str, Any], slot: str, identities: Regi
         where += f" AND {task} IS NULL"
     return connection.execute(
         "SELECT * FROM facts WHERE " + where
-        + " AND slot_key=? AND status='active' AND expired_at_utc IS NULL ORDER BY recorded_at_utc DESC, id DESC LIMIT 1",
+        + " AND slot_key=? AND status='active' AND expired_at_utc IS NULL ORDER BY recorded_at_utc DESC, id DESC",
         (*params, slot),
-    ).fetchone()
+    ).fetchall()
 
 
 def _record_fact(connection, entry, episode_id, event_id, evidence, now, identities: Registry) -> str:
     fact = entry["fact"]
     group = _json([entry.get("project"), entry.get("task_id")])
-    current = _current_fact(connection, entry, fact["slot"], identities)
+    actives = _active_facts(connection, entry, fact["slot"], identities)
+    current = actives[0] if actives else None
     unchanged = (
         current is not None
         and current["value_key"] == fact["value"]
@@ -326,6 +353,24 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now, identit
                 now,
             ),
         )
+    if expected:
+        # Replacing the newest value settles the slot: values that other
+        # spellings of its names held, as separate slots before the registry,
+        # retire with it.
+        for other in actives[1:]:
+            connection.execute(
+                "UPDATE facts SET status='retired', expired_at_utc=?, valid_to_utc=?, expired_tx_id=? WHERE id=?",
+                (now, now, tx, other["id"]),
+            )
+            connection.execute(
+                "INSERT INTO fact_supersessions(old_fact_id,new_fact_id,reason,tx_id) VALUES (?,?,'merge',?)",
+                (other["id"], fact_id, tx),
+            )
+            connection.execute(
+                """INSERT INTO fact_mutation_log(domain,action,fact_id,previous_fact_id,tx_id,reason,recorded_at_utc)
+                VALUES (?,'retire',?,NULL,?,?,?)""",
+                (entry["domain"], other["id"], tx, f"merged into {fact_id}", now),
+            )
     connection.execute(
         "INSERT INTO fact_observations(fact_id,episode_id,reference_time_utc,episode_valid_at_utc,extractor_version) VALUES (?,?,?,?,?)",
         (fact_id, episode_id, now, now, "explicit-v1"),

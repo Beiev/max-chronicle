@@ -1712,17 +1712,17 @@ def fetch_latest_snapshot(
     *,
     domain: str | None = None,
 ) -> dict[str, Any] | None:
-    domain = config.identities.domain(domain)
+    scope_sql, scope_params = config.identities.scope(domain=domain).where(domain="domain", project="NULL", task="NULL")
     with open_connection(config) as connection:
         row = connection.execute(
             """
             SELECT id, captured_at_utc, payload_json
             FROM snapshots
-            WHERE (? IS NULL OR domain = ?)
+            WHERE """ + scope_sql + """
             ORDER BY captured_at_utc DESC
             LIMIT 1
             """,
-            (domain, domain),
+            scope_params,
         ).fetchone()
     if not row:
         return None
@@ -3353,7 +3353,8 @@ def timeline_state(
         raise ValueError(f"detail must be 'digest' or 'full', got {detail!r}")
     resolved_visibility = _normalize_event_visibility(visibility)
     target_utc = target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    snapshot_domain = config.identities.domain(domain)
+    snapshot_sql, snapshot_params = config.identities.scope(domain=domain).where(
+        domain="domain", project="NULL", task="NULL")
     scope_sql, scope_params = _event_scope(config, domain=domain)
 
     with open_connection(config) as connection:
@@ -3364,11 +3365,11 @@ def timeline_state(
                 payload_json,
                 ABS(unixepoch(captured_at_utc) - unixepoch(?)) AS delta_seconds
             FROM snapshots
-            WHERE (? IS NULL OR domain = ?)
+            WHERE """ + snapshot_sql + """
             ORDER BY delta_seconds ASC
             LIMIT ?
             """,
-            (target_utc, snapshot_domain, snapshot_domain, limit),
+            (target_utc, *snapshot_params, limit),
         ).fetchall()
         event_rows = connection.execute(
             """
