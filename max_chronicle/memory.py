@@ -139,11 +139,36 @@ def request_hash(entry: dict[str, Any]) -> str:
     return _hash(material)
 
 
+# 0.12.0's rules, in its order: "opencode-glm5.2" was glm, not opencode.
+_AGENT_RULES_0_12 = (("prefix", "claude"), ("part", "glm"), ("part", "deepseek"), ("prefix", "codex"),
+                     ("prefix", "gemini"), ("prefix", "opencode"), ("prefix", "transcript-analyst"))
+
+
+def _agent_0_12(name: str | None) -> str:
+    """The agent 0.12.0's MCP server hashed for *name*: lower case, then its fixed rules."""
+    agent = (name or UNKNOWN_AGENT).strip().lower()
+    if agent == "operator":
+        return "claude"
+    for kind, value in _AGENT_RULES_0_12:
+        if (agent.startswith(value) if kind == "prefix" else value in agent):
+            return value
+    return agent
+
+
 def _earlier_request_hashes(entry: dict[str, Any]) -> set[str]:
-    """The hashes 0.12.0 stored for the same input: with an agent always, spelled as given or canonical."""
+    """The hashes 0.12.0 stored for the same input.
+
+    Its MCP server hashed the agent it normalised, and "mcp" when the caller
+    named none; its CLI and Python API hashed the agent as given, or none. A
+    caller who names an agent now matches only what 0.12.0 made of that name,
+    so a retry cannot change the author of an earlier request.
+    """
     material = _request_input(entry)
-    return {_hash(material | {"agent": agent})
-            for agent in {entry.get("actor_raw"), entry.get("agent"), UNKNOWN_AGENT}}
+    given = entry.get("actor_raw", entry.get("agent"))
+    agents = {given, _agent_0_12(given)}
+    if entry.get("agent_source", "explicit") not in ("explicit", "session"):
+        agents |= {None, UNKNOWN_AGENT}
+    return {_hash(material | {"agent": agent}) for agent in agents}
 
 
 def request_receipt(
