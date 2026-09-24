@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import tomllib
+
+from .identity import Registry
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -92,6 +94,9 @@ class ChronicleConfig:
     artifact_follow_symlinks: bool
     mem0_collection: str
     operator_label: str
+    # Canonical names of agents, projects and domains (FR-14); every scope
+    # filter resolves spellings through it. Built from the manifest.
+    identities: Registry = field(default_factory=lambda: Registry.from_manifest(None), compare=False, repr=False)
 
 
 def _expand(path: str | Path) -> Path:

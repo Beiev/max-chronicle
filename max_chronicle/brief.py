@@ -18,6 +18,7 @@ import sqlite3
 from typing import Any, Iterator
 
 from .db import connect
+from .identity import Registry, fold
 from .memory import open_tasks
 from .redaction import redact
 from .store import ChronicleConfig, config_from_manifest
@@ -82,11 +83,13 @@ def _short_time(value: str | None) -> str:
 
 
 def resolve_project(
-    connection: sqlite3.Connection, manifest: dict[str, Any], *, cwd: str | None, project: str | None
+    connection: sqlite3.Connection, manifest: dict[str, Any], *, cwd: str | None, project: str | None,
+    identities: Registry | None = None,
 ) -> tuple[str | None, str]:
-    """The project a session works on, and how it was found."""
+    """The canonical project a session works on, and how it was found."""
+    identities = identities or Registry.from_manifest(manifest)
     if project:
-        return project, "given"
+        return identities.project(project), "given"
     if not cwd:
         return None, "none"
     where = Path(os.path.normpath(os.path.expanduser(cwd)))
@@ -99,33 +102,45 @@ def resolve_project(
                 if best is None or depth > best[0]:
                     best = (depth, entry["id"])
     if best is not None:
-        return best[1], "root"
+        return identities.project(best[1]), "root"
     known = {
-        row[0].casefold(): row[0]
+        fold(name): name
         for row in connection.execute("SELECT DISTINCT project FROM event_observations WHERE project IS NOT NULL")
+        if (name := identities.project(row[0]))
     }
-    if where.name and where.name.casefold() in known:
-        return known[where.name.casefold()], "directory"
+    named = identities.project(where.name) if where.name else None
+    if named and fold(named) in known:
+        return known[fold(named)], "directory"
     return None, "none"
 
 
-def _facts(connection: sqlite3.Connection, project: str | None) -> list[dict[str, Any]]:
+def _facts(connection: sqlite3.Connection, identities: Registry, project: str | None) -> list[dict[str, Any]]:
+    where, params = identities.scope(project=project).where(
+        domain="f.domain", project="json_extract(f.attributes_json,'$.project')",
+        task="json_extract(f.attributes_json,'$.task_id')", project_or_unset=True,
+    )
     rows = connection.execute(
         """SELECT f.id, f.slot_key, f.value_key, json_extract(f.attributes_json,'$.project') AS project,
                   json_extract(f.attributes_json,'$.task_id') AS task_id, json_extract(f.attributes_json,'$.kind') AS kind
         FROM current_facts f JOIN events e ON e.id=json_extract(f.attributes_json,'$.event_id')
         WHERE COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
           AND f.slot_key != 'task.status'
-          AND (? IS NULL OR json_extract(f.attributes_json,'$.project') IS NULL
-               OR json_extract(f.attributes_json,'$.project') = ?)
+          AND """ + where + """
         ORDER BY f.recorded_at_utc DESC, f.id LIMIT ?""",
-        (project, project, BRIEF_FACTS),
+        (*params, BRIEF_FACTS),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [dict(row) | {"project": identities.project(row["project"])} for row in rows]
 
 
-def _decisions(connection: sqlite3.Connection, project: str | None, now: datetime) -> list[dict[str, Any]]:
+def _decisions(
+    connection: sqlite3.Connection, identities: Registry, project: str | None, now: datetime
+) -> list[dict[str, Any]]:
     since = (now - timedelta(days=BRIEF_DECISION_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    where, params = identities.scope(project=project).where(
+        domain="COALESCE(e.circumstances, json_extract(e.payload_json,'$.domain'))",
+        project="COALESCE(e.title, json_extract(e.payload_json,'$.project'))",
+        task="json_extract(e.payload_json,'$.task_id')", project_or_unset=True,
+    )
     rows = connection.execute(
         """SELECT e.id, e.occurred_at_utc, e.actor, e.text,
                   COALESCE(e.title, json_extract(e.payload_json,'$.project')) AS project
@@ -135,12 +150,11 @@ def _decisions(connection: sqlite3.Connection, project: str | None, now: datetim
           -- A decision that set a fact is shown through the facts: the current value
           -- there, a replaced one nowhere, so an old decision never returns unmarked.
           AND NOT EXISTS (SELECT 1 FROM facts f WHERE json_extract(f.attributes_json,'$.event_id') = e.id)
-          AND (? IS NULL OR COALESCE(e.title, json_extract(e.payload_json,'$.project')) IS NULL
-               OR COALESCE(e.title, json_extract(e.payload_json,'$.project')) = ?)
+          AND """ + where + """
         ORDER BY e.occurred_at_utc DESC, e.id LIMIT ?""",
-        (since, project, project, BRIEF_DECISIONS),
+        (since, *params, BRIEF_DECISIONS),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [dict(row) | {"project": identities.project(row["project"])} for row in rows]
 
 
 def _warnings(connection: sqlite3.Connection, now: datetime) -> list[str]:
@@ -226,14 +240,15 @@ def build_brief(
     config = config_from_manifest(manifest)
     if not config.db_path.exists():  # a fresh installation: nothing recorded, nothing created
         text = _text([("", [FRAMING, "Nothing has been recorded in Chronicle yet."]), ("Protocol", list(PROTOCOL))])
-        return {"project": project, "project_source": "given" if project else "none", "text": text,
+        return {"project": config.identities.project(project), "project_source": "given" if project else "none", "text": text,
                 "counts": {"open_tasks": 0, "facts": 0, "decisions": 0, "warnings": 0},
                 "omitted": 0, "cut": False, "redactions": 0}
+    identities = config.identities
     with _read_only(config) as connection:
-        resolved, how = resolve_project(connection, manifest, cwd=cwd, project=project)
-        tasks = open_tasks(connection, project=resolved, limit=BRIEF_TASKS)
-        facts = _facts(connection, resolved)
-        decisions = _decisions(connection, resolved, now)
+        resolved, how = resolve_project(connection, manifest, cwd=cwd, project=project, identities=identities)
+        tasks = open_tasks(connection, identities, project=resolved, limit=BRIEF_TASKS)
+        facts = _facts(connection, identities, resolved)
+        decisions = _decisions(connection, identities, resolved, now)
         warnings = _warnings(connection, now)
     clean = _Cleaner()
     sections = _render(resolved, how, tasks, facts, decisions, warnings, clean)

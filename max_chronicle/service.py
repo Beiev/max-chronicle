@@ -517,7 +517,8 @@ _UNREDACTED_ENTRY_KEYS = frozenset(
         "id", "request_id", "session_id", "agent", "domain", "category", "project",
         "task_id", "recorded_at", "occurred_at", "entity_id", "entity_type",
         "source_files", "slot", "kind", "supersedes", "mem0_status", "memory_guard",
-        "content_hash", "skip_generic_source_archives",
+        "content_hash", "skip_generic_source_archives", "agent_source", "actor_raw",
+        "project_raw", "domain_raw",
     }
 )
 
@@ -1623,6 +1624,9 @@ def build_startup_bundle(
         Startup bundle dict targeting ~50K full / ~30K compact.
     """
     from .memory import task_context as read_task_context
+    identities = _config(manifest).identities
+    domain_id = identities.domain(domain_id) or "global"
+    project = identities.project(project)
     if domain_id not in manifest["domain_map"]:
         raise ValueError(f"Unknown domain {domain_id!r}; use a manifest domain and project/task_id for task scope")
     context = read_task_context(manifest, domain=domain_id, project=project,
@@ -2112,11 +2116,14 @@ def record_event(
     normalized_entry, redactions = _redact_entry(_normalize_record_entry(entry))
     from .memory import validate_entry, request_receipt, record_observation
     validate_entry(normalized_entry)
+    config = _config(manifest)
+    # Canonical names for the agent, project and domain; the given spellings
+    # stay beside them (FR-14).
+    config.identities.canonical_entry(normalized_entry)
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
     resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind)
     if resolved_mem0_status is not None:
         normalized_entry["mem0_status"] = resolved_mem0_status
-    config = _config(manifest)
 
     if source_kind == "chronicle_mcp" and not (normalized_entry.get("checkpoint") or normalized_entry.get("fact")):
         memory_guard = evaluate_memory_guard(config, normalized_entry, source_kind=source_kind)
@@ -2245,7 +2252,7 @@ def record_event(
                 connection=connection,
             )
             artifacts_written += 1
-        observation = record_observation(connection, normalized_entry, stored["id"], evidence)
+        observation = record_observation(connection, normalized_entry, stored["id"], evidence, config.identities)
     if embedding_vec is not None and embed_model is not None and embed_dim is not None:
         # A vector is an index entry, not part of the record. Written in its own
         # transaction, no failure of it can lose the event, not even one that
@@ -2940,6 +2947,7 @@ def project_state(
     event_limit: int = 10,
 ) -> dict[str, Any]:
     config = _config(manifest)
+    project = config.identities.project(project) or project
     entity_id = _project_entity_id(project)
     events = fetch_project_events(config, project=project, limit=event_limit)
     relations = fetch_relations_for_entity(config, entity_id=entity_id)

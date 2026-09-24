@@ -16,6 +16,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .identity import Registry, Scope, fold_sql
 from .store import config_from_manifest, open_connection
 
 Item = Annotated[str, Field(min_length=1, max_length=1000)]
@@ -103,12 +104,13 @@ def validate_entry(entry: dict[str, Any]) -> None:
 
 def request_hash(entry: dict[str, Any]) -> str:
     # A transport reconnect may assign a new session ID to the same retried
-    # operation. The original observation keeps its originating session.
+    # operation. The original observation keeps its originating session. An
+    # agent taken from the session rather than named by the caller can change
+    # the same way, so only a named agent is part of the input (W6).
     keys = (
         "domain",
         "project",
         "task_id",
-        "agent",
         "text",
         "why",
         "category",
@@ -118,7 +120,10 @@ def request_hash(entry: dict[str, Any]) -> str:
         "checkpoint",
         "fact",
     )
-    return _hash({key: entry.get(key) for key in keys})
+    material = {key: entry.get(key) for key in keys}
+    if entry.get("agent_source", "explicit") == "explicit":
+        material["agent"] = entry.get("agent")
+    return _hash(material)
 
 
 def request_receipt(
@@ -162,6 +167,7 @@ def record_observation(
     entry: dict[str, Any],
     event_id: str,
     evidence: list[dict],
+    identities: Registry | None = None,
 ) -> dict:
     fingerprint = request_hash(entry)
     observation_hash = _hash(
@@ -182,7 +188,8 @@ def record_observation(
     payload = {**entry, "evidence": evidence}
     if entry.get("fact"):
         payload["fact_id"] = _record_fact(
-            connection, entry, observation_id, event_id, evidence, now
+            connection, entry, observation_id, event_id, evidence, now,
+            identities or Registry.from_manifest(None),
         )
     connection.execute(
         """INSERT INTO event_observations(id,event_id,request_id,request_hash,observation_hash,
@@ -210,13 +217,27 @@ def record_observation(
     )
 
 
-def _record_fact(connection, entry, episode_id, event_id, evidence, now) -> str:
+def _current_fact(connection, entry: dict[str, Any], slot: str, identities: Registry):
+    """The active fact for *slot* in the entry's scope, under any spelling of its names (FR-14)."""
+    scope = identities.scope(domain=entry["domain"], project=entry.get("project"), task_id=entry.get("task_id"))
+    project, task = "json_extract(group_id,'$[0]')", "json_extract(group_id,'$[1]')"
+    where, params = scope.where(domain="domain", project=project, task=task)
+    # A fact without a project or task belongs to that wider scope only.
+    if scope.project is None:
+        where += f" AND {project} IS NULL"
+    if scope.task_id is None:
+        where += f" AND {task} IS NULL"
+    return connection.execute(
+        "SELECT * FROM facts WHERE " + where
+        + " AND slot_key=? AND status='active' AND expired_at_utc IS NULL ORDER BY recorded_at_utc DESC, id DESC LIMIT 1",
+        (*params, slot),
+    ).fetchone()
+
+
+def _record_fact(connection, entry, episode_id, event_id, evidence, now, identities: Registry) -> str:
     fact = entry["fact"]
     group = _json([entry.get("project"), entry.get("task_id")])
-    current = connection.execute(
-        "SELECT * FROM facts WHERE domain=? AND group_id=? AND slot_key=? AND status='active' AND expired_at_utc IS NULL",
-        (entry["domain"], group, fact["slot"]),
-    ).fetchone()
+    current = _current_fact(connection, entry, fact["slot"], identities)
     unchanged = (
         current is not None
         and current["value_key"] == fact["value"]
@@ -318,60 +339,74 @@ CLOSED_TASK_STATUSES = ("completed", "cancelled")
 _CURSOR_ERROR = "Invalid cursor or cursor belongs to another scope"
 
 
-def _encode_cursor(scope: list, seq: int) -> str:
-    return base64.urlsafe_b64encode(_json({"v": 1, "scope": scope, "seq": seq}).encode()).decode()
+def _encode_cursor(scope: Scope, seq: int) -> str:
+    return base64.urlsafe_b64encode(_json({"v": 1, "scope": scope.key, "seq": seq}).encode()).decode()
 
 
-def _decode_cursor(value: str, scope: list) -> int:
+def _decode_cursor(value: str, scope: Scope, identities: Registry) -> int:
+    """The position a cursor issued for *scope* holds, whichever spellings it was issued for.
+
+    A cursor issued before the registry holds the names as they were given,
+    and stays valid for every spelling of the same scope (FR-14).
+    """
     try:
         cursor = json.loads(base64.urlsafe_b64decode(value.encode()))
-        if cursor["scope"] != scope or cursor["v"] != 1 or type(cursor["seq"]) is not int or cursor["seq"] < 0:
+        domain, project, task_id = cursor["scope"]
+        issued = identities.scope(domain=domain, project=project, task_id=task_id)
+        if issued.key != scope.key or cursor["v"] != 1 or type(cursor["seq"]) is not int or cursor["seq"] < 0:
             raise ValueError()
     except Exception as exc:
         raise ValueError(_CURSOR_ERROR) from exc
     return cursor["seq"]
 
 
-def _scope_filter(domain: str | None, project: str | None, task_id: str | None) -> tuple[str, tuple]:
-    """Observations in scope, without quarantined ones (FR-1)."""
-    where = """(? IS NULL OR o.domain=?) AND (? IS NULL OR o.project=?) AND (? IS NULL OR o.task_id=?)
+def _scope_filter(scope: Scope) -> tuple[str, tuple]:
+    """Observations in scope under any spelling of its names, without quarantined ones (FR-1, FR-14)."""
+    where, params = scope.where(domain="o.domain", project="o.project", task="o.task_id")
+    return where + """
         AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
-        AND COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'"""
-    return where, (domain, domain, project, project, task_id, task_id)
+        AND COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'""", params
 
 
 def open_tasks(
-    connection, *, domain: str | None = None, project: str | None = None, limit: int = OPEN_TASK_LIMIT
+    connection, identities: Registry, *, domain: str | None = None, project: str | None = None,
+    limit: int = OPEN_TASK_LIMIT,
 ) -> list[dict]:
     """The open tasks in scope, newest checkpoint first (FR-12)."""
-    where, params = _scope_filter(domain, project, None)
-    return _open_tasks(connection, where, params, limit)
+    return _open_tasks(connection, identities, identities.scope(domain=domain, project=project), limit)
 
 
-def _open_tasks(connection, where: str, params: tuple, limit: int) -> list[dict]:
+def _open_tasks(connection, identities: Registry, scope: Scope, limit: int) -> list[dict]:
     """The latest checkpoint of each task in scope whose task.status is not closed (FR-12).
 
-    A task's status is its newest visible task.status fact in any domain: a
+    A task is one project and task id under any of their spellings (FR-14).
+    Its status is its newest visible task.status fact in any domain: a
     quarantined completion does not close it, and a later reopening wins.
     """
+    where, params = _scope_filter(scope)
+    project_sql, project_params = identities.project_sql("o.project")
+    fact_project_sql, fact_project_params = identities.project_sql("json_extract(f.attributes_json,'$.project')")
     closed = ",".join("?" for _ in CLOSED_TASK_STATUSES)
     rows = connection.execute(
         """SELECT * FROM (
-            SELECT o.*, ROW_NUMBER() OVER (PARTITION BY o.project, o.task_id ORDER BY o.seq DESC) AS latest
-            FROM event_observations o JOIN events e ON e.id=o.event_id
-            WHERE """ + where + """ AND o.task_id IS NOT NULL
-              AND json_type(o.payload_json,'$.checkpoint')='object'
+            SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.task_project, s.task_key ORDER BY s.seq DESC) AS latest
+            FROM (
+                SELECT o.*, """ + project_sql + """ AS task_project, """ + fold_sql("o.task_id") + """ AS task_key
+                FROM event_observations o JOIN events e ON e.id=o.event_id
+                WHERE """ + where + """ AND o.task_id IS NOT NULL
+                  AND json_type(o.payload_json,'$.checkpoint')='object'
+            ) AS s
         ) AS c WHERE latest = 1 AND COALESCE((
             SELECT lower(trim(f.value_key)) FROM current_facts f
             JOIN events fe ON fe.id=json_extract(f.attributes_json,'$.event_id')
             WHERE f.slot_key='task.status'
-              AND json_extract(f.attributes_json,'$.project') IS c.project
-              AND json_extract(f.attributes_json,'$.task_id')=c.task_id
+              AND """ + fact_project_sql + """ IS c.task_project
+              AND """ + fold_sql("json_extract(f.attributes_json,'$.task_id')") + """ = c.task_key
               AND COALESCE(json_extract(fe.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
             ORDER BY f.recorded_at_utc DESC, f.id DESC LIMIT 1
         ), '') NOT IN (""" + closed + """)
         ORDER BY seq DESC LIMIT ?""",
-        (*params, *CLOSED_TASK_STATUSES, limit),
+        (*project_params, *params, *fact_project_params, *CLOSED_TASK_STATUSES, limit),
     ).fetchall()
     tasks = []
     for row in rows:
@@ -379,7 +414,8 @@ def _open_tasks(connection, where: str, params: tuple, limit: int) -> list[dict]
         checkpoint = observation["checkpoint"]
         tasks.append({
             key: observation[key] for key in ("project", "task_id", "agent", "recorded_at_utc", "event_id")
-        } | {"goal": checkpoint.get("goal"), "next_steps": checkpoint.get("next_steps", [])[:OPEN_TASK_NEXT_STEPS]})
+        } | {"project": identities.project(observation["project"]), "goal": checkpoint.get("goal"),
+             "next_steps": checkpoint.get("next_steps", [])[:OPEN_TASK_NEXT_STEPS]})
     return tasks
 
 
@@ -405,11 +441,18 @@ def task_context(
         raise ValueError("task_id requires project")
     if since and before:
         raise ValueError("since and before are exclusive: page one way at a time")
-    scope = [domain, project, task_id]
-    after = _decode_cursor(since, scope) if since else 0
-    older_than = _decode_cursor(before, scope) if before else None
-    where, params = _scope_filter(domain, project, task_id)
     config = config_from_manifest(manifest)
+    identities = config.identities
+    scope = identities.scope(domain=domain, project=project, task_id=task_id)
+    after = _decode_cursor(since, scope, identities) if since else 0
+    older_than = _decode_cursor(before, scope, identities) if before else None
+    where, params = _scope_filter(scope)
+    fact_where, fact_params = scope.where(
+        domain="f.domain",
+        project="json_extract(f.attributes_json,'$.project')",
+        task="json_extract(f.attributes_json,'$.task_id')",
+        task_or_unset=True,
+    )
     with open_connection(config) as connection:
         rows = connection.execute(
             "SELECT o.* FROM event_observations o JOIN events e ON e.id=o.event_id WHERE "
@@ -434,28 +477,25 @@ def task_context(
                 (*params, rows[0]["seq"]),
             ).fetchone()[0] == 1
         checkpoint_row = None
-        if task_id:
+        if scope.task_id:
             checkpoint_row = connection.execute(
                 "SELECT o.* FROM event_observations o JOIN events e ON e.id=o.event_id WHERE "
                 + where
                 + " AND json_type(o.payload_json,'$.checkpoint')='object' ORDER BY o.seq DESC LIMIT 1",
                 params,
             ).fetchone()
-        open_tasks = None if task_id else _open_tasks(connection, where, params, OPEN_TASK_LIMIT)
+        open_tasks = None if scope.task_id else _open_tasks(connection, identities, scope, OPEN_TASK_LIMIT)
         facts = connection.execute(
             """SELECT f.* FROM current_facts f JOIN events e
             ON e.id=json_extract(f.attributes_json,'$.event_id')
-            WHERE (? IS NULL OR f.domain=?)
-            AND (? IS NULL OR json_extract(f.attributes_json,'$.project')=?)
-            AND (? IS NULL OR json_extract(f.attributes_json,'$.task_id')=?
-                OR json_extract(f.attributes_json,'$.task_id') IS NULL)
+            WHERE """ + fact_where + """
             AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
             ORDER BY f.recorded_at_utc DESC,f.id LIMIT ?""",
-            (*params, limit + 1),
+            (*fact_params, limit + 1),
         ).fetchall()
     context = {
-        "project": project,
-        "task_id": task_id,
+        "project": scope.project,
+        "task_id": scope.task_id,
         "checkpoint": _observation(checkpoint_row) if checkpoint_row else None,
         "changes": [
             {

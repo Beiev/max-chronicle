@@ -34,6 +34,7 @@ from .db import (
     schema_target_version,
     utc_now,
 )
+from .identity import Registry
 from .lexical import covers, query_terms, relaxed_query, strict_query
 from .redaction import redact
 
@@ -121,7 +122,7 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
             mem0_collection=mem0_collection,
             operator_label=operator_label,
         )
-    return config
+    return replace(config, identities=Registry.from_manifest(manifest))
 
 
 _READ_ONLY_PROCESS = False
@@ -1433,18 +1434,12 @@ def _upsert_mem0_outbox(
     )
 
 
-def _event_domain_where_clause(alias: str = "e") -> str:
-    return (
-        f"(? IS NULL OR {alias}.circumstances = ? "
-        f"OR ({alias}.circumstances IS NULL AND json_extract({alias}.payload_json, '$.domain') = ?))"
-    )
-
-
-def _event_project_where_clause(alias: str = "e") -> str:
-    return (
-        f"({alias}.entity_id = ? OR {alias}.title = ? "
-        f"OR ({alias}.entity_id IS NULL AND {alias}.title IS NULL "
-        f"AND json_extract({alias}.payload_json, '$.project') = ?))"
+def _event_scope(config: ChronicleConfig, alias: str = "e", **names: str | None) -> tuple[str, tuple[str, ...]]:
+    """SQL keeping events in a scope, whichever spelling each name was written in (FR-14)."""
+    return config.identities.scope(**names).where(
+        domain=f"COALESCE({alias}.circumstances, json_extract({alias}.payload_json, '$.domain'))",
+        project=f"COALESCE({alias}.title, json_extract({alias}.payload_json, '$.project'))",
+        task=f"json_extract({alias}.payload_json, '$.task_id')",
     )
 
 
@@ -1673,6 +1668,7 @@ def fetch_recent_events(
     connection: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
     resolved_visibility = _normalize_event_visibility(visibility)
+    scope_sql, scope_params = _event_scope(config, domain=domain)
     def _fetch(active_connection: sqlite3.Connection) -> list[sqlite3.Row]:
         return active_connection.execute(
             """
@@ -1696,11 +1692,11 @@ def fetch_recent_events(
             LEFT JOIN mem0_outbox AS o
                 ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
-              AND """ + _event_domain_where_clause("e") + """
+              AND """ + scope_sql + """
             ORDER BY e.occurred_at_utc DESC
             LIMIT ?
             """,
-            (resolved_visibility, domain, domain, domain, limit),
+            (resolved_visibility, *scope_params, limit),
         ).fetchall()
 
     if connection is not None:
@@ -1716,6 +1712,7 @@ def fetch_latest_snapshot(
     *,
     domain: str | None = None,
 ) -> dict[str, Any] | None:
+    domain = config.identities.domain(domain)
     with open_connection(config) as connection:
         row = connection.execute(
             """
@@ -1740,7 +1737,9 @@ def fetch_project_events(
     visibility: str = "default",
 ) -> list[dict[str, Any]]:
     resolved_visibility = _normalize_event_visibility(visibility)
-    entity_id = f"project:{_slugify(project)}"
+    scope = config.identities.scope(project=project)
+    project_sql, project_params = _event_scope(config, project=project)
+    entity_ids = [f"project:{_slugify(form)}" for form in scope.projects]
     with open_connection(config) as connection:
         rows = connection.execute(
             """
@@ -1764,11 +1763,11 @@ def fetch_project_events(
             LEFT JOIN mem0_outbox AS o
                 ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
-              AND """ + _event_project_where_clause("e") + """
+              AND (e.entity_id IN (""" + ", ".join("?" for _ in entity_ids) + """) OR """ + project_sql + """)
             ORDER BY e.occurred_at_utc DESC
             LIMIT ?
             """,
-            (resolved_visibility, entity_id, project, project, limit),
+            (resolved_visibility, *entity_ids, *project_params, limit),
         ).fetchall()
     return [_event_row_to_entry(row) for row in rows]
 
@@ -1795,6 +1794,7 @@ def search_events(
     fts_query = _fts_query(query, relaxed=relaxed)
     terms = query_terms(query)
     page_size = limit * RELAXED_CANDIDATE_FACTOR if relaxed else limit
+    scope_sql, scope_params = _event_scope(config, domain=domain, project=project, task_id=task_id)
     kept: list[sqlite3.Row] = []
     with open_connection(config) as connection:
         if relaxed:
@@ -1826,9 +1826,7 @@ def search_events(
                     ON o.event_id = e.id AND o.operation = 'add'
                 WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
                   AND events_fts MATCH ?
-                  AND """ + _event_domain_where_clause("e") + """
-                  AND (? IS NULL OR e.title = ?)
-                  AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
+                  AND """ + scope_sql + """
                   AND (? = 0 OR NOT EXISTS (SELECT 1 FROM facts f
                       WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
                       OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
@@ -1836,8 +1834,7 @@ def search_events(
                 ORDER BY rank, e.occurred_at_utc DESC, e.id
                 LIMIT ? OFFSET ?
                 """,
-                (resolved_visibility, fts_query, domain, domain, domain,
-                 project, project, task_id, task_id, current_only, page_size, page * page_size),
+                (resolved_visibility, fts_query, *scope_params, current_only, page_size, page * page_size),
             ).fetchall()
             if not relaxed:
                 kept = rows
@@ -1867,6 +1864,7 @@ def search_fact_events(
     task_id: str | None = None,
 ) -> list[str]:
     """Search current explicit values as well as the prose of their event."""
+    scope_sql, scope_params = _event_scope(config, domain=domain, project=project, task_id=task_id)
     with open_connection(config) as connection:
         rows = connection.execute(
             """SELECT e.id FROM facts_fts
@@ -1874,11 +1872,9 @@ def search_fact_events(
             JOIN events e ON e.id=json_extract(f.attributes_json,'$.event_id')
             WHERE facts_fts MATCH ?
               AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
-              AND """ + _event_domain_where_clause("e") + """
-              AND (? IS NULL OR e.title=?)
-              AND (? IS NULL OR json_extract(e.payload_json,'$.task_id')=?)
+              AND """ + scope_sql + """
             ORDER BY bm25(facts_fts),e.occurred_at_utc DESC,e.id LIMIT ?""",
-            (_fts_query(query), domain, domain, domain, project, project, task_id, task_id, limit),
+            (_fts_query(query), *scope_params, limit),
         ).fetchall()
     return [row["id"] for row in rows]
 
@@ -1896,20 +1892,19 @@ def fetch_recall_pool(
     from .embeddings import active_profile
 
     key = model_key or active_profile().key
+    scope_sql, scope_params = _event_scope(config, domain=domain, project=project, task_id=task_id)
     with open_connection(config) as connection:
         rows = connection.execute(
             """SELECT e.id, e.occurred_at_utc, ev.model_key, ev.dim, ev.vector
             FROM events e LEFT JOIN event_vectors ev ON ev.event_id = e.id AND ev.model_key = ?
             WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
-              AND """ + _event_domain_where_clause("e") + """
-              AND (? IS NULL OR e.title = ?)
-              AND (? IS NULL OR json_extract(e.payload_json, '$.task_id') = ?)
+              AND """ + scope_sql + """
               AND NOT EXISTS (SELECT 1 FROM facts f
                   WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
                   OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
                       AND json_extract(obs.payload_json,'$.fact_id')=f.id)))
             ORDER BY e.occurred_at_utc DESC, e.id
-            """, (key, domain, domain, domain, project, project, task_id, task_id),
+            """, (key, *scope_params),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -1928,6 +1923,7 @@ def fetch_events_between(
     """Events in a window, oldest first; with ``newest``, the latest ``limit`` of them."""
     resolved_visibility = _normalize_event_visibility(visibility)
     excluded_sql, excluded_params = _source_kind_exclusion(exclude_source_kinds)
+    scope_sql, scope_params = _event_scope(config, domain=domain)
     with open_connection(config) as connection:
         rows = connection.execute(
             """
@@ -1953,11 +1949,11 @@ def fetch_events_between(
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?
-              AND """ + _event_domain_where_clause("e") + excluded_sql + """
+              AND """ + scope_sql + excluded_sql + """
             ORDER BY e.occurred_at_utc """ + ("DESC" if newest else "ASC") + """
             LIMIT ?
             """,
-            (resolved_visibility, start_utc, end_utc, domain, domain, domain, *excluded_params, limit),
+            (resolved_visibility, start_utc, end_utc, *scope_params, *excluded_params, limit),
         ).fetchall()
     entries = [_event_row_to_entry(row) for row in rows]
     return entries[::-1] if newest else entries
@@ -3357,6 +3353,8 @@ def timeline_state(
         raise ValueError(f"detail must be 'digest' or 'full', got {detail!r}")
     resolved_visibility = _normalize_event_visibility(visibility)
     target_utc = target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snapshot_domain = config.identities.domain(domain)
+    scope_sql, scope_params = _event_scope(config, domain=domain)
 
     with open_connection(config) as connection:
         snapshot_rows = connection.execute(
@@ -3370,7 +3368,7 @@ def timeline_state(
             ORDER BY delta_seconds ASC
             LIMIT ?
             """,
-            (target_utc, domain, domain, limit),
+            (target_utc, snapshot_domain, snapshot_domain, limit),
         ).fetchall()
         event_rows = connection.execute(
             """
@@ -3395,10 +3393,10 @@ def timeline_state(
                 ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
               AND ABS(unixepoch(e.occurred_at_utc) - unixepoch(?)) <= ?
-              AND """ + _event_domain_where_clause("e") + """
+              AND """ + scope_sql + """
             ORDER BY e.occurred_at_utc ASC
             """,
-            (resolved_visibility, target_utc, window_hours * 3600, domain, domain, domain),
+            (resolved_visibility, target_utc, window_hours * 3600, *scope_params),
         ).fetchall()
 
     snapshots: list[dict[str, Any]] = []

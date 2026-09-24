@@ -17,6 +17,6 @@ The active contract is [Shared agent memory](ROADMAP-ULTIMATE-MEMORY.md).
 - [x] Golden-set eval with a pinned synthetic baseline (FR-13).
 - [x] Unicode-aware lexical recall, flagged relaxed fallback, `no_confident_match` (FR-2).
 - [ ] Secret filter on write, archive, and index (FR-11).
-- [ ] Brief endpoint and session hooks for Claude and Codex (FR-12, NFR-4).
+- [x] Brief endpoint and session hooks for Claude and Codex (FR-12, NFR-4).
 - [ ] Index of explicitly written notes with project/global scoping (FR-10).
-- [ ] Identity registry and one scope function (FR-14).
+- [x] Identity registry and one scope function (FR-14).
