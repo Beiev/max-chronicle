@@ -723,6 +723,10 @@ def cmd_embed_backfill(args: argparse.Namespace) -> int:
 
 def cmd_notes(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
+    if args.db is not None:
+        manifest = dict(manifest)
+        manifest["paths"] = dict(manifest["paths"])
+        manifest["paths"]["chronicle_db"] = str(args.db)
     if args.notes_command == "sync":
         return _print_json(sync_notes(manifest, embed=not args.no_embed, embed_limit=args.embed_limit))
     if args.notes_command == "status":

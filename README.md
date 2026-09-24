@@ -214,7 +214,7 @@ recall them (FR-10):
 
 ```toml
 [notes]
-paths = ["~/.claude/projects/*/memory/*.md"]
+paths = ["~/.claude/projects/*/memory/*.md"]  # absolute, or from ~
 exclude = ["*.bak-*", "*/_archive/*"]
 deny = ["*api-key*", "*keys.md"]  # never read, whatever they hold
 sync_minutes = 15                  # the long-running server re-syncs this often
@@ -222,10 +222,23 @@ sync_minutes = 15                  # the long-running server re-syncs this often
 
 `chronicle notes sync` re-indexes the changed notes, keeps a tombstone for a
 deleted one, and never writes to a note; the server runs the same sync every
-`sync_minutes`. Each note is split into sections at its headings, and the
-secret filter runs on every stored string. A note inside a project root, or in
-the file memory of a project's directory, belongs to that project; any other
-note is global.
+`sync_minutes`.
+
+- **Secrets.** The secret filter runs on a note's whole text before it is split
+  into sections at its headings, so a key longer than a section is removed
+  whole. Every other stored string is filtered too. Built-in name patterns such
+  as `*secret*`, `*credential*`, `*private-key*`, `id_rsa*` and `*.pem` apply on
+  top of `deny`.
+- **Files not read.** A file reached through a symbolic link below the fixed
+  part of a pattern, a file whose path holds a likely secret, and a file that is
+  not text (UTF-8, or UTF-16/32 with a byte-order mark) are reported, not read.
+- **Removal.** A deleted or newly denied note keeps only its path as a
+  tombstone. The sync compacts the full-text index and deletes with
+  `secure_delete`, so removed text does not linger in the database file.
+- **Projects.** A note inside a project root, or in the file memory of a
+  directory inside that root, belongs to that project. In the file memory of a
+  directory under the workspace, it belongs to that workspace child's project.
+  Any other note is global.
 
 `query_memory` returns notes in `notes`, next to events in `results`: the best
 section of each note, with its heading, path and id. In a project scope, the

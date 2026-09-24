@@ -3,21 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from dataclasses import replace
 import json
+import logging
+import os
 import secrets
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
+from max_chronicle.embeddings import active_profile, unpack_vector
 from max_chronicle.evals import GoldenCase, run_eval
 from max_chronicle.mcp_server import _start_notes_sync, build_server
-from max_chronicle.notes import CHUNK_CHARS, _directory_slug, chunk_note, note_project, read_note, sync_notes
+from max_chronicle.notes import (
+    CHUNK_CHARS,
+    _directory_slug,
+    chunk_note,
+    note_project,
+    note_settings,
+    read_note,
+    sync_notes,
+)
 from max_chronicle.identity import Registry
 from max_chronicle.recall import query_memory
 from max_chronicle.store import config_from_manifest, open_connection
 
-from max_chronicle import service
+from max_chronicle import cli, service
+from max_chronicle import mcp_server as mcp_server_module
 
 
 @pytest.fixture(autouse=True)
@@ -263,3 +278,278 @@ def test_a_note_belongs_to_a_root_a_project_folder_or_nobody(tmp_path) -> None:
         == "max-chronicle"
     assert note_project(claude / _directory_slug(workspace) / "memory" / "a.md", manifest, registry) is None
     assert note_project(tmp_path / "elsewhere" / "a.md", manifest, registry) is None
+
+
+# Review of #14: every test below failed before its fix.
+
+
+def _pem_block(lines: int = 40) -> tuple[str, list[str]]:
+    body = [base64.b64encode(secrets.token_bytes(48)).decode() for _ in range(lines)]
+    head, tail = "-----BEGIN " + "RSA PRIVATE KEY-----", "-----END " + "RSA PRIVATE KEY-----"
+    return "\n".join([head, *body, tail]), body
+
+
+def _stored_text(manifest: dict) -> str:
+    """Every string the note index stores, full-text content included."""
+    with open_connection(config_from_manifest(manifest)) as connection:
+        return json.dumps([[tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
+                           for table in ("documents", "document_chunks", "document_chunks_fts")])
+
+
+def test_secrets_are_filtered_before_a_note_is_split(notes) -> None:
+    """A private key longer than a section, or a key across a hard cut, never reaches the index."""
+    manifest, files = notes
+    block, body = _pem_block()
+    key = _synthetic_key()
+    long_line = "word " * 298 + "x " + key  # one 1,500+ character line, the key across the cut
+    note = _note(files["global"].with_name("build-box.md"),
+                 f"## Build box\nSSH access:\n\n{block}\n\n## Long\n{long_line}\n", name="Build box")
+
+    sync_notes(manifest)
+
+    stored = _stored_text(manifest)
+    assert not any(line in stored for line in body)
+    assert key not in "".join(text for _, text in _chunks(manifest, note))
+
+
+def test_a_key_in_a_file_name_or_type_is_never_stored(notes) -> None:
+    manifest, files = notes
+    token = "ghp_" + secrets.token_hex(18)
+    key = _synthetic_key()
+    named = _note(files["global"].with_name(f"{token}.md"), "## Setup\nPlain setup text.\n", name="Setup note")
+    typed = _note(files["global"].with_name("vendor-setup.md"), "## Setup\nThe vendor sandbox rotates weekly.\n",
+                  name="Vendor setup", type=key)
+    ssh = _note(files["global"].with_name("build-box-private-key.md"), "## Box\nPlain text.\n", name="Box")
+
+    report = sync_notes(manifest)
+
+    documents = _documents(manifest)
+    assert str(named) not in documents and str(ssh) not in documents and str(typed) in documents
+    assert token not in _stored_text(manifest) and key not in _stored_text(manifest)
+    assert token not in json.dumps(report) and report["denied"] == 1
+    assert [item["reason"] for item in report["skipped"]] == ["secret_in_path"]
+    found = query_memory(manifest, query="vendor sandbox rotates")["notes"]
+    assert found and key not in json.dumps(found) and key not in json.dumps(read_note(manifest, found[0]["document_id"]))
+
+
+def test_full_text_matches_are_scoped_before_they_are_capped(notes) -> None:
+    manifest, files = notes
+    for index in range(120):
+        _note(files["atlas"].parent / f"step-{index:03d}.md", f"## Deploy {index}\nDeploy pipeline step {index}.\n",
+              name=f"Atlas step {index}")
+    filler = " ".join(f"word{index}" for index in range(160))
+    _note(files["inside"], f"# Orbit notes\n\nThe orbit deploy pipeline has no staging. {filler}\n")
+    sync_notes(manifest)
+
+    found = query_memory(manifest, query="deploy pipeline", project="orbit")
+
+    assert [note["path"] for note in found["notes"]][:2] == [str(files["inside"]), str(files["global"])]
+    assert found["no_confident_match"] is False
+
+
+def _orbit_vector(manifest: dict, files: dict) -> list[float] | None:
+    with open_connection(config_from_manifest(manifest)) as connection:
+        row = connection.execute(
+            "SELECT v.vector FROM document_chunks c JOIN documents d ON d.id = c.document_id "
+            "LEFT JOIN chunk_vectors v ON v.chunk_id = c.id WHERE d.path = ?", (str(files["orbit"]),)).fetchone()
+    return unpack_vector(row["vector"]) if row["vector"] else None
+
+
+def test_a_vector_never_outlives_the_text_it_was_made_from(notes, monkeypatch) -> None:
+    manifest, files = notes
+    batches: list[int] = []
+
+    def embed(texts, **_):
+        if not batches:  # another sync re-indexes a changed note while this batch is embedded
+            _note(files["orbit"], "## Launch\nOrbit launches on Fridays now.\n", name="Orbit launch")
+            sync_notes(manifest, embed=False)
+        batches.append(len(texts))
+        return [[1.0, 0.0, 0.0] if "Tuesdays" in text else [0.0, 1.0, 0.0] for text in texts]
+
+    monkeypatch.setattr("max_chronicle.embeddings.embed_documents", embed)
+    sync_notes(manifest)
+    assert _orbit_vector(manifest, files) is None  # the vector of the old text was not stored
+
+    again = sync_notes(manifest)
+
+    assert again["embedding"]["embedded"] == 1 and _orbit_vector(manifest, files) == [0.0, 1.0, 0.0]
+
+
+def test_symlinks_are_not_followed(notes, tmp_path) -> None:
+    manifest, files = notes
+    outside = tmp_path / "outside"
+    _note(outside / "vendor-api-keys.md", "## Keys\nzebramarker lives in a denied file\n")
+    _note(outside / "project" / "memory" / "plan.md", "## Plan\nquokkamarker lives outside the paths\n")
+    (files["global"].parent / "harmless.md").symlink_to(outside / "vendor-api-keys.md")
+    (files["atlas"].parents[2] / "linked-project").symlink_to(outside / "project", target_is_directory=True)
+
+    report = sync_notes(manifest)
+
+    stored = _stored_text(manifest)
+    assert "zebramarker" not in stored and "quokkamarker" not in stored
+    assert [item["reason"] for item in report["skipped"]] == ["symlink", "symlink"]
+
+
+def test_notes_commands_use_the_db_flag(notes, chronicle_sandbox, monkeypatch, capsys, tmp_path) -> None:
+    manifest, _ = notes
+    with chronicle_sandbox.manifest_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n[notes]\npaths = [" + ", ".join(json.dumps(p) for p in manifest["notes"]["paths"])
+                     + ']\nexclude = ["*.bak-*"]\n')
+    other = tmp_path / "copy" / "chronicle.db"
+    other.parent.mkdir()
+    monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
+                                      "--db", str(other), "notes", "sync", "--no-embed"])
+
+    assert cli.main() == 0
+    capsys.readouterr()
+
+    assert _documents(manifest) == {}
+    with open_connection(replace(config_from_manifest(manifest), db_path=other)) as connection:
+        assert connection.execute("SELECT count(*) FROM documents").fetchone()[0] == 4
+
+
+def test_the_startup_bundle_takes_no_confidence_from_notes(notes) -> None:
+    manifest, _ = notes
+    sync_notes(manifest)
+    service.record_event(manifest, {"agent": "agent-a", "domain": "global", "text": "Grocery list for the weekend"})
+
+    bundle = service.build_startup_bundle(manifest, focus="orbit launches tuesdays")
+
+    assert bundle["recall_status"]["no_confident_match"] is True
+
+
+def test_a_nested_memory_folder_belongs_to_the_enclosing_project(tmp_path) -> None:
+    workspace = tmp_path / "Projects"
+    orbit = workspace / "orbit"
+    manifest = {"paths": {"workspace_root": str(workspace)}, "projects": [{"id": "orbit", "roots": [str(orbit)]}]}
+    registry = Registry.from_manifest(manifest)
+    for folder in (orbit / ".worktrees" / "feature", orbit / "docs", workspace / "voice" / "transcripts",
+                   workspace / "orbit-legacy", workspace / "garden planner" / "notes"):
+        folder.mkdir(parents=True)
+
+    def project(folder: Path) -> str | None:
+        return note_project(tmp_path / ".claude" / "projects" / _directory_slug(folder) / "memory" / "a.md",
+                            manifest, registry)
+
+    assert project(orbit / ".worktrees" / "feature") == "orbit"
+    assert project(orbit / "docs") == "orbit"
+    assert project(workspace / "voice" / "transcripts") == "voice"
+    assert project(workspace / "orbit-legacy") == "orbit-legacy"
+    assert project(workspace / "garden planner" / "notes") == "garden-planner"
+    # The directory is gone: under a root the note stays with the root, a workspace child keeps its name.
+    assert project(orbit / ".worktrees" / "removed") == "orbit"
+    assert project(workspace / "archived-app") == "archived-app"
+    assert project(workspace / "archived-app" / ".cache") == "archived-app"
+
+
+def test_a_utf16_note_is_decoded_before_filtering_and_binary_files_are_skipped(notes) -> None:
+    manifest, files = notes
+    key = _synthetic_key()
+    utf16 = files["global"].with_name("vendor-notes.md")
+    utf16.write_bytes(f"## Vendor\nThe vendor sandbox rotates weekly. OPENAI_API_KEY={key}\n".encode("utf-16"))
+    binary = files["global"].with_name("blob.md")
+    binary.write_bytes(b"## Blob\n\x00\x01zebramarker\x00")
+
+    report = sync_notes(manifest)
+
+    stored = _stored_text(manifest)
+    assert key not in stored.replace("\\u0000", "") and "zebramarker" not in stored
+    [(heading, text)] = _chunks(manifest, utf16)
+    assert heading == "vendor-notes › Vendor" and text.startswith("The vendor sandbox rotates weekly.")
+    assert {"path": str(binary), "reason": "not_text"} in report["skipped"]
+
+
+@pytest.mark.parametrize("size", [13, 16])
+def test_a_malformed_note_vector_is_ignored(notes, monkeypatch, size) -> None:
+    manifest, _ = notes
+    sync_notes(manifest, embed=False)
+    service.record_event(manifest, {"agent": "agent-a", "domain": "global", "text": "Orbit launch moved"})
+    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query: [0.9, 0.1, 0.0])
+    with open_connection(config_from_manifest(manifest)) as connection:
+        chunk_id = connection.execute("SELECT id FROM document_chunks ORDER BY id LIMIT 1").fetchone()[0]
+        connection.execute("INSERT INTO chunk_vectors(chunk_id, model_key, dim, vector, created_at_utc) "
+                           "VALUES (?, ?, 3, ?, '2026-09-24T00:00:00Z')", (chunk_id, active_profile().key, b"\x01" * size))
+        connection.commit()
+
+    payload = query_memory(manifest, query="orbit launch moved")
+
+    assert payload["results"] and payload["notes"] and "notes" not in payload["channel_errors"]
+
+
+def test_a_relaxed_note_match_is_flagged(notes) -> None:
+    manifest, _ = notes
+    sync_notes(manifest)
+
+    payload = query_memory(manifest, query="orbit launching tuesday")
+
+    assert payload["notes"] and payload["relaxed"] is True and "notes_fts" in payload["channels_used"]
+
+
+def test_a_bad_notes_section_stops_the_server_cleanly(chronicle_sandbox, monkeypatch, caplog) -> None:
+    with chronicle_sandbox.manifest_path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[notes]\npaths = ["/nonexistent/*.md"]\nsync_minutes = 0\n')
+    monkeypatch.setattr(sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path),
+                                      "--transport", "streamable-http"])
+
+    with caplog.at_level(logging.ERROR, logger="max_chronicle.mcp"):
+        assert mcp_server_module._main() == 1
+
+    assert "cannot start" in caplog.text and "sync_minutes" in caplog.text
+
+
+def test_note_paths_must_be_absolute() -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        note_settings({"notes": {"paths": ["notes/*.md"]}})
+    assert note_settings({"notes": {"paths": ["~/notes/*.md"]}}).enabled
+
+
+def test_titles_and_frontmatter_ignore_code_and_rules(notes) -> None:
+    manifest, files = notes
+    memory = files["global"].parent
+    code = _note(memory / "toolchain.md", "```sh\n# install the toolchain\nmake setup\n```\n\n## Usage\nRun it once.\n")
+    ruled = _note(memory / "ruled.md", "---\nThe opening paragraph after a rule.\n\n---\n\n## Later\nMore text.\n")
+
+    sync_notes(manifest)
+
+    assert _documents(manifest)[str(code)]["title"] == "toolchain"
+    assert _chunks(manifest, code)[0] == ("toolchain", "```sh\n# install the toolchain\nmake setup\n```")
+    assert "The opening paragraph after a rule." in _chunks(manifest, ruled)[0][1]
+
+
+def test_equally_ranked_notes_come_newest_first(notes, monkeypatch) -> None:
+    manifest, files = notes
+    memory = files["global"].parent
+    older = _note(memory / "older.md", "## Walrus\nwalrus harbor schedule\n", name="Older walrus")
+    newer = _note(memory / "newer.md", "## Otter\nsomething unrelated entirely\n", name="Newer otter")
+    os.utime(older, (1_600_000_000, 1_600_000_000))
+    os.utime(newer, (1_700_000_000, 1_700_000_000))
+    monkeypatch.setattr("max_chronicle.embeddings.embed_documents",
+                        lambda texts, **_: [[1.0, 0.0, 0.0] if "unrelated" in t else [0.0, 1.0, 0.0] for t in texts])
+    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query: [1.0, 0.0, 0.0])
+    sync_notes(manifest)
+
+    hits = query_memory(manifest, query="walrus harbor")["notes"]
+
+    assert hits[0]["rrf_score"] == hits[1]["rrf_score"]
+    assert [hit["path"] for hit in hits[:2]] == [str(newer), str(older)]
+
+
+def test_a_note_denied_later_leaves_nothing_behind(notes) -> None:
+    manifest, files = notes
+    note = _note(files["global"].with_name("plans.md"), "## Plans\nquokkamarker zebramarker\n",
+                 name="Plans quokkamarker", description="zebramarker plans", type="walrusmarker")
+    sync_notes(manifest)
+    identifier = _documents(manifest)[str(note)]["id"]
+
+    assert sync_notes({**manifest, "notes": {**manifest["notes"], "deny": ["plans.md"]}})["removed"] == 1
+
+    config = config_from_manifest(manifest)
+    with open_connection(config) as connection:
+        row = dict(connection.execute("SELECT * FROM documents WHERE id = ?", (identifier,)).fetchone())
+        segments = b"".join(bytes(block) for (block,) in connection.execute(
+            "SELECT block FROM document_chunks_fts_data") if block is not None)
+    assert row["deleted_at_utc"] is not None
+    assert not {"quokkamarker", "zebramarker", "walrusmarker"} & set(json.dumps(row).replace('"', " ").split())
+    assert b"quokkamarker" not in segments and read_note(manifest, identifier) is None
+    raw = b"".join(path.read_bytes() for path in config.db_path.parent.glob(config.db_path.name + "*"))
+    assert b"quokkamarker" not in raw and b"zebramarker" not in raw

@@ -1655,8 +1655,9 @@ def build_startup_bundle(
     recent_events = fetch_recent_events(config, limit=limit, domain=domain_id)
     recall_status = None
     if focus:
+        # The bundle shows events only, so its confidence must come from events too.
         recall = query_memory(manifest, query=focus, domain=domain_id, project=project,
-                              task_id=task_id, limit=limit)
+                              task_id=task_id, limit=limit, include_notes=False)
         recall_status = {key: recall[key] for key in (
             "degraded", "channel_errors", "vector_coverage", "relaxed", "no_confident_match", "hint",
         ) if key in recall}

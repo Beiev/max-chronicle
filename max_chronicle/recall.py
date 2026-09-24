@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
+import struct
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -224,6 +225,8 @@ def query_memory(
             found = recall_notes(config, query=query, project=project, query_vector=usable_query_vec,
                                  threshold=threshold, limit=min(limit, NOTE_LIMIT))
             notes = found["notes"]
+            relaxed = relaxed or found["relaxed"]
+            channels = channels + found["channels"]
             # A note holding every query term, or close enough, is confident evidence too.
             confident = confident or any(
                 note["chunk_id"] in found["strict"]
@@ -231,7 +234,7 @@ def query_memory(
                     and note["channels"]["vector_similarity"] >= confident_floor)
                 for note in notes
             )
-        except (sqlite3.Error, ValueError) as exc:
+        except (sqlite3.Error, ValueError, struct.error) as exc:  # the notes channel never breaks event recall
             errors["notes"] = f"{type(exc).__name__}: {exc}"
     response = {
         "query": query,

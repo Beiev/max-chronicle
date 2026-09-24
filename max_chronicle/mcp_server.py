@@ -1105,7 +1105,9 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
     read_only = args.profile == READ_ONLY_PROFILE
     try:
         manifest_path = args.manifest or default_manifest_path()
-        config = config_from_manifest(load_manifest(manifest_path))
+        loaded = load_manifest(manifest_path)
+        config = config_from_manifest(loaded)
+        note_settings(loaded)  # a bad [notes] section stops the start, not the sync thread later
         prepared = prepare_database(config, allow_upgrade=args.migrate and not read_only, read_only=read_only)
     except (ChronicleConfigError, MigrationError, sqlite3.Error, OSError, ValueError) as exc:
         _LOGGER.error("chronicle-mcp cannot start: %s: %s", type(exc).__name__, exc)
@@ -1172,7 +1174,12 @@ def _start_notes_sync(manifest_path: Path) -> threading.Thread | None:
     A stdio server lives as long as one client and does not sync; `chronicle
     notes sync` does the same by hand.
     """
-    if not note_settings(load_manifest(manifest_path)).sync_minutes:
+    try:
+        minutes = note_settings(load_manifest(manifest_path)).sync_minutes
+    except (OSError, ValueError) as exc:
+        _LOGGER.error("notes sync not started: %s: %s", type(exc).__name__, exc)
+        return None
+    if not minutes:
         return None
 
     def loop() -> None:
