@@ -109,3 +109,19 @@ def test_a_write_gets_canonical_names_and_keeps_the_given_ones() -> None:
     canonical = {"agent": "codex", "project": "max-chronicle", "domain": "memory"}
     registry.canonical_entry(canonical)
     assert canonical == {"agent": "codex", "project": "max-chronicle", "domain": "memory"}
+
+
+def test_entries_with_one_id_add_up_instead_of_hiding_each_other() -> None:
+    registry = Registry.from_manifest({
+        "projects": [{"id": "atlas", "aliases": ["old-atlas"]}, {"id": "atlas", "aliases": ["legacy"]}],
+        "agents": [{"id": "bot", "aliases": ["helper"]}, {"id": "bot", "aliases": ["assistant-bot"]}],
+    })
+
+    assert registry.projects.forms("old-atlas") == ("atlas", "old-atlas", "legacy")
+    assert (registry.agent("helper"), registry.agent("assistant-bot")) == ("bot", "bot")
+
+
+@pytest.mark.parametrize("key", ["prefixes", "contains", "aliases"])
+def test_a_string_where_a_list_belongs_is_a_configuration_error(key) -> None:
+    with pytest.raises(ValueError, match=f"{key} must be a list"):
+        Registry.from_manifest({"agents": [{"id": "bot", key: "helper"}]})

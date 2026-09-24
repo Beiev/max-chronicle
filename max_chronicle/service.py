@@ -25,6 +25,7 @@ from .config import (
     feature_enabled,
 )
 from .db import database_summary
+from .identity import fold
 from .recall import query_memory
 from .redaction import redact_value
 from .projections import render_job_search_status, render_status_generated_block, update_status_file
@@ -517,8 +518,7 @@ _UNREDACTED_ENTRY_KEYS = frozenset(
         "id", "request_id", "session_id", "agent", "domain", "category", "project",
         "task_id", "recorded_at", "occurred_at", "entity_id", "entity_type",
         "source_files", "slot", "kind", "supersedes", "mem0_status", "memory_guard",
-        "content_hash", "skip_generic_source_archives", "agent_source", "actor_raw",
-        "project_raw", "domain_raw",
+        "content_hash", "skip_generic_source_archives", "agent_source",
     }
 )
 
@@ -583,7 +583,8 @@ def _find_recent_exact_duplicate(
             (existing.get("domain") or "global") == entry["domain"]
             and (existing.get("category") or "note") == entry["category"]
             and (existing.get("project") or "") == (entry.get("project") or "")
-            and existing.get("task_id") == entry.get("task_id")
+            # One task under any spelling of its id (FR-14).
+            and fold(existing.get("task_id") or "") == fold(entry.get("task_id") or "")
             and existing.get("checkpoint") == entry.get("checkpoint")
             and existing.get("fact") == entry.get("fact")
             and (existing.get("text") or "").strip() == entry["text"]
@@ -887,11 +888,18 @@ def _runtime_source_catalog(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _domain_id(manifest: dict[str, Any], domain_id: str | None) -> str | None:
+    """A domain's canonical id for any of its spellings (FR-14); an unknown one as given."""
+    entry = manifest["domain_map"].get(domain_id) if domain_id else None
+    return entry["id"] if entry else domain_id
+
+
 def build_sources_audit(
     manifest: dict[str, Any],
     *,
     domain_id: str = "global",
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     attach_catalog = _source_catalog(manifest, domain_id)
     runtime_catalog = _runtime_source_catalog(manifest)
     mem0_dump_path = _compat_path(manifest, "mem0_dump")
@@ -1138,6 +1146,7 @@ def build_freshness_audit(
     *,
     domain_id: str = "global",
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     domain = manifest["domain_map"][domain_id]
     config = _config(manifest)
     attach_sources: list[dict[str, Any]] = []
@@ -2118,8 +2127,14 @@ def record_event(
     validate_entry(normalized_entry)
     config = _config(manifest)
     # Canonical names for the agent, project and domain; the given spellings
-    # stay beside them (FR-14).
+    # stay beside them (FR-14). A given spelling is caller text, so it passes
+    # the secret filter like any other.
     config.identities.canonical_entry(normalized_entry)
+    for raw_key in ("actor_raw", "project_raw", "domain_raw"):
+        if raw_key in normalized_entry:
+            normalized_entry[raw_key], found = redact_value(normalized_entry[raw_key])
+            for kind, count in found.items():
+                redactions[kind] = redactions.get(kind, 0) + count
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
     resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind)
     if resolved_mem0_status is not None:
@@ -2787,6 +2802,7 @@ def capture_runtime_snapshot(
     append_compat: bool = True,
     render_generated: bool = True,
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     config = _config(manifest)
     recent_events = fetch_recent_events(config, limit=8, domain=domain_id)
     if not recent_events:
@@ -2820,6 +2836,7 @@ def build_activation(
     focus: str | None = None,
     capture: bool = True,
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     attach_bundle = build_attach_bundle(
         manifest,
         domain_id=domain_id,
@@ -2971,6 +2988,7 @@ def query_context(
 ) -> dict[str, Any]:
     if mode not in QUERY_MODES:
         raise ValueError(f"Unsupported query mode: {mode}")
+    domain = _domain_id(manifest, domain)
     config = _config(manifest)
     chronicle_hits = search_events(config, query=query, limit=limit, domain=domain)
     for hit in chronicle_hits:

@@ -19,6 +19,7 @@ from max_chronicle.brief import build_brief
 from max_chronicle.mcp_server import build_server
 from max_chronicle.memory import task_context
 from max_chronicle.recall import query_memory
+from max_chronicle.runtime_context import load_manifest
 from max_chronicle.store import config_from_manifest, fetch_recent_events, open_connection
 
 
@@ -85,8 +86,14 @@ def test_open_tasks_merge_the_spellings_of_one_task(loaded_manifest) -> None:
         ("max-chronicle", "Run the launch"),
     ]
 
-    _record(manifest, "Launch done", project="STATUS", task_id="LAUNCH PLAN",
+
+def test_a_completion_written_before_the_registry_closes_the_task_under_every_spelling(loaded_manifest) -> None:
+    _checkpoint(loaded_manifest, "max-chronicle", "launch_plan", "Run the launch")
+    _checkpoint(loaded_manifest, "max-chronicle", "video", "Cut the video")
+    _record(loaded_manifest, "Launch done", project="STATUS", task_id="LAUNCH PLAN",
             fact={"slot": "task.status", "value": "completed", "kind": "observed"})
+    manifest = _registered(loaded_manifest)
+
     tasks = task_context(manifest, domain="global", project="max-chronicle", task_id=None)["open_tasks"]
     assert [task["goal"] for task in tasks] == ["Cut the video"]
 
@@ -205,3 +212,130 @@ def test_a_retry_after_a_reconnect_is_the_same_request(chronicle_sandbox) -> Non
     first, retried = asyncio.run(scenario())
     assert first["agent"] == "memory-librarian"
     assert (retried["id"], retried["chronicle_status"]) == (first["id"], "existing")
+
+
+# ---------------------------------------------------------------------------
+# Review of #13: each case failed before its fix
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_key() -> str:
+    return "sk-" + "proj-" + "Q7fZ2mK9xLp4Rt8Vw3Nc6Bh1Jd5Gy0Ua"
+
+
+def test_a_given_spelling_passes_the_secret_filter(loaded_manifest, chronicle_sandbox) -> None:
+    key = _synthetic_key()
+    stored = _record(loaded_manifest, "A spelling with a key", agent=f"codex {key}")
+
+    assert stored["agent"] == "codex" and sum(stored["redactions"].values()) >= 1
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config) as connection:
+        rows = [json.dumps([tuple(row) for row in connection.execute(f"SELECT * FROM {table}")])
+                for table in ("events", "event_observations")]
+    ledger = (chronicle_sandbox.status_root / "ssot-ledger.jsonl").read_text()
+    assert not any(key in text for text in [*rows, ledger])
+
+
+def test_a_retry_after_an_upgrade_or_a_new_alias_is_the_same_request(loaded_manifest) -> None:
+    from max_chronicle.memory import _hash, _request_input
+
+    arguments = {"text": "Retried across a deploy", "request_id": "retry-deploy", "agent": "claude-code",
+                 "agent_source": "client", "project": "old-atlas"}
+    first = _record(loaded_manifest, **arguments)
+    # 0.12.0 hashed the same input with the agent its MCP layer had normalised.
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config) as connection, connection:
+        stored = json.loads(connection.execute(
+            "SELECT payload_json FROM event_observations WHERE request_id=?", ("retry-deploy",)).fetchone()[0])
+        legacy = _hash(_request_input(stored) | {"agent": "claude"})
+        connection.execute("UPDATE event_observations SET request_hash=? WHERE request_id=?", (legacy, "retry-deploy"))
+    manifest = {**loaded_manifest, "projects": [{"id": "atlas", "aliases": ["old-atlas"]}]}
+
+    retried = _record(manifest, **arguments)
+
+    assert (retried["id"], retried["chronicle_status"]) == (first["id"], "existing")
+
+
+def test_two_agents_confirming_the_same_text_are_two_observations(chronicle_sandbox) -> None:
+    server = build_server(manifest_path=chronicle_sandbox.manifest_path)
+
+    async def scenario() -> list[str]:
+        async with create_connected_server_and_client_session(
+            server, client_info=Implementation(name="claude-code", version="2.1")
+        ) as client:
+            await client.call_tool("startup_bundle", {"mode": "brief", "agent": "claude"})
+            first = _decode(await client.call_tool("record_event", {"text": "The launch slips a week"}))
+            await client.call_tool("startup_bundle", {"mode": "brief", "agent": "codex"})
+            await client.call_tool("record_event", {"text": "The launch slips a week"})
+            return first["id"]
+
+    event_id = asyncio.run(scenario())
+    with open_connection(config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))) as connection:
+        authors = [row[0] for row in connection.execute(
+            "SELECT actor FROM event_observations WHERE event_id=? ORDER BY seq", (event_id,))]
+    assert authors == ["claude", "codex"]
+
+
+def test_replacing_a_value_settles_every_spelling_of_its_slot(loaded_manifest) -> None:
+    _record(loaded_manifest, "Old atlas deploys to staging", project="old-atlas",
+            fact={"slot": "deploy.target", "value": "staging", "kind": "decision"})
+    newest = _record(loaded_manifest, "Atlas deploys to production", project="atlas",
+                     fact={"slot": "deploy.target", "value": "production", "kind": "decision"})["fact_id"]
+    manifest = {**loaded_manifest, "projects": [{"id": "atlas", "aliases": ["old-atlas"]}]}
+
+    def values() -> list[str]:
+        facts = task_context(manifest, domain="global", project="atlas", task_id=None)["current_facts"]
+        return sorted(fact["value"] for fact in facts if fact["slot"] == "deploy.target")
+
+    assert values() == ["production", "staging"]  # the conflict stays visible until someone settles it
+    _record(manifest, "Atlas deploys to canary", project="atlas",
+            fact={"slot": "deploy.target", "value": "canary", "kind": "decision", "supersedes": newest})
+    assert values() == ["canary"]
+
+
+def test_a_cursor_holds_for_any_spelling_of_undeclared_names(loaded_manifest) -> None:
+    _record(loaded_manifest, "First", project="Other_Project", domain="Custom_Domain")
+    cursor = task_context(loaded_manifest, domain="Custom_Domain", project="Other_Project", task_id=None)["cursor"]
+    newer = _record(loaded_manifest, "Second", project="other-project", domain="custom-domain")["id"]
+
+    page = task_context(loaded_manifest, domain="custom domain", project="other project", task_id=None, since=cursor)
+
+    assert [change["event_id"] for change in page["changes"]] == [newer]
+
+
+def test_snapshots_under_an_old_domain_spelling_stay_visible(loaded_manifest) -> None:
+    from max_chronicle.store import fetch_latest_snapshot, store_snapshot
+    from max_chronicle.service import reconstruct_timeline
+
+    config = config_from_manifest(loaded_manifest)
+    store_snapshot(config, {"domain": "mem", "title": "historical-snapshot"})
+    manifest = _registered(loaded_manifest)
+    config = config_from_manifest(manifest)
+
+    for spelling in ("mem", "memory"):
+        assert fetch_latest_snapshot(config, domain=spelling)["title"] == "historical-snapshot"
+    from datetime import datetime, timezone
+    timeline = reconstruct_timeline(manifest, timestamp=datetime.now(timezone.utc), domain="memory")
+    assert len(timeline["nearest_snapshots"]) == 1
+
+
+def test_a_domain_alias_works_for_every_tool_that_takes_a_domain(chronicle_sandbox) -> None:
+    from max_chronicle.service import build_sources_audit, capture_runtime_snapshot, query_context
+
+    path = chronicle_sandbox.manifest_path
+    path.write_text(path.read_text().replace('id = "memory"', 'id = "memory"\naliases = ["mem"]', 1))
+    manifest = load_manifest(path)
+
+    assert "mem" in manifest["domain_map"] and manifest["domain_map"]["Mem"]["id"] == "memory"
+    assert query_context(manifest, query="chronicle", domain="mem") is not None
+    assert build_sources_audit(manifest, domain_id="mem")["domain"]["id"] == "memory"
+    assert capture_runtime_snapshot(manifest, domain_id="mem", agent="pytest")["id"]
+
+
+def test_the_same_text_under_two_spellings_of_a_task_is_one_event(loaded_manifest) -> None:
+    first = service.record_event(loaded_manifest, {"agent": "a", "domain": "global", "text": "Draft ready",
+                                                   "project": "alpha", "task_id": "Launch_plan"}, dedupe=True)
+    second = service.record_event(loaded_manifest, {"agent": "a", "domain": "global", "text": "Draft ready",
+                                                    "project": "alpha", "task_id": "launch-plan"}, dedupe=True)
+
+    assert second["id"] == first["id"] and second["dedupe_status"] == "exact_duplicate"
