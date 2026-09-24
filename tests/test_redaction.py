@@ -287,6 +287,21 @@ def test_a_value_under_any_secret_name_is_redacted_whole(key: str) -> None:
     assert counts == {"assigned_secret": 1}
 
 
+@pytest.mark.parametrize(("encrypted", "prefix"), [(True, ""), (False, "> "), (False, "")],
+                         ids=["pem-headers", "quoted", "plain"])
+def test_a_private_key_cut_before_its_end_line_is_redacted(encrypted: bool, prefix: str) -> None:
+    body = [_random(64) for _ in range(8)]
+    lines = ["-----BEGIN " + "RSA PRIVATE" + " KEY-----"]
+    if encrypted:
+        lines += ["Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC," + _random(32, "0123456789ABCDEF"), ""]
+    text = "The key as pasted:\n" + "\n".join(prefix + line for line in lines + body) + "\n\nThen rotate it.\n"
+
+    result = redact(text).text
+
+    assert not any(line in result for line in body)
+    assert result.startswith("The key as pasted:\n") and result.endswith("\nThen rotate it.\n")
+
+
 @pytest.mark.parametrize(
     "text",
     [

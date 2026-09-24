@@ -5,7 +5,8 @@
 -- file, `document_chunks` its sections. A deleted note keeps its row as a
 -- tombstone (deleted_at_utc) and loses its chunks. `project` is the note's
 -- canonical project, or NULL for a global note. Documents have no task or
--- domain. Chunk text is stored after the secret filter (FR-11).
+-- domain. Chunk text is stored after the secret filter (FR-11). A note indexed
+-- by an older parser or filter (index_version) is indexed again.
 --
 -- document_chunks_fts folds ё into е like events_fts (0011). chunk_vectors are
 -- keyed by embedding model like event_vectors (0012).
@@ -23,7 +24,8 @@ CREATE TABLE IF NOT EXISTS documents (
     modified_at_utc TEXT    NOT NULL,
     indexed_at_utc  TEXT    NOT NULL,
     deleted_at_utc  TEXT,
-    redactions      INTEGER NOT NULL DEFAULT 0
+    redactions      INTEGER NOT NULL DEFAULT 0,
+    index_version   INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_documents_live ON documents(project) WHERE deleted_at_utc IS NULL;

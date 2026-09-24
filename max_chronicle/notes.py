@@ -19,12 +19,12 @@ The manifest turns indexing on:
     sync_minutes = 15                   # the server re-syncs this often
 
 Symbolic links below the fixed part of a path pattern are not followed, and a
-file that is not text, or whose path holds a likely secret, is not read.
+file that is not UTF-8 text, or whose path holds a likely secret, is not read.
 """
 
 from __future__ import annotations
 
-import codecs
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -45,6 +45,8 @@ from .redaction import redact
 from .store import _fts_query, config_from_manifest, open_connection, write_transaction
 
 NOTE_SOURCE = "notes"
+# Bump when parsing or the secret filter changes: every note is indexed again.
+NOTE_INDEX_VERSION = 1
 # Notes that hold keys are skipped by name as well as filtered by content.
 # A note about a key (which file, which host) stays; a pasted key block is redacted by content.
 DEFAULT_DENY = ("*api-key*", "*api_key*", "*apikey*", "*secret*", "*credential*", "*password*", "*keys.md",
@@ -57,13 +59,13 @@ RELAXED_SCAN_PAGES = 4  # a relaxed full-text query reads at most this many cand
 WALK_BUDGET = 20_000  # directory entries read to find the directory of a file-memory folder
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
-_FENCE = re.compile(r"^\s*(```|~~~)")
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _GLOB_CHARS = re.compile(r"[*?\[]")
-# A frontmatter line: `key: value`, `key:`, an indented continuation, a list item or a comment.
-_FRONTMATTER_LINE = re.compile(r"^(?:[A-Za-z0-9_][\w.-]*\s*:(?:\s|$)|\s+\S|-\s|#)")
-# Longer marks first: the UTF-32 LE mark starts with the UTF-16 LE one.
-_BOMS = ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"), (codecs.BOM_UTF8, "utf-8-sig"),
-         (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"))
+# Frontmatter: `key: value` or `key:` lines (any key, quoted or not), plus
+# indented continuations, list items and comments.
+_FRONTMATTER_KEY = re.compile(r"""^(?:"[^"]*"|'[^']*'|[^\s:#"'-][^:]*?)\s*:(?:\s|$)""")
+_FRONTMATTER_OTHER = re.compile(r"^(?:\s+\S|-\s|#)")
+_BLOCK_SCALARS = {">", "|", ">-", "|-", ">+", "|+"}
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,10 @@ class NoteSettings:
 
 def note_settings(manifest: dict[str, Any]) -> NoteSettings:
     """The [notes] section of *manifest*; without it, nothing is indexed."""
-    raw = manifest.get("notes") or {}
+    raw = manifest.get("notes")
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError("[notes] must be a table")
 
     def names(key: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
         value = raw.get(key, default)
@@ -123,6 +128,16 @@ def _through_symlink(path: Path, base: Path) -> bool:
         return True
 
 
+def _matches(pattern: str) -> Iterator[Path]:
+    """Paths matching *pattern*. `**` never descends through a symlink, which could loop."""
+    if "**" not in pattern:
+        return (Path(name) for name in glob.glob(pattern))
+    base = _glob_base(pattern)
+    literal = set(Path(pattern).parts)  # a hidden name the pattern spells out is wanted
+    return (path for path in base.glob(str(Path(pattern).relative_to(base)))
+            if not any(part.startswith(".") and part not in literal for part in path.relative_to(base).parts))
+
+
 def discover(settings: NoteSettings) -> tuple[list[Path], list[Path]]:
     """The note files the settings name, excluded ones left out, and those reached through a symlink.
 
@@ -131,10 +146,9 @@ def discover(settings: NoteSettings) -> tuple[list[Path], list[Path]]:
     """
     plain: dict[Path, bool] = {}
     for pattern in settings.paths:
-        expanded = os.path.normpath(os.path.expanduser(pattern))
+        expanded = os.path.expanduser(pattern)  # not normalised: `link/..` is where the link points, then up
         base = _glob_base(expanded)
-        for name in glob.glob(expanded, recursive=True):
-            path = Path(name)
+        for path in _matches(expanded):
             if not path.is_file() or any(fnmatch(str(path), rule) or fnmatch(path.name, rule)
                                          for rule in settings.exclude):
                 continue
@@ -164,21 +178,36 @@ def _slug_directory(slug: str) -> Path | None:
     """
     budget = WALK_BUDGET
 
-    def walk(directory: Path, rest: str) -> Path | None:
+    def listed(directory: Path) -> list[os.DirEntry]:
         nonlocal budget
-        if not rest:
-            return directory
+        entries: list[os.DirEntry] = []
         try:
             with os.scandir(directory) as listing:
-                entries = sorted(listing, key=lambda entry: entry.name)
+                while budget > 0:
+                    entry = next(listing, None)
+                    if entry is None:
+                        break
+                    budget -= 1
+                    entries.append(entry)
+                else:  # out of budget: stop reading, find nothing
+                    return []
         except OSError:
-            return None
-        for entry in entries:
-            budget -= 1
-            if budget < 0:
-                return None
+            return []
+        # The longer name first: `a-b` is a shallower home than `a/b` for the same folder name.
+        return sorted(entries, key=lambda entry: (-len(entry.name), entry.name))
+
+    def is_dir(entry: os.DirEntry) -> bool:
+        try:
+            return entry.is_dir()
+        except OSError:  # a looping or unreadable link
+            return False
+
+    def walk(directory: Path, rest: str) -> Path | None:
+        if not rest:
+            return directory
+        for entry in listed(directory):
             encoded = "-" + _encode(entry.name)
-            if (rest == encoded or rest.startswith(encoded + "-")) and entry.is_dir():
+            if (rest == encoded or rest.startswith(encoded + "-")) and is_dir(entry):
                 found = walk(Path(entry.path), rest[len(encoded):])
                 if found is not None:
                     return found
@@ -198,9 +227,10 @@ def note_project(
     A note inside a project root belongs to it. A note in the file memory of a
     working directory belongs to the project of that directory: the project
     whose root holds it, else the workspace child it sits in. When the
-    directory is gone, the folder name decides: under a root's name the note
-    stays with the root, and a workspace child keeps its name. *directories*
-    caches folder lookups across the notes of one sync.
+    directory is gone, the folder name decides: a hidden folder under a root's
+    name stays with the root, a workspace child keeps its name, and anything
+    else under a root's name goes to the root. *directories* caches folder
+    lookups across the notes of one sync.
     """
     where = Path(os.path.normpath(path))
     roots = [(Path(os.path.normpath(os.path.expanduser(root))), entry["id"])
@@ -229,23 +259,24 @@ def note_project(
         if workspace is not None and workspace in home.parents:  # named as its file-memory folder names it
             return identities.project(_encode(home.relative_to(workspace).parts[0]))
         return None
-    under = max(((len(root.parts), project) for root, project in roots
-                 if folder.startswith(_directory_slug(root) + "-")), default=None)
-    if under:
-        return identities.project(under[1])
+    by_depth = sorted(roots, key=lambda item: -len(item[0].parts))
+    # `--` starts a hidden directory (`.worktrees`, `.claude`): what precedes it holds it.
+    hidden = next((project for root, project in by_depth if folder.startswith(_directory_slug(root) + "--")), None)
+    if hidden:
+        return identities.project(hidden)
     prefix = _directory_slug(workspace) + "-" if workspace is not None else None
     if prefix and folder.startswith(prefix):
         child = folder[len(prefix):]
-        # `--` starts a hidden directory, so what precedes it is the child.
         return identities.project(child.split("--")[0] if "--" in child else child)
-    return None
+    under = next((project for root, project in by_depth if folder.startswith(_directory_slug(root) + "-")), None)
+    return identities.project(under) if under else None
 
 
 def _frontmatter(text: str) -> tuple[dict[str, str], str]:
     """Top-level ``key: value`` pairs of a leading --- block (nested keys flattened), and the body.
 
-    A block holding anything but keys, continuations, list items or comments
-    is text between two rules, not frontmatter.
+    The block needs a key line, and every other line must be a continuation,
+    a list item or a comment; anything else is text between two rules.
     """
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -255,13 +286,15 @@ def _frontmatter(text: str) -> tuple[dict[str, str], str]:
     except StopIteration:
         return {}, text
     block = [line for line in lines[1:end] if line.strip()]
-    if not block or not all(_FRONTMATTER_LINE.match(line) for line in block):
+    keyed = [bool(_FRONTMATTER_KEY.match(line)) for line in block]
+    if not any(keyed) or not all(key or _FRONTMATTER_OTHER.match(line) for key, line in zip(keyed, block)):
         return {}, text
     fields: dict[str, str] = {}
     for line in lines[1:end]:
         key, sep, value = line.strip().partition(":")
-        if sep and key and value.strip():
-            fields.setdefault(key.strip(), value.strip().strip("\"'"))
+        value = value.strip()
+        if sep and key and value and value not in _BLOCK_SCALARS:  # a folded value is not read
+            fields.setdefault(key.strip().strip("\"'"), value.strip("\"'"))
     return fields, "\n".join(lines[end + 1:])
 
 
@@ -288,23 +321,44 @@ def _split(text: str, limit: int = CHUNK_CHARS) -> list[str]:
     return [piece.strip("\n") for piece in pieces]
 
 
-def chunk_note(title: str, body: str) -> list[tuple[str, str]]:
-    """(heading, text) sections of a note; a heading is ``Title › Section``."""
-    sections: list[tuple[str, list[str]]] = [(title, [])]
-    fenced = False
-    for line in body.splitlines():
-        if _FENCE.match(line):
-            fenced = not fenced
-        match = None if fenced else _HEADING.match(line)
+def _in_code(lines: list[str]) -> list[bool]:
+    """Whether each line belongs to a fenced code block, fences included.
+
+    A fence closes only on its own character, at least as long, with nothing
+    after it, so a ``` example inside a ```` or ~~~ block stays code.
+    """
+    marks, fence = [], None
+    for line in lines:
+        match = _FENCE.match(line)
+        marks.append(fence is not None or match is not None)
+        if fence is None:
+            fence = match.group(1) if match else None
+        elif match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence) \
+                and not line.strip()[len(match.group(1)):]:
+            fence = None
+    return marks
+
+
+def chunk_note(title: str, body: str, clean: Callable[[str], str] = str) -> list[tuple[str, str]]:
+    """(heading, text) sections of a note; a heading is ``Title › Section``.
+
+    *clean* runs on each section and heading before a long section is cut, so
+    a secret pattern never spans two sections and a key is never cut in two.
+    """
+    lines = body.splitlines()
+    sections: list[tuple[str | None, list[str]]] = [(None, [])]
+    for line, code in zip(lines, _in_code(lines)):
+        match = None if code else _HEADING.match(line)
         if match and len(match.group(1)) > 1:
-            sections.append((f"{title} › {match.group(2).strip()}", []))
+            sections.append((match.group(2).strip(), []))
         elif not (match and match.group(2).strip() == title):
             sections[-1][1].append(line)
     chunks = []
-    for heading, lines in sections:
-        text = "\n".join(lines).strip()
+    for heading, section in sections:
+        text = clean("\n".join(section).strip()).strip()
         if text:
-            chunks.extend((heading, piece) for piece in _split(text))
+            name = title if heading is None else f"{title} › {clean(heading)}"
+            chunks.extend((name, piece) for piece in _split(text))
     return chunks
 
 
@@ -323,23 +377,27 @@ class ParsedNote:
 
 
 class NotText(ValueError):
-    """A file matched as a note holds binary data."""
+    """A file matched as a note is not UTF-8 text."""
 
 
 def _decode(data: bytes) -> str | None:
-    """The text of a note file, UTF-8 unless a byte-order mark says otherwise; None if it is not text."""
-    encoding = next((name for mark, name in _BOMS if data.startswith(mark)), "utf-8")
-    text = data.decode(encoding, errors="replace")
+    """The text of a note file: UTF-8, with or without a byte-order mark; None for anything else.
+
+    Another encoding's mark can lie about the bytes after it, and a key read
+    in the wrong encoding passes the filter unseen.
+    """
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
     return None if "\x00" in text else text
 
 
 def _first_title(body: str) -> str | None:
     """The first level-one heading outside code blocks."""
-    fenced = False
-    for line in body.splitlines():
-        if _FENCE.match(line):
-            fenced = not fenced
-        elif not fenced and (match := _HEADING.match(line)) and len(match.group(1)) == 1:
+    lines = body.splitlines()
+    for line, code in zip(lines, _in_code(lines)):
+        if not code and (match := _HEADING.match(line)) and len(match.group(1)) == 1:
             return match.group(2).strip()
     return None
 
@@ -347,9 +405,10 @@ def _first_title(body: str) -> str | None:
 def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
     """A note's fields and chunks, with likely secrets redacted in every stored string (FR-11).
 
-    The whole body is filtered before it is split into sections: filtering each
-    section would leave a key that spans two of them, or is longer than one,
-    partly in clear text.
+    Each section is filtered whole, before a long one is cut: filtering the
+    pieces would leave a key longer than a piece, or across a cut, partly in
+    clear text, and filtering the whole note would let a pattern swallow the
+    sections between two mentions of a key.
     """
     text = _decode(data)
     if text is None:
@@ -365,8 +424,7 @@ def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
         redactions += result.count
         return result.text
 
-    body = clean(body) or ""
-    title = clean(fields.get("name")) or _first_title(body) or clean(path.stem) or path.stem
+    title = clean(fields.get("name")) or clean(_first_title(body)) or clean(path.stem) or path.stem
     return ParsedNote(
         path=path,
         sha256=hashlib.sha256(data).hexdigest(),
@@ -376,7 +434,7 @@ def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
         title=title,
         description=clean(fields.get("description")),
         kind=clean(fields.get("type")),
-        chunks=chunk_note(title, body),
+        chunks=chunk_note(title, body, lambda value: clean(value) or ""),
         redactions=redactions,
     )
 
@@ -385,14 +443,15 @@ def _store(connection: sqlite3.Connection, note: ParsedNote, now: str) -> None:
     identifier = document_id(note.path)
     connection.execute(
         """INSERT INTO documents(id, path, source, project, title, description, kind, content_sha256,
-               size_bytes, modified_at_utc, indexed_at_utc, deleted_at_utc, redactions)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+               size_bytes, modified_at_utc, indexed_at_utc, deleted_at_utc, redactions, index_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
            ON CONFLICT(id) DO UPDATE SET project=excluded.project, title=excluded.title,
                description=excluded.description, kind=excluded.kind, content_sha256=excluded.content_sha256,
                size_bytes=excluded.size_bytes, modified_at_utc=excluded.modified_at_utc,
-               indexed_at_utc=excluded.indexed_at_utc, deleted_at_utc=NULL, redactions=excluded.redactions""",
+               indexed_at_utc=excluded.indexed_at_utc, deleted_at_utc=NULL, redactions=excluded.redactions,
+               index_version=excluded.index_version""",
         (identifier, str(note.path), NOTE_SOURCE, note.project, note.title, note.description, note.kind,
-         note.sha256, note.size, note.modified, now, note.redactions),
+         note.sha256, note.size, note.modified, now, note.redactions, NOTE_INDEX_VERSION),
     )
     connection.execute("DELETE FROM document_chunks WHERE document_id = ?", (identifier,))
     connection.executemany(
@@ -417,9 +476,9 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         return report
     identities = config.identities
     with open_connection(config) as connection:
-        known = {row["path"]: (row["content_sha256"], row["project"], row["deleted_at_utc"])
-                 for row in connection.execute("SELECT path, content_sha256, project, deleted_at_utc FROM documents "
-                                               "WHERE source = ?", (NOTE_SOURCE,))}
+        known = {row["path"]: (row["content_sha256"], row["project"], row["deleted_at_utc"], row["index_version"])
+                 for row in connection.execute("SELECT path, content_sha256, project, deleted_at_utc, index_version "
+                                               "FROM documents WHERE source = ?", (NOTE_SOURCE,))}
     live: set[str] = set()
     changed: list[ParsedNote] = []
     directories: dict[str, Path | None] = {}
@@ -442,7 +501,7 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
             continue
         project = note_project(path, manifest, identities, directories)
         digest = hashlib.sha256(data).hexdigest()
-        if known.get(str(path)) == (digest, project, None):
+        if known.get(str(path)) == (digest, project, None, NOTE_INDEX_VERSION):
             live.add(str(path))
             report["unchanged"] += 1
             continue
@@ -461,7 +520,7 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         for note in changed:
             _store(connection, note, now)
             report["indexed"] += 1
-        for path, (_, _, deleted) in known.items():
+        for path, (_, _, deleted, _) in known.items():
             if path not in live and deleted is None:
                 identifier = document_id(Path(path))
                 connection.execute("DELETE FROM document_chunks WHERE document_id = ?", (identifier,))
@@ -476,9 +535,25 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         if changed or report["removed"]:
             # Deleted rows stay in older full-text segments until they merge.
             connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
+    if changed or report["removed"]:
+        _checkpoint(config)
     if embed:
         report["embedding"] = embed_chunks(manifest, limit=embed_limit)
     return report
+
+
+def _checkpoint(config) -> None:
+    """Move the write-ahead log into the database file and empty it, when no reader holds it; never waits.
+
+    Freed pages are zeroed (secure_delete), but the log keeps the older pages
+    until a checkpoint copies the new ones over them and truncates it.
+    """
+    with open_connection(config) as connection:
+        connection.execute("PRAGMA busy_timeout = 0")
+        try:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.OperationalError:  # busy: the next sync tries again
+            pass
 
 
 def embed_chunks(manifest: dict[str, Any], *, limit: int | None = None) -> dict[str, Any]:
@@ -583,12 +658,16 @@ def recall_notes(
         if not pool:
             return nothing
         terms = query_terms(query)
-        # The scope applies before the cap, or other projects' notes crowd this one's out.
+        # The scope applies before the cap, and in a project scope the project's own
+        # notes come first, or other notes crowd them out of the capped list.
+        own = "(d.project IS NULL), " if scope.project is not None else ""
         scoped = ("SELECT document_chunks_fts.chunk_id FROM document_chunks_fts "
                   "JOIN document_chunks c ON c.id = document_chunks_fts.chunk_id "
                   "JOIN documents d ON d.id = c.document_id AND d.deleted_at_utc IS NULL "
-                  "WHERE document_chunks_fts MATCH ? AND " + where + " ORDER BY bm25(document_chunks_fts)")
-        ranked = [row[0] for row in connection.execute(scoped, (_fts_query(query), *params))] if terms else []
+                  "WHERE document_chunks_fts MATCH ? AND " + where + " ORDER BY " + own + "bm25(document_chunks_fts)")
+        # A sync may commit between the reads: only chunks of the pool read above count.
+        ranked = [chunk_id for chunk_id, in connection.execute(scoped, (_fts_query(query), *params))
+                  if chunk_id in pool] if terms else []
         strict = set(ranked)
         relaxed = bool(terms) and not strict
         fts = ranked[:cap]
@@ -611,8 +690,10 @@ def recall_notes(
             if chunk["vector"] is not None and chunk["dim"] == len(query_vector) and len(chunk["vector"]) == size:
                 vector_available = True
                 similarities[chunk_id] = score(unpack_vector(chunk["vector"]))
-    admitted = sorted((cid for cid, value in similarities.items() if value >= threshold),
-                      key=lambda cid: -similarities[cid])[:cap]
+    admitted = sorted(cid for cid, value in similarities.items() if value >= threshold)
+    admitted.sort(key=lambda cid: pool[cid]["modified_at_utc"], reverse=True)  # equal similarity: newer first
+    admitted.sort(key=lambda cid: (scope.project is not None and pool[cid]["project"] is None, -similarities[cid]))
+    admitted = admitted[:cap]
     vector_ranks = {chunk_id: rank for rank, chunk_id in enumerate(admitted)}
     scores = {chunk_id: sum(1 / (60 + rank) for rank in (fts_ranks.get(chunk_id), vector_ranks.get(chunk_id))
                             if rank is not None)

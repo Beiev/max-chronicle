@@ -224,17 +224,20 @@ sync_minutes = 15                  # the long-running server re-syncs this often
 deleted one, and never writes to a note; the server runs the same sync every
 `sync_minutes`.
 
-- **Secrets.** The secret filter runs on a note's whole text before it is split
-  into sections at its headings, so a key longer than a section is removed
-  whole. Every other stored string is filtered too. Built-in name patterns such
-  as `*secret*`, `*credential*`, `*private-key*`, `id_rsa*` and `*.pem` apply on
-  top of `deny`.
+- **Secrets.** The secret filter runs on each section of a note (text under one
+  heading) as a whole, before a long section is cut into pieces: a key is never
+  cut in two, and a pattern never spans two sections. Every other stored string
+  is filtered too. Built-in name patterns such as `*secret*`, `*credential*`,
+  `*private-key*`, `id_rsa*` and `*.pem` apply on top of `deny`. When the parser
+  or the filter changes, every note is indexed again.
 - **Files not read.** A file reached through a symbolic link below the fixed
   part of a pattern, a file whose path holds a likely secret, and a file that is
-  not text (UTF-8, or UTF-16/32 with a byte-order mark) are reported, not read.
+  not UTF-8 text are reported, not read. `**` never descends through a link,
+  and wildcards skip hidden files and folders.
 - **Removal.** A deleted or newly denied note keeps only its path as a
-  tombstone. The sync compacts the full-text index and deletes with
-  `secure_delete`, so removed text does not linger in the database file.
+  tombstone. The sync compacts the full-text index, deletes with
+  `secure_delete`, and empties the write-ahead log when no reader holds it;
+  until then the log may keep an older copy.
 - **Projects.** A note inside a project root, or in the file memory of a
   directory inside that root, belongs to that project. In the file memory of a
   directory under the workspace, it belongs to that workspace child's project.

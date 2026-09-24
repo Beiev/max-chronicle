@@ -45,6 +45,7 @@ ENTROPY_MAX_TOKEN_LENGTH = 1024
 ASSIGNED_VALUE_MIN_LENGTH = 8
 VALUE_MAX_LENGTH = 4096
 PRIVATE_KEY_MAX_LENGTH = 16384
+PRIVATE_KEY_MAX_LINES = 512  # of a block cut before its END line
 _CHARACTER_CLASSES = ((r"[a-z]", 26), (r"[A-Z]", 26), (r"[0-9]", 10), (r"[\-_+]", 3))
 
 # Most specific first: an Anthropic or OpenRouter key also starts with "sk-".
@@ -77,8 +78,18 @@ _PRIVATE_KEY_BLOCK = re.compile(
     r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----"
     r"(?:(?!-----BEGIN )[\s\S]){0,%d}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----" % PRIVATE_KEY_MAX_LENGTH
 )
+# A block cut short takes its BEGIN line and then only lines a key body holds,
+# each possibly quoted with ">": headers such as Proc-Type or DEK-Info, base64,
+# and blank lines. It stops at the first other line, before its line break, so
+# the text after a truncated key stays.
+_KEY_BODY_LINE = (
+    r"(?:[ \t]{0,8}>){0,8}[ \t]{0,8}"
+    r"(?:[A-Za-z][A-Za-z0-9-]{0,40}:[ \t]{0,8}[A-Za-z0-9+/=,.:\- \t]{0,200}|[A-Za-z0-9+/=]{0,200})"
+    r"[ \t]{0,8}(?=\r?\n|\Z)"
+)
 _PRIVATE_KEY_OPEN = re.compile(
-    r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[A-Za-z0-9+/=\s]{0,%d}" % PRIVATE_KEY_MAX_LENGTH
+    r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[ \t]{0,8}(?:\r?\n" + _KEY_BODY_LINE + r"){0,%d}"
+    % PRIVATE_KEY_MAX_LINES
 )
 _SECRET_WORD = (
     r"(?:api[_\-]?key|access[_\-]?key|secret(?:[_\-]?key)?|token|passw(?:or)?d|pwd|private[_\-]?key|credentials?)"

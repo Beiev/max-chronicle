@@ -4,24 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
+import contextlib
 from dataclasses import replace
 import json
 import logging
 import os
 import secrets
+import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from max_chronicle.browse import render_search_results
 from max_chronicle.embeddings import active_profile, unpack_vector
 from max_chronicle.evals import GoldenCase, run_eval
 from max_chronicle.mcp_server import _start_notes_sync, build_server
 from max_chronicle.notes import (
     CHUNK_CHARS,
+    NOTE_INDEX_VERSION,
     _directory_slug,
+    _slug_directory,
     chunk_note,
+    discover,
+    document_id,
     note_project,
     note_settings,
     read_note,
@@ -33,6 +42,7 @@ from max_chronicle.store import config_from_manifest, open_connection
 
 from max_chronicle import cli, service
 from max_chronicle import mcp_server as mcp_server_module
+from max_chronicle import notes as notes_module
 
 
 @pytest.fixture(autouse=True)
@@ -436,27 +446,49 @@ def test_a_nested_memory_folder_belongs_to_the_enclosing_project(tmp_path) -> No
     assert project(workspace / "voice" / "transcripts") == "voice"
     assert project(workspace / "orbit-legacy") == "orbit-legacy"
     assert project(workspace / "garden planner" / "notes") == "garden-planner"
-    # The directory is gone: under a root the note stays with the root, a workspace child keeps its name.
+    # The directory is gone: a hidden folder under a root stays with the root, a workspace child keeps its name.
     assert project(orbit / ".worktrees" / "removed") == "orbit"
     assert project(workspace / "archived-app") == "archived-app"
     assert project(workspace / "archived-app" / ".cache") == "archived-app"
+    (workspace / "orbit-legacy").rmdir()
+    assert project(workspace / "orbit-legacy") == "orbit-legacy"
 
 
-def test_a_utf16_note_is_decoded_before_filtering_and_binary_files_are_skipped(notes) -> None:
+def test_only_utf8_text_is_read(notes) -> None:
+    """A byte-order mark can lie about the bytes after it, so a note must be UTF-8 (a UTF-8 mark is fine)."""
     manifest, files = notes
     key = _synthetic_key()
-    utf16 = files["global"].with_name("vendor-notes.md")
-    utf16.write_bytes(f"## Vendor\nThe vendor sandbox rotates weekly. OPENAI_API_KEY={key}\n".encode("utf-16"))
-    binary = files["global"].with_name("blob.md")
-    binary.write_bytes(b"## Blob\n\x00\x01zebramarker\x00")
+    line = f"OPENAI_API_KEY={key}\n"
+    utf16 = _note_bytes(files, "vendor-utf16.md", f"## Vendor\nThe vendor sandbox rotates weekly. {line}".encode("utf-16"))
+    mixed = _note_bytes(files, "vendor-mixed.md", codecs.BOM_UTF16_LE + (line + " " * (len(line) % 2)).encode("ascii"))
+    appended = _note_bytes(files, "vendor-appended.md",
+                           "## Vendor\nThe vendor sandbox rotates weekly.\n".encode("utf-16") + line.encode("ascii"))
+    binary = _note_bytes(files, "blob.md", b"## Blob\n\x00\x01zebramarker\x00")
+    latin = _note_bytes(files, "latin.md", "## Caf\xe9\nquokkamarker menu\n".encode("latin-1"))
+    marked = _note_bytes(files, "marked.md", codecs.BOM_UTF8 + "## Marked\nThe marked note reads fine.\n".encode())
 
     report = sync_notes(manifest)
 
-    stored = _stored_text(manifest)
-    assert key not in stored.replace("\\u0000", "") and "zebramarker" not in stored
-    [(heading, text)] = _chunks(manifest, utf16)
-    assert heading == "vendor-notes › Vendor" and text.startswith("The vendor sandbox rotates weekly.")
-    assert {"path": str(binary), "reason": "not_text"} in report["skipped"]
+    raw = _raw_strings(manifest)
+    wide = raw.encode("utf-16-le", errors="ignore")  # a key read as UTF-16 comes back when encoded again
+    assert key not in raw and key.encode() not in wide and key.encode() not in wide[1:]
+    assert "zebramarker" not in raw and "quokkamarker" not in raw
+    skipped = {item["path"] for item in report["skipped"] if item["reason"] == "not_text"}
+    assert skipped == {str(path) for path in (utf16, mixed, appended, binary, latin)}
+    assert _chunks(manifest, marked) == [("marked › Marked", "The marked note reads fine.")]
+
+
+def _raw_strings(manifest: dict) -> str:
+    with open_connection(config_from_manifest(manifest)) as connection:
+        return "\n".join(value for table in ("documents", "document_chunks", "document_chunks_fts")
+                         for row in connection.execute(f"SELECT * FROM {table}") for value in row
+                         if isinstance(value, str))
+
+
+def _note_bytes(files: dict, name: str, data: bytes) -> Path:
+    path = files["global"].with_name(name)
+    path.write_bytes(data)
+    return path
 
 
 @pytest.mark.parametrize("size", [13, 16])
@@ -553,3 +585,279 @@ def test_a_note_denied_later_leaves_nothing_behind(notes) -> None:
     assert b"quokkamarker" not in segments and read_note(manifest, identifier) is None
     raw = b"".join(path.read_bytes() for path in config.db_path.parent.glob(config.db_path.name + "*"))
     assert b"quokkamarker" not in raw and b"zebramarker" not in raw
+
+
+# Second review of #14: every test below failed before its fix, except the guards marked as such.
+
+_OPENSSH_BEGIN = "-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----"
+_OPENSSH_END = "-----END " + "OPENSSH PRIVATE" + " KEY-----"
+
+
+def test_a_key_pattern_never_crosses_a_heading(notes) -> None:
+    manifest, files = notes
+    memory = files["global"].parent
+    cut = _note(memory / "deploy-key-howto.md", "# Deploy key howto\n\n## Format\nThe key file begins with this line:\n"
+                + _OPENSSH_BEGIN + "\n\n## Rotation\nRotate the deploy key every month.\n")
+    mentions = _note(memory / "farm-key-notes.md",
+                     "# Farm key notes\n\n## Header\nA key file starts with the line " + _OPENSSH_BEGIN + " on its own.\n\n"
+                     "## Where it lives\nThe render farm deploy key lives in the password manager entry farm.\n\n"
+                     "## Footer\nIt ends with the line " + _OPENSSH_END + " at the bottom.\n")
+    body = [base64.b64encode(secrets.token_bytes(52)).decode()[:70] for _ in range(6)]
+    whole = _note(memory / "farm-access.md", "# Farm access\n\n## Key\n" + _OPENSSH_BEGIN + "\n" + "\n".join(body)
+                  + "\n" + _OPENSSH_END + "\n\n## After\nUse the bastion host.\n")
+
+    sync_notes(manifest)
+
+    assert [heading for heading, _ in _chunks(manifest, cut)] == ["Deploy key howto › Format", "Deploy key howto › Rotation"]
+    assert "password manager entry farm" in " ".join(text for _, text in _chunks(manifest, mentions))
+    stored = _raw_strings(manifest)
+    assert not any(line in stored for line in body)  # guard: a whole block still goes whole
+    assert [heading for heading, _ in _chunks(manifest, whole)] == ["Farm access › Key", "Farm access › After"]
+
+
+class _PoolThenSync:
+    """A connection that lets a sync commit right after recall reads its pool of chunks."""
+
+    def __init__(self, connection, sync):
+        self._connection, self._sync = connection, sync
+
+    def execute(self, sql, *args):
+        cursor = self._connection.execute(sql, *args)
+        if self._sync and "LEFT JOIN chunk_vectors v" in sql:
+            rows = cursor.fetchall()
+            self._sync.pop()()
+            return rows
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def test_recall_survives_a_sync_between_its_reads(notes, monkeypatch) -> None:
+    manifest, files = notes
+    sync_notes(manifest)
+    real = notes_module.open_connection
+
+    def concurrent_sync():
+        _note(files["global"].with_name("kraken.md"), "## Kraken\nThe kraken release checklist.\n", name="Kraken")
+        monkeypatch.setattr(notes_module, "open_connection", real)
+        sync_notes(manifest)
+
+    hooks = [concurrent_sync]
+
+    @contextlib.contextmanager
+    def racing(config):
+        with real(config) as connection:
+            yield _PoolThenSync(connection, hooks)
+
+    monkeypatch.setattr(notes_module, "open_connection", racing)
+
+    found = query_memory(manifest, query="kraken release checklist")
+
+    assert not hooks and "notes" not in found["channel_errors"]
+    assert query_memory(manifest, query="kraken release checklist")["notes"][0]["title"] == "Kraken"
+
+
+def test_global_notes_do_not_crowd_out_the_project_note(notes) -> None:
+    manifest, files = notes
+    filler = " ".join(f"filler{index}" for index in range(300))
+    project_note = _note(files["inside"].parent / "quasar-plan.md", f"## Plan\nThe quasar survey. {filler}\n")
+    for index in range(101):
+        _note(files["global"].parent / f"quasar-{index:03d}.md", f"## Q{index}\nquasar quasar\n")
+    sync_notes(manifest, embed=False)
+
+    found = query_memory(manifest, query="quasar", project="orbit")["notes"]
+
+    assert found[0]["path"] == str(project_note)
+
+
+def test_an_unreadable_directory_entry_does_not_stop_a_sync(notes, tmp_path) -> None:
+    manifest, files = notes
+    base = tmp_path / "wk"
+    base.mkdir()
+    (base / "loop").symlink_to("loop")  # stat() fails with ELOOP
+    claude_projects = files["global"].parents[2]  # <projects>/<folder>/memory/<note>
+    _note(claude_projects / _directory_slug(base / "loop" / "sub") / "memory" / "plan.md", "## Plan\nquokka plan\n")
+
+    assert _slug_directory(_directory_slug(base / "loop" / "sub")) is None
+    assert sync_notes(manifest, embed=False)["indexed"] == 5
+
+
+def test_recursive_patterns_do_not_follow_directory_symlinks(tmp_path) -> None:
+    folder = tmp_path / "notes"
+    _note(folder / "a.md", "## A\nx\n")
+    _note(folder / ".trash" / "old.md", "## Old\nx\n")
+    (folder / "loop").symlink_to(".", target_is_directory=True)
+
+    plain, linked = discover(note_settings({"notes": {"paths": [str(folder / "**" / "*.md")]}}))
+
+    assert (plain, linked) == ([folder / "a.md"], [])
+
+
+FRONTMATTERS = {
+    "spaces_in_key": "---\nname: Deploy checklist\ndate created: 2026-09-01\ntype: reference\n---\n",
+    "quoted_key": "---\n\"name\": Deploy checklist\ntype: reference\n---\n",
+    "cyrillic_key": "---\nname: Deploy checklist\nавтор: Орбита\ntype: reference\n---\n",
+    "slash_in_key": "---\nname: Deploy checklist\nog/image: cover.png\ntype: reference\n---\n",
+    "nested_and_folded": ("---\nname: Deploy checklist\ntype: reference\ndescription: >\n  A folded\n  description\n"
+                          "metadata:\n  owner: orbit\n  tags:\n    - a\n    - b\n---\n"),
+}
+
+
+def test_frontmatter_takes_any_key_and_needs_one(notes) -> None:
+    manifest, files = notes
+    memory = files["global"].parent
+    paths = {tag: _note(memory / f"fm-{tag.replace('_', '-')}.md", head + "## Steps\nRun the checklist twice.\n")
+             for tag, head in FRONTMATTERS.items()}
+    procedure = _note(memory / "procedure.md",
+                      "---\n# Deploy procedure\n- Stop the worker first\n- Run the migration after\n---\n\n## Notes\nMore.\n")
+
+    sync_notes(manifest, embed=False)
+
+    documents = _documents(manifest)
+    assert {tag: (documents[str(path)]["title"], documents[str(path)]["kind"]) for tag, path in paths.items()} == {
+        tag: ("Deploy checklist", "reference") for tag in FRONTMATTERS}
+    assert "Stop the worker first" in " ".join(text for _, text in _chunks(manifest, procedure))
+
+
+def test_code_fences_close_only_on_their_own_marker(notes) -> None:
+    manifest, files = notes
+    memory = files["global"].parent
+    nested = _note(memory / "snippets.md", "````markdown\n```sh\nmake setup\n```\n# Fake title inside a snippet\n````\n\n"
+                   "# Actual title\n\n## Use\nRun it.\n")
+    mixed = _note(memory / "manual.md", "~~~\n```\n# Fake title inside a tilde fence\n~~~\n\n# Actual manual\n\nSteps.\n")
+
+    sync_notes(manifest, embed=False)
+
+    documents = _documents(manifest)
+    assert documents[str(nested)]["title"] == "Actual title" and documents[str(mixed)]["title"] == "Actual manual"
+    assert [heading for heading, _ in _chunks(manifest, nested)] == ["Actual title", "Actual title › Use"]
+
+
+def test_equal_similarity_ranks_the_newer_note_first(notes, monkeypatch) -> None:
+    manifest, files = notes
+    memory = files["global"].parent
+    older = _note(memory / "a-old.md", "## Walrus\nsame walrus harbor text\n", name="Old walrus")
+    newer = _note(memory / "b-new.md", "## Walrus\nsame walrus harbor text\n", name="New walrus")
+    os.utime(older, (1_600_000_000, 1_600_000_000))
+    os.utime(newer, (1_700_000_000, 1_700_000_000))
+    monkeypatch.setattr("max_chronicle.embeddings.embed_documents",
+                        lambda texts, **_: [[1.0, 0.0, 0.0] if "walrus" in t else [0.0, 1.0, 0.0] for t in texts])
+    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query: [1.0, 0.0, 0.0])
+    sync_notes(manifest)
+
+    hits = [hit for hit in query_memory(manifest, query="pinniped")["notes"] if "walrus" in hit["title"].lower()]
+
+    assert [hit["path"] for hit in hits] == [str(newer), str(older)]  # the tie breaks in the channel's own ranks
+
+
+@pytest.mark.parametrize("line", ['notes = "on"', 'notes = ["~/notes/*.md"]'])
+def test_a_notes_value_that_is_not_a_table_stops_the_server_cleanly(chronicle_sandbox, monkeypatch, caplog, line) -> None:
+    text = chronicle_sandbox.manifest_path.read_text(encoding="utf-8")
+    chronicle_sandbox.manifest_path.write_text(line + "\n" + text, encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path),
+                                      "--transport", "streamable-http"])
+
+    with caplog.at_level(logging.ERROR, logger="max_chronicle.mcp"):
+        assert mcp_server_module._main() == 1
+
+    assert "cannot start" in caplog.text and "[notes] must be a table" in caplog.text
+
+
+@pytest.mark.parametrize("argv", [["--transport", "stdio"], ["--profile", "readonly", "--transport", "streamable-http"]])
+def test_a_server_that_never_syncs_ignores_a_bad_notes_section(chronicle_sandbox, loaded_manifest, monkeypatch,
+                                                              argv) -> None:
+    with open_connection(config_from_manifest(loaded_manifest)):
+        pass  # a read-only server needs a database to exist
+    with chronicle_sandbox.manifest_path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[notes]\npaths = ["/nonexistent/*.md"]\nsync_minutes = 0\n')
+    monkeypatch.setattr(mcp_server_module, "build_server",
+                        lambda *args, **kwargs: SimpleNamespace(run=lambda transport: None, settings=SimpleNamespace()))
+    monkeypatch.setattr(sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path), *argv])
+
+    assert mcp_server_module._main() == 0
+
+
+def test_notes_are_indexed_again_when_the_index_changes(notes, monkeypatch) -> None:
+    manifest, _ = notes
+    sync_notes(manifest)
+    assert sync_notes(manifest)["unchanged"] == 4
+
+    monkeypatch.setattr(notes_module, "NOTE_INDEX_VERSION", NOTE_INDEX_VERSION + 1)
+
+    assert (sync_notes(manifest)["indexed"], sync_notes(manifest)["unchanged"]) == (4, 4)
+
+
+@pytest.mark.parametrize("command", [["notes", "status"], ["notes", "sync", "--no-embed"], ["recent"]])
+def test_the_db_flag_works_without_a_paths_table(tmp_path, monkeypatch, capsys, command) -> None:
+    manifest = tmp_path / "manifest.toml"
+    manifest.write_text(f'version = 1\n[notes]\npaths = ["{tmp_path}/notes/*.md"]\n', encoding="utf-8")
+    monkeypatch.setenv("CHRONICLE_ROOT", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(manifest), "--db", str(tmp_path / "x.db"), *command])
+
+    assert cli.main() == 0
+    capsys.readouterr()
+
+
+def test_the_folder_walk_prefers_the_shallower_directory_and_stays_in_budget(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "Projects"
+    (workspace / "a" / "b").mkdir(parents=True)
+    (workspace / "a-b").mkdir()
+    assert _slug_directory(_directory_slug(workspace / "a-b")) == workspace / "a-b"
+
+    wide = tmp_path / "wide"
+    wide.mkdir()
+    for index in range(200):
+        (wide / f"f{index:03d}").touch()
+    read = []
+    real = os.scandir
+
+    @contextlib.contextmanager
+    def counting(path):
+        with real(path) as listing:
+            yield (read.append(entry.name) or entry for entry in listing)
+
+    monkeypatch.setattr(notes_module, "WALK_BUDGET", 50)
+    monkeypatch.setattr(notes_module.os, "scandir", counting)
+
+    assert _slug_directory(_directory_slug(wide / "missing" / "sub")) is None and len(read) <= 50
+
+
+def test_browse_search_shows_notes(notes, capsys) -> None:
+    manifest, _ = notes
+    sync_notes(manifest)
+    payload = query_memory(manifest, query="orbit launches tuesdays")
+    capsys.readouterr()
+
+    render_search_results(payload)
+
+    assert "Orbit launch" in capsys.readouterr().out
+
+
+def test_removed_text_leaves_the_write_ahead_log_too(notes) -> None:
+    manifest, files = notes
+    sync_notes(manifest, embed=False)
+    db = config_from_manifest(manifest).db_path
+    idle = sqlite3.connect(db)  # another process's idle connection keeps the log file alive
+    try:
+        idle.execute("SELECT 1").fetchone()
+        note = _note(files["global"].with_name("zanzibar.md"), "## Z\nThe zanzibarquokka plan.\n", name="Zanzibar")
+        sync_notes(manifest, embed=False)
+        sync_notes({**manifest, "notes": {**manifest["notes"], "deny": ["zanzibar*"]}}, embed=False)
+
+        assert read_note(manifest, document_id(note)) is None
+        for path in (db, Path(f"{db}-wal")):
+            assert not path.exists() or b"zanzibarquokka" not in path.read_bytes()
+    finally:
+        idle.close()
+
+
+def test_a_parent_step_after_a_symlink_follows_the_filesystem(tmp_path) -> None:
+    (tmp_path / "x" / "y").mkdir(parents=True)
+    _note(tmp_path / "x" / "notes" / "physical.md", "# p\n")
+    _note(tmp_path / "notes" / "lexical.md", "# l\n")
+    (tmp_path / "link").symlink_to(tmp_path / "x" / "y", target_is_directory=True)
+
+    plain, linked = discover(note_settings({"notes": {"paths": [str(tmp_path / "link" / ".." / "notes" / "*.md")]}}))
+
+    assert [path.name for path in plain] == ["physical.md"] and linked == []

@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 import sqlite3
 import sys
-from typing import Iterator
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from .bootstrap import bootstrap_legacy
@@ -109,6 +109,13 @@ def _doctor_status(*statuses: str | None) -> str:
     if normalized & {"warn", "warning", "issues", "failed_soft", "skipped"}:
         return "issues"
     return "ok"
+
+
+def _with_db(manifest: dict[str, Any], db: Path | None) -> dict[str, Any]:
+    """*manifest* with --db, when given, as its database; a manifest may lack a [paths] table."""
+    if db is None:
+        return manifest
+    return {**manifest, "paths": {**manifest.get("paths", {}), "chronicle_db": str(db)}}
 
 
 def _config_from_args(args: argparse.Namespace) -> ChronicleConfig:
@@ -251,10 +258,7 @@ def cmd_timeline(args: argparse.Namespace) -> int:
 
 def cmd_record(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    if args.db is not None:
-        manifest = dict(manifest)
-        manifest["paths"] = dict(manifest["paths"])
-        manifest["paths"]["chronicle_db"] = str(args.db)
+    manifest = _with_db(manifest, args.db)
     entry = {
         "id": args.id,
         "recorded_at": args.recorded_at,
@@ -307,10 +311,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 def cmd_recent(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    if args.db is not None:
-        manifest = dict(manifest)
-        manifest["paths"] = dict(manifest["paths"])
-        manifest["paths"]["chronicle_db"] = str(args.db)
+    manifest = _with_db(manifest, args.db)
     config = config_from_manifest(manifest)
     events = fetch_recent_events(config, limit=args.limit, domain=args.domain, visibility="raw")
     if args.format == "json":
@@ -723,10 +724,7 @@ def cmd_embed_backfill(args: argparse.Namespace) -> int:
 
 def cmd_notes(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    if args.db is not None:
-        manifest = dict(manifest)
-        manifest["paths"] = dict(manifest["paths"])
-        manifest["paths"]["chronicle_db"] = str(args.db)
+    manifest = _with_db(manifest, args.db)
     if args.notes_command == "sync":
         return _print_json(sync_notes(manifest, embed=not args.no_embed, embed_limit=args.embed_limit))
     if args.notes_command == "status":
@@ -801,10 +799,7 @@ def _threshold(value: str) -> tuple[str, float]:
 
 def cmd_eval(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    if args.db is not None:
-        manifest = dict(manifest)
-        manifest["paths"] = dict(manifest["paths"])
-        manifest["paths"]["chronicle_db"] = str(args.db)
+    manifest = _with_db(manifest, args.db)
     try:
         cases = load_golden(args.golden)
     except (OSError, ValueError) as exc:

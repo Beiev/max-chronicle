@@ -186,13 +186,15 @@ Long-term writes should target Chronicle directly, not JSONL first.
 
 `documents` holds one row per indexed note file, keyed by a hash of its path:
 source, canonical project (NULL for a global note), title, description, kind,
-content sha256, size, file mtime, and `deleted_at_utc` for a tombstone. A deleted
-or newly denied note keeps only its path and file stem, and loses its chunks;
-the sync compacts `document_chunks_fts` and deletes with `secure_delete`, so the
-removed text does not linger in freed pages. Documents have no task or domain.
+content sha256, size, file mtime, `deleted_at_utc` for a tombstone, and the
+`index_version` of the parser and secret filter that indexed it (an older one is
+indexed again). A deleted or newly denied note keeps only its path and file
+stem, and loses its chunks; the sync compacts `document_chunks_fts`, deletes
+with `secure_delete` and truncates the write-ahead log when no reader holds it.
+Documents have no task or domain.
 
 `document_chunks` are a note's sections (`Title › Section`), at most 1,500
-characters each, cut from the note's text after the secret filter ran on all of it. `document_chunks_fts` indexes
+characters each, cut from a section after the secret filter ran on all of it. `document_chunks_fts` indexes
 heading and text with ё folded into е, like `events_fts`. `chunk_vectors` are
 keyed by (chunk, embedding model key), like `event_vectors`, and cascade with
 their chunk.
