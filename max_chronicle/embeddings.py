@@ -11,6 +11,7 @@ backfilled while the old index still serves.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import math
@@ -102,21 +103,43 @@ def unpack_vector(blob: bytes) -> list[float]:
     return list(struct.unpack(f"{n}f", blob))
 
 
+_sumprod = getattr(math, "sumprod", None)  # C speed on Python 3.12+
+
+
+def _dot(a: list[float], b: list[float]) -> float:
+    return _sumprod(a, b) if _sumprod is not None else sum(x * y for x, y in zip(a, b))
+
+
+def similarity_scorer(query: list[float]) -> Callable[[list[float]], float]:
+    """Cosine similarity to *query* for many vectors, the query's norm computed once.
+
+    A vector of another dimension or with a non-finite value raises ValueError;
+    a zero vector scores 0.0.
+    """
+    query_norm = math.sqrt(_dot(query, query))
+    if not math.isfinite(query_norm):
+        raise ValueError("Embedding contains non-finite values")
+
+    def score(vector: list[float]) -> float:
+        if len(vector) != len(query):
+            raise ValueError("Embedding dimensions do not match")
+        dot = _dot(query, vector)
+        norm = math.sqrt(_dot(vector, vector))
+        if not (math.isfinite(dot) and math.isfinite(norm)):
+            raise ValueError("Embedding contains non-finite values")
+        if norm == 0.0 or query_norm == 0.0:
+            return 0.0
+        return dot / (query_norm * norm)
+
+    return score
+
+
 def cosine(a: list[float], b: list[float]) -> float:
     """Return the cosine similarity between two equal-length vectors.
 
     Returns 0.0 when either vector is zero-length (degenerate embedding).
     """
-    if len(a) != len(b):
-        raise ValueError("Embedding dimensions do not match")
-    if not all(math.isfinite(x) for x in (*a, *b)):
-        raise ValueError("Embedding contains non-finite values")
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(y * y for y in b))
-    if mag_a == 0.0 or mag_b == 0.0:
-        return 0.0
-    return dot / (mag_a * mag_b)
+    return similarity_scorer(a)(b)
 
 
 # ---------------------------------------------------------------------------
@@ -133,16 +156,11 @@ def event_embedding_text(event: dict[str, Any]) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
-def embed_text(text: str, *, timeout: float = DOCUMENT_TIMEOUT_S) -> list[float] | None:
-    """Embed *text* as given with the active profile's model.
-
-    Uses Ollama's /api/embed with truncation, so a text longer than the model's
-    context is embedded from its start instead of failing. The dimension is the
-    model's own. Returns None on ANY failure (connection error, timeout, bad
-    response). NEVER raises.
-    """
+def _request_embeddings(inputs: str | list[str], *, timeout: float) -> list[list[float]] | None:
+    """One Ollama /api/embed call for a text or a list; None unless every vector is usable. NEVER raises."""
+    expected = 1 if isinstance(inputs, str) else len(inputs)
     try:
-        payload = {"model": active_profile().model, "input": text, "truncate": True}
+        payload = {"model": active_profile().model, "input": inputs, "truncate": True}
         req = urllib.request.Request(
             f"{_ollama_base_url()}/api/embed",
             data=json.dumps(payload).encode("utf-8"),
@@ -152,14 +170,38 @@ def embed_text(text: str, *, timeout: float = DOCUMENT_TIMEOUT_S) -> list[float]
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read()
         embeddings = json.loads(body).get("embeddings")
-        if not isinstance(embeddings, list) or not embeddings or not isinstance(embeddings[0], list):
+        if not isinstance(embeddings, list) or len(embeddings) != expected:
             return None
-        vector = [float(x) for x in embeddings[0]]
-        if not vector or not all(math.isfinite(x) for x in vector) or not any(vector):
-            return None
-        return vector
+        vectors = []
+        for item in embeddings:
+            if not isinstance(item, list):
+                return None
+            vector = [float(x) for x in item]
+            if not vector or not all(math.isfinite(x) for x in vector) or not any(vector):
+                return None
+            vectors.append(vector)
+        return vectors
     except Exception:  # noqa: BLE001 — intentional blanket catch
         return None
+
+
+def embed_text(text: str, *, timeout: float = DOCUMENT_TIMEOUT_S) -> list[float] | None:
+    """Embed *text* as given with the active profile's model.
+
+    Uses Ollama's /api/embed with truncation, so a text longer than the model's
+    context is embedded from its start instead of failing. The dimension is the
+    model's own. Returns None on ANY failure (connection error, timeout, bad
+    response). NEVER raises.
+    """
+    vectors = _request_embeddings(text, timeout=timeout)
+    return vectors[0] if vectors else None
+
+
+def embed_documents(texts: list[str], *, timeout: float = BACKFILL_TIMEOUT_S) -> list[list[float]] | None:
+    """Embed stored texts (note chunks) in one call; None on any failure. NEVER raises."""
+    if not texts:
+        return []
+    return _request_embeddings([active_profile().document_prefix + text for text in texts], timeout=timeout)
 
 
 def embed_query(query: str) -> list[float] | None:

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .bootstrap import bootstrap_legacy
 from .brief import BRIEF_DEFAULT_CHARS, build_brief
+from .notes import notes_status, read_note, sync_notes
 from .browse import render_browse_help, render_daybook, render_entity_timeline, render_recent_events, render_search_results
 from .config import (
     ENV_CHRONICLE_AUTO_MIGRATE,
@@ -720,6 +721,19 @@ def cmd_embed_backfill(args: argparse.Namespace) -> int:
     return _print_json(payload)
 
 
+def cmd_notes(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    if args.notes_command == "sync":
+        return _print_json(sync_notes(manifest, embed=not args.no_embed, embed_limit=args.embed_limit))
+    if args.notes_command == "status":
+        return _print_json(notes_status(manifest))
+    note = read_note(manifest, args.document_id)
+    if note is None:
+        print(json.dumps({"status": "not_found", "document_id": args.document_id}), file=sys.stderr)
+        return 1
+    return _print_json(note)
+
+
 def cmd_query_memory(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     payload = query_memory(
@@ -741,9 +755,14 @@ def cmd_query_memory(args: argparse.Namespace) -> int:
     print(f"Channels: {channels or 'none'}{degraded}")
     print()
     results = payload.get("results") or []
-    if not results:
+    notes = payload.get("notes") or []
+    if not results and not notes:
         print("No results.")
         return 0
+    for note in notes:
+        print(f"- note | {note.get('project') or 'global'} | {note['heading']} | rrf={note['rrf_score']}")
+        print(f"  {note['text']}")
+        print(f"  [{note['path']}, id {note['document_id']}]")
     for hit in results:
         project = hit.get("project") or "n/a"
         category = hit.get("category") or "n/a"
@@ -1140,6 +1159,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum events to embed in this run (default: all missing)",
     )
     p_embed_backfill.set_defaults(handler=cmd_embed_backfill)
+
+    p_notes = sub.add_parser("notes", help="Index notes written on purpose (FR-10): sync, status, show")
+    notes_sub = p_notes.add_subparsers(dest="notes_command", required=True)
+    p_notes_sync = notes_sub.add_parser("sync", help="Re-index changed notes and tombstone deleted ones")
+    p_notes_sync.add_argument("--no-embed", action="store_true", help="Skip embedding new sections")
+    p_notes_sync.add_argument("--embed-limit", type=int, default=None, help="Maximum sections to embed")
+    notes_sub.add_parser("status", help="How many notes, sections and vectors the index holds")
+    p_notes_show = notes_sub.add_parser("show", help="A note's indexed (redacted) text")
+    p_notes_show.add_argument("document_id")
+    p_notes.set_defaults(handler=cmd_notes)
 
     p_query_memory = sub.add_parser(
         "query-memory",

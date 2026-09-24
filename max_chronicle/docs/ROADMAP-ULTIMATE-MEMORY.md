@@ -265,7 +265,7 @@ interface Receipt {
 | FR-1 to FR-8, NFR-1 to NFR-3 | Implemented in 0.10.0. Recency only breaks ties since 0.12.0 (FR-1 v1.1). |
 | FR-2 v1.1 | Unicode tokens, ё folding, flagged relaxed match: 0.11.0. `no_confident_match`: 0.12.0 |
 | FR-9, FR-13 | 0.11.0 |
-| FR-11 | Events, evidence files, generated text artifacts: 0.11.0. Snapshots, imports, Mem0 responses, notes: planned |
-| FR-10 | Planned: note index |
+| FR-11 | Events, evidence files, generated text artifacts: 0.11.0. Notes: 0.14.0. Snapshots, imports, Mem0 responses: planned |
+| FR-10 | 0.14.0: note index (`[notes]` in the manifest, `chronicle notes sync`, `notes` in `query_memory`, `chronicle://note/{id}`) |
 | FR-12, NFR-4 | Brief (`GET /brief`, `chronicle brief`, `startup_bundle(mode="brief")`, `chronicle://brief/{project}`): 0.12.0; p95 12 ms on a live-size database. Session hooks are operator configuration. |
 | FR-14 | 0.13.0: registry in the manifest (`[[projects]]`, `[[domains]]`, `[[agents]]` with aliases); one scope function for events, observations, facts, open tasks, the brief and cursors |

@@ -16,15 +16,16 @@ The core storage model:
 
 Current operational database version:
 
-- `PRAGMA user_version = 12`
-- latest applied migration: `0012_event_vectors.sql`
-- next migration number: `0013`
+- `PRAGMA user_version = 13`
+- latest applied migration: `0013_documents.sql`
+- next migration number: `0014`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
 Migration `0009` adds `event_embeddings` (float32 BLOB vectors) backing the hybrid `query_memory` recall.
 Migration `0011` rebuilds `events_fts` (event text and why only; no longer the project and domain slugs in `title` and `circumstances`) and `facts_fts` (now contentful) with ё folded into е, because FTS5's unicode61 tokenizer keeps the two apart.
 Migration `0012` replaces `event_embeddings` with `event_vectors`, keyed by (event, embedding model key), so the index of a new model is backfilled beside the old one; existing vectors keep their model name as key.
+Migration `0013` adds the note index (FR-10): `documents`, `document_chunks`, `document_chunks_fts` and `chunk_vectors`.
 
 ## Core Tables
 
@@ -180,6 +181,22 @@ Current import sources:
 This is bootstrap only.
 
 Long-term writes should target Chronicle directly, not JSONL first.
+
+## Note index (migration 0013)
+
+`documents` holds one row per indexed note file, keyed by a hash of its path:
+source, canonical project (NULL for a global note), title, description, kind,
+content sha256, size, file mtime, and `deleted_at_utc` for a tombstone. A deleted
+note keeps its row and loses its chunks. Documents have no task or domain.
+
+`document_chunks` are a note's sections (`Title › Section`), at most 1,500
+characters each, stored after the secret filter. `document_chunks_fts` indexes
+heading and text with ё folded into е, like `events_fts`. `chunk_vectors` are
+keyed by (chunk, embedding model key), like `event_vectors`, and cascade with
+their chunk.
+
+The files stay the source: `chronicle notes sync` re-indexes changed notes,
+tombstones deleted ones, and never writes to a note.
 
 ## Shared agent memory (migration 0010)
 

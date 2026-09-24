@@ -206,6 +206,32 @@ built in; an `[[agents]]` entry with the same id replaces a built-in one. A
 session that never names its agent is attributed to its MCP client, such as
 `claude-code`.
 
+### Notes written on purpose
+
+Agents often keep durable notes as files, such as Claude's file memory. With a
+`[notes]` section in the manifest, Chronicle indexes them so every agent can
+recall them (FR-10):
+
+```toml
+[notes]
+paths = ["~/.claude/projects/*/memory/*.md"]
+exclude = ["*.bak-*", "*/_archive/*"]
+deny = ["*api-key*", "*keys.md"]  # never read, whatever they hold
+sync_minutes = 15                  # the long-running server re-syncs this often
+```
+
+`chronicle notes sync` re-indexes the changed notes, keeps a tombstone for a
+deleted one, and never writes to a note; the server runs the same sync every
+`sync_minutes`. Each note is split into sections at its headings, and the
+secret filter runs on every stored string. A note inside a project root, or in
+the file memory of a project's directory, belongs to that project; any other
+note is global.
+
+`query_memory` returns notes in `notes`, next to events in `results`: the best
+section of each note, with its heading, path and id. In a project scope, the
+project's own notes come before global ones. `chronicle://note/{document_id}`
+serves a whole note; `chronicle notes status` counts what the index holds.
+
 | Tool | Purpose |
 | --- | --- |
 | `startup_bundle` | Task context, checkpoint, current facts, change cursor; unlock writes. `mode="brief"`: only the brief. |
