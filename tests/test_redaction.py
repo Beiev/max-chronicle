@@ -913,4 +913,19 @@ def test_a_deep_value_is_walked_without_exhausting_the_stack() -> None:
 
     value, counts = redact_value(deep)
 
-    assert key not in json.dumps(value) and counts
+    for _ in range(5000):  # json.dumps and repr would recurse as deep
+        value = value[0]
+    assert key not in value["note"] and "[REDACTED:" in value["note"] and counts
+
+
+def test_json_too_deep_to_parse_goes_whole_when_it_names_a_secret(monkeypatch) -> None:
+    import max_chronicle.redaction as redaction_module
+
+    def too_deep(text):
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    monkeypatch.setattr(redaction_module.json, "loads", too_deep)  # as Python 3.11 does past ~1,000 levels
+    named, counts = redact_value('[[{"password": ["Correct-Horse-9"]}]]')
+    plain, _ = redact_value("[[0]]")
+
+    assert (named, counts["assigned_secret"]) == ("[REDACTED:assigned_secret]", 1) and plain == "[[0]]"

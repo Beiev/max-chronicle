@@ -511,6 +511,13 @@ def _redact_text(value: str, secret: bool, counts: Counter[str]) -> str:
     result = redact(value)
     counts.update(result.counts)
     decoded = _json_container(result.text)
+    if decoded is _TOO_DEEP:
+        # JSON nested deeper than the json module parses (about 1,000 levels
+        # before Python 3.12): what a secret name marks inside cannot be told.
+        if _SECRET_WORD_ANYWHERE.search(result.text):
+            counts["assigned_secret"] += 1
+            return MARKER.format(kind="assigned_secret")
+        return result.text
     if decoded is None:
         return result.text
     # Recursion here follows levels of encoding only, and each one adds escapes.
@@ -525,13 +532,19 @@ def _redact_text(value: str, secret: bool, counts: Counter[str]) -> str:
         return MARKER.format(kind="assigned_secret")
 
 
-def _json_container(text: str) -> dict[str, Any] | list[Any] | None:
-    """The object or array that *text* holds as JSON, or None."""
+_TOO_DEEP = object()
+_SECRET_WORD_ANYWHERE = re.compile(r"(?i)" + _SECRET_WORD)
+
+
+def _json_container(text: str) -> Any:
+    """The object or array that *text* holds as JSON, None, or _TOO_DEEP when it nests too deep to parse."""
     stripped = text.strip()
     if stripped[:1] not in ("{", "[") or len(stripped) > JSON_TEXT_MAX_LENGTH:
         return None
     try:
         decoded = json.loads(stripped)
-    except (ValueError, RecursionError):
+    except RecursionError:
+        return _TOO_DEEP
+    except ValueError:
         return None
     return decoded if isinstance(decoded, (dict, list)) else None

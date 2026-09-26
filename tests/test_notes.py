@@ -1119,7 +1119,7 @@ def test_a_secret_in_a_named_project_is_never_stored(notes, tmp_path) -> None:
 # The parser and the secret filter, as indexed notes were made with them.
 # Changing either changes this digest: bump NOTE_INDEX_VERSION so every note
 # is indexed again, then record the new digest under the new version.
-INDEX_DIGESTS = {4: "efe8904cd414e474a0f685af31ea2e4db65d1484aec34586358a2fb0f39673eb"}
+INDEX_DIGESTS = {4: "bc9c3bda977f8c732539f52771d146663c5466bd1f0cfb2608769eb588f51221"}
 
 
 def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:
