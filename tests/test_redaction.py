@@ -894,3 +894,23 @@ def test_a_deep_branch_does_not_hide_a_shallow_secret(depth) -> None:
     value, counts = redact_value(text)
 
     assert "Correct-Horse-9" not in value and "Battery-Staple-7" not in value and counts["assigned_secret"] == 2
+
+
+@pytest.mark.parametrize("depth", [31, 1100])
+def test_json_encoded_twice_is_filtered_at_any_depth(depth) -> None:
+    text = "[" * depth + json.dumps(json.dumps({"password": ["Correct-Horse-9"]})) + "]" * depth
+
+    value, counts = redact_value(text)
+
+    assert "Correct-Horse-9" not in value and counts["assigned_secret"] == 1
+
+
+def test_a_deep_value_is_walked_without_exhausting_the_stack() -> None:
+    key = "sk-" + "proj-" + "Zq8" * 12
+    deep: object = {"note": f"the key {key}"}
+    for _ in range(5000):
+        deep = [deep]
+
+    value, counts = redact_value(deep)
+
+    assert key not in json.dumps(value) and counts

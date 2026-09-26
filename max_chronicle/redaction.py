@@ -471,62 +471,58 @@ def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset(),
     object or array is decoded and filtered as a value too, however many times it
     was encoded, and written back as JSON when anything in it was redacted.
     """
-    return _redact_value(value, skip_keys, secret, None)
+    counts: Counter[str] = Counter()
+    return _redact_tree(value, skip_keys, secret, counts), counts
 
 
 JSON_TEXT_MAX_LENGTH = 1 << 20
-JSON_TEXT_MAX_DEPTH = 32
 
 
-def _redact_value(value: Any, skip_keys: frozenset[str], secret: bool,
-                  levels: int | None) -> tuple[Any, Counter[str]]:
-    """redact_value; *levels* is how deep JSON decoded from a string may still be walked, None outside one.
+def _redact_tree(root: Any, skip_keys: frozenset[str], secret: bool, counts: Counter[str]) -> Any:
+    """*root* with its strings redacted, walked with a stack of its own, so no depth exhausts Python's."""
+    holder: list[Any] = [None]
+    pending: list[tuple[Any, bool, Any, Any]] = [(root, secret, holder, 0)]  # value, secret, parent, key
+    while pending:
+        value, under_secret, parent, key = pending.pop()
+        if isinstance(value, str):
+            parent[key] = _redact_text(value, under_secret, counts)
+        elif isinstance(value, list):
+            items: list[Any] = [None] * len(value)
+            parent[key] = items
+            pending.extend((item, under_secret, items, index) for index, item in enumerate(value))
+        elif isinstance(value, dict):
+            mapping: dict[Any, Any] = {}
+            parent[key] = mapping
+            for name, item in value.items():
+                mapping[name] = item  # keeps the order; replaced below unless skipped
+                if name not in skip_keys:
+                    named = isinstance(name, str) and _SECRET_NAME.search(name) is not None
+                    pending.append((item, named and not isinstance(item, dict), mapping, name))
+        else:
+            parent[key] = value
+    return holder[0]
 
-    JSON below that depth, across every level of encoding, keeps what the text
-    filter left: walking it could exhaust the stack.
-    """
-    counts: Counter[str] = Counter()
-    if isinstance(value, str):
-        if secret and _plausible_assigned_value(value):
-            counts["assigned_secret"] += 1
-            return MARKER.format(kind="assigned_secret"), counts
-        result = redact(value)
-        counts.update(result.counts)
-        text = result.text
-        budget = JSON_TEXT_MAX_DEPTH if levels is None else levels
-        decoded = _json_container(text) if budget else None
-        if decoded is not None:
-            redacted, found = _redact_value(decoded, frozenset(), False, budget)
-            if found:
-                try:
-                    text = json.dumps(redacted, ensure_ascii=False)
-                except (ValueError, RecursionError):
-                    text = MARKER.format(kind="assigned_secret")
-                counts.update(found)
-        return text, counts
-    if isinstance(value, (list, dict)) and levels is not None:
-        if levels == 0:
-            return value, counts
-        levels -= 1
-    if isinstance(value, list):
-        items = []
-        for item in value:
-            redacted, found = _redact_value(item, skip_keys, secret, levels)
-            items.append(redacted)
-            counts.update(found)
-        return items, counts
-    if isinstance(value, dict):
-        mapping = {}
-        for key, item in value.items():
-            if key in skip_keys:
-                mapping[key] = item
-                continue
-            named = isinstance(key, str) and _SECRET_NAME.search(key) is not None
-            redacted, found = _redact_value(item, skip_keys, named and not isinstance(item, dict), levels)
-            mapping[key] = redacted
-            counts.update(found)
-        return mapping, counts
-    return value, counts
+
+def _redact_text(value: str, secret: bool, counts: Counter[str]) -> str:
+    """One string of a value: whole when it is a credential under a secret name, else filtered, JSON included."""
+    if secret and _plausible_assigned_value(value):
+        counts["assigned_secret"] += 1
+        return MARKER.format(kind="assigned_secret")
+    result = redact(value)
+    counts.update(result.counts)
+    decoded = _json_container(result.text)
+    if decoded is None:
+        return result.text
+    # Recursion here follows levels of encoding only, and each one adds escapes.
+    found: Counter[str] = Counter()
+    redacted = _redact_tree(decoded, frozenset(), False, found)
+    if not found:
+        return result.text
+    counts.update(found)
+    try:
+        return json.dumps(redacted, ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return MARKER.format(kind="assigned_secret")
 
 
 def _json_container(text: str) -> dict[str, Any] | list[Any] | None:
