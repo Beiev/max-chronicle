@@ -214,7 +214,9 @@ VALID = {"id": "a", "query": "q", "category": "fact", "expected": ["event:1"]}
         (json.dumps(VALID | {"category": "trivia"}), "category must be one of"),
         (json.dumps(VALID | {"category": "abstention"}), "abstention cases, and only they"),
         (json.dumps(VALID | {"expected": []}), "abstention cases, and only they"),
-        (json.dumps(VALID | {"expected": ["doc:readme"]}), "expected must be a list of references (event:<id>)"),
+        (json.dumps(VALID | {"expected": ["doc:readme"]}), "expected must be a list of references (event:<id>, note:<id>)"),
+        (json.dumps(VALID | {"expected": ["event:1"], "category": "knowledge_update", "stale": ["note:~/a.md"]}),
+         "a case expects events or notes, not both"),
         (json.dumps(VALID | {"stale": ["event:1"]}), "both expected and stale"),
         (json.dumps(VALID | {"scope": {"agent": "codex"}}), "scope maps domain, project, task_id"),
         (json.dumps(VALID | {"lang": ""}), "lang must be a non-empty string"),
@@ -296,3 +298,30 @@ def test_the_eval_command_writes_the_report_and_enforces_floors(
 
     golden.write_text("{}\n", encoding="utf-8")
     assert run() == 2
+
+
+
+
+def test_a_note_case_is_scored_on_the_notes_and_asks_for_them(monkeypatch, tmp_path) -> None:
+    from max_chronicle import recall as recall_module
+    from max_chronicle.evals import _parse_case, build_report, format_report
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    note = tmp_path / "memory" / "backups.md"
+    asked: list[bool] = []
+
+    def query_memory(manifest, *, query, limit, include_notes, **scope):
+        asked.append(include_notes)
+        return {"results": [{"event_id": "e1"}], "notes": [{"path": "/elsewhere.md"}, {"path": str(note)}]}
+
+    monkeypatch.setattr(recall_module, "query_memory", query_memory)
+    note_case = _parse_case({"id": "note", "query": "backups", "category": "fact", "expected": ["note:~/memory/backups.md"]})
+
+    details = run_eval({}, [_case("event", ("event:e1",)), note_case])
+    report = build_report(details)
+
+    assert asked == [False, True]  # event cases score as before notes were indexed
+    assert note_case.expected == (f"note:{note}",)
+    assert [(d["surface"], d["first_hit_rank"]) for d in details] == [("events", 1), ("notes", 2)]
+    assert report["by_surface"]["notes"]["hit@1"] == 0.0 and report["by_surface"]["events"]["hit@1"] == 1.0
+    assert "surface:notes" in format_report(report)

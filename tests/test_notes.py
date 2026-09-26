@@ -1087,10 +1087,39 @@ def test_a_note_indexed_by_an_older_version_is_indexed_again_unchanged(notes) ->
     assert report["indexed"] == 1 and _documents(manifest)[str(files["global"])]["index_version"] == NOTE_INDEX_VERSION
 
 
+
+def test_a_note_that_names_its_project_belongs_to_it(notes, tmp_path) -> None:
+    manifest, files = notes
+    manifest = {**manifest, "projects": [*manifest["projects"], {"id": "atlas", "aliases": ["atlas-app"]}]}
+    archive = tmp_path / "archive"
+    manifest["notes"] = {**manifest["notes"], "paths": [*manifest["notes"]["paths"], str(archive / "*.md")]}
+    named = _note(archive / "atlas-memory.md", "Atlas ships on Fridays.\n", name="Atlas release day", project="atlas-app")
+    inside = _note(files["inside"].with_name("other.md"), "Filed under atlas.\n", name="Filed", project="Atlas_App")
+    commented = _note(archive / "commented.md", "Archived.\n", name="Archived", project='"atlas" # archived project')
+
+    first = sync_notes(manifest, embed=False)
+    second = sync_notes(manifest, embed=False)
+
+    documents = _documents(manifest)
+    assert documents[str(named)]["project"] == documents[str(inside)]["project"] == "atlas"
+    assert documents[str(commented)]["project"] == "atlas"  # a YAML comment is not part of the name
+    assert first["indexed"] >= 2 and second["indexed"] == 0  # a named project does not re-index every sync
+
+
+def test_a_secret_in_a_named_project_is_never_stored(notes, tmp_path) -> None:
+    manifest, files = notes
+    key = _synthetic_key()
+    path = _note(files["global"].with_name("leaky.md"), "Plain text.\n", name="Leaky", project=f"atlas {key}")
+
+    sync_notes(manifest, embed=False)
+
+    assert key not in _stored_text(manifest) and _documents(manifest)[str(path)]["project"]
+
+
 # The parser and the secret filter, as indexed notes were made with them.
 # Changing either changes this digest: bump NOTE_INDEX_VERSION so every note
 # is indexed again, then record the new digest under the new version.
-INDEX_DIGESTS = {3: "010c55a65bc1442ed17e6333c9da88dfd537cfc1b8a9b4027915d0c37f32fd45"}
+INDEX_DIGESTS = {4: "bc9c3bda977f8c732539f52771d146663c5466bd1f0cfb2608769eb588f51221"}
 
 
 def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:

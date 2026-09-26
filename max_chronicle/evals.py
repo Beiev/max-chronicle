@@ -27,8 +27,9 @@ from . import __version__
 EVAL_SCHEMA = "chronicle-eval/1"
 CATEGORIES = ("fact", "rationale", "knowledge_update", "temporal", "handoff", "abstention")
 SCOPE_KEYS = ("domain", "project", "task_id")
-# Evidence kinds recall can return today. Documents join with the file index.
-REF_KINDS = ("event",)
+# Evidence kinds recall returns: events in `results`, indexed notes in `notes`
+# (by path, `~` allowed). One case asks about one of the two surfaces.
+REF_KINDS = ("event", "note")
 CASE_FIELDS = {"id", "query", "category", "lang", "expected", "stale", "scope", "notes"}
 HIT_KS = (1, 5, 10)
 RECALL_AT = 5
@@ -96,6 +97,9 @@ def _parse_case(raw: Any) -> GoldenCase:
         raise ValueError("abstention cases, and only they, have no expected evidence")
     if set(stale) & set(expected):
         raise ValueError("a reference cannot be both expected and stale")
+    if len({ref.partition(":")[0] for ref in (*expected, *stale)}) > 1:
+        raise ValueError("a case expects events or notes, not both")
+    expected, stale = _note_paths(expected), _note_paths(stale)
     scope = raw.get("scope", {})
     if (
         not isinstance(scope, dict)
@@ -111,6 +115,16 @@ def _parse_case(raw: Any) -> GoldenCase:
     return GoldenCase(
         id=case_id, query=query, category=category, expected=expected, stale=stale, lang=lang, scope=scope
     )
+
+
+def _note_paths(refs: tuple[str, ...]) -> tuple[str, ...]:
+    """Note references with `~` expanded, as the index stores note paths."""
+    return tuple(f"note:{os.path.expanduser(ref[5:].strip())}" if ref.startswith("note:") else ref for ref in refs)
+
+
+def surface(case: GoldenCase) -> str:
+    """Which list of a recall answer the case is scored on."""
+    return "notes" if any(ref.startswith("note:") for ref in (*case.expected, *case.stale)) else "events"
 
 
 def _refs(value: Any, name: str) -> tuple[str, ...]:
@@ -131,16 +145,18 @@ def run_eval(
     clock: Callable[[], float] = time.perf_counter,
 ) -> list[dict[str, Any]]:
     """Ask every case through recall and score the ranking it returns."""
-    if recall is None:
-        from .recall import query_memory
-
-        # The golden set scores event recall; indexed notes are ranked apart.
-        recall = functools.partial(query_memory, include_notes=False)
     details = []
     for case in cases:
+        ask = recall
+        if ask is None:
+            from .recall import query_memory
+
+            # Notes are asked for only by the cases about them, so event cases
+            # score exactly as they did before notes were indexed.
+            ask = functools.partial(query_memory, include_notes=surface(case) == "notes")
         started = clock()
         try:
-            response = recall(manifest, query=case.query, limit=RECALL_LIMIT, **case.scope)
+            response = ask(manifest, query=case.query, limit=RECALL_LIMIT, **case.scope)
             error = None
         except Exception as exc:  # a failing query is a measured miss, not an aborted run
             response, error = {}, f"{type(exc).__name__}: {exc}"
@@ -156,13 +172,18 @@ def _hit_ref(hit: Mapping[str, Any]) -> str:
 def _score_case(
     case: GoldenCase, response: Mapping[str, Any], *, latency_ms: float, error: str | None
 ) -> dict[str, Any]:
-    ranked = [_hit_ref(hit) for hit in response.get("results") or []]
+    on_notes = surface(case) == "notes"
+    if on_notes:
+        ranked = [f"note:{note['path']}" for note in response.get("notes") or []]
+    else:
+        ranked = [_hit_ref(hit) for hit in response.get("results") or []]
     expected = set(case.expected)
     ranks = [rank for rank, ref in enumerate(ranked, start=1) if ref in expected]
     detail: dict[str, Any] = {
         "id": case.id,
         "category": case.category,
         "lang": case.lang,
+        "surface": "notes" if on_notes else "events",
         "query": case.query,
         "expected": list(case.expected),
         "ranked": ranked,
@@ -267,6 +288,7 @@ def build_report(details: list[dict[str, Any]], *, golden_path: Path | None = No
         "overall": summarize(details),
         "by_category": _grouped(details, "category"),
         "by_lang": _grouped(details, "lang"),
+        "by_surface": _grouped(details, "surface"),
         "cases": details,
     }
 
@@ -299,6 +321,7 @@ def format_report(report: Mapping[str, Any]) -> str:
     rows = [("overall", report["overall"])]
     rows += [(f"cat:{name}", metrics) for name, metrics in report["by_category"].items()]
     rows += [(f"lang:{name}", metrics) for name, metrics in report["by_lang"].items()]
+    rows += [(f"surface:{name}", metrics) for name, metrics in report.get("by_surface", {}).items()]
     table = [headers]
     for name, metrics in rows:
         cells = [_cell(metrics.get(column)) for column in columns]

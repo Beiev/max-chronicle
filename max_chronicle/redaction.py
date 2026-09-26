@@ -23,6 +23,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import functools
+import json
 import math
 import re
 from typing import Any
@@ -460,42 +461,90 @@ def _random_entropy(length: int, alphabet: int) -> float:
     return alphabet * bits
 
 
-def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset()) -> tuple[Any, Counter[str]]:
+def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset(),
+                 secret: bool = False) -> tuple[Any, Counter[str]]:
     """Redact every string inside ``value``, except under ``skip_keys`` of a mapping.
 
     A string under a key named like a secret ("password", "AWS_SECRET_ACCESS_KEY",
-    "accessToken") is redacted whole when it looks like a credential, since its
-    own text would not say so.
+    "accessToken"), directly or in a list, is redacted whole when it looks like a
+    credential, since its own text would not say so. A string that holds a JSON
+    object or array is decoded and filtered as a value too, however many times it
+    was encoded, and written back as JSON when anything in it was redacted.
     """
     counts: Counter[str] = Counter()
-    if isinstance(value, str):
-        result = redact(value)
-        counts.update(result.counts)
-        return result.text, counts
-    if isinstance(value, list):
-        items = []
-        for item in value:
-            redacted, found = redact_value(item, skip_keys=skip_keys)
-            items.append(redacted)
-            counts.update(found)
-        return items, counts
-    if isinstance(value, dict):
-        mapping = {}
-        for key, item in value.items():
-            if key in skip_keys:
-                mapping[key] = item
-                continue
-            if (
-                isinstance(key, str)
-                and isinstance(item, str)
-                and _SECRET_NAME.search(key)
-                and _plausible_assigned_value(item)
-            ):
-                mapping[key] = MARKER.format(kind="assigned_secret")
-                counts["assigned_secret"] += 1
-                continue
-            redacted, found = redact_value(item, skip_keys=skip_keys)
-            mapping[key] = redacted
-            counts.update(found)
-        return mapping, counts
-    return value, counts
+    return _redact_tree(value, skip_keys, secret, counts), counts
+
+
+JSON_TEXT_MAX_LENGTH = 1 << 20
+
+
+def _redact_tree(root: Any, skip_keys: frozenset[str], secret: bool, counts: Counter[str]) -> Any:
+    """*root* with its strings redacted, walked with a stack of its own, so no depth exhausts Python's."""
+    holder: list[Any] = [None]
+    pending: list[tuple[Any, bool, Any, Any]] = [(root, secret, holder, 0)]  # value, secret, parent, key
+    while pending:
+        value, under_secret, parent, key = pending.pop()
+        if isinstance(value, str):
+            parent[key] = _redact_text(value, under_secret, counts)
+        elif isinstance(value, list):
+            items: list[Any] = [None] * len(value)
+            parent[key] = items
+            pending.extend((item, under_secret, items, index) for index, item in enumerate(value))
+        elif isinstance(value, dict):
+            mapping: dict[Any, Any] = {}
+            parent[key] = mapping
+            for name, item in value.items():
+                mapping[name] = item  # keeps the order; replaced below unless skipped
+                if name not in skip_keys:
+                    named = isinstance(name, str) and _SECRET_NAME.search(name) is not None
+                    pending.append((item, named and not isinstance(item, dict), mapping, name))
+        else:
+            parent[key] = value
+    return holder[0]
+
+
+def _redact_text(value: str, secret: bool, counts: Counter[str]) -> str:
+    """One string of a value: whole when it is a credential under a secret name, else filtered, JSON included."""
+    if secret and _plausible_assigned_value(value):
+        counts["assigned_secret"] += 1
+        return MARKER.format(kind="assigned_secret")
+    result = redact(value)
+    counts.update(result.counts)
+    decoded = _json_container(result.text)
+    if decoded is _TOO_DEEP:
+        # JSON nested deeper than the json module parses (about 1,000 levels
+        # before Python 3.12): what a secret name marks inside cannot be told.
+        if _SECRET_WORD_ANYWHERE.search(result.text):
+            counts["assigned_secret"] += 1
+            return MARKER.format(kind="assigned_secret")
+        return result.text
+    if decoded is None:
+        return result.text
+    # Recursion here follows levels of encoding only, and each one adds escapes.
+    found: Counter[str] = Counter()
+    redacted = _redact_tree(decoded, frozenset(), False, found)
+    if not found:
+        return result.text
+    counts.update(found)
+    try:
+        return json.dumps(redacted, ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return MARKER.format(kind="assigned_secret")
+
+
+_TOO_DEEP = object()
+_SECRET_WORD_ANYWHERE = re.compile(r"(?i)" + _SECRET_WORD)
+
+
+def _json_container(text: str) -> Any:
+    """The object or array that *text* holds as JSON, None, or _TOO_DEEP when it nests too deep to parse."""
+    stripped = text.strip()
+    if stripped[:1] not in ("{", "[") or len(stripped) > JSON_TEXT_MAX_LENGTH:
+        return None
+    try:
+        decoded = json.loads(stripped)
+    except RecursionError:
+        return _TOO_DEEP
+    except ValueError:
+        return None
+    return decoded if isinstance(decoded, (dict, list)) else None

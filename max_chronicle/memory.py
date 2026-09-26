@@ -343,10 +343,19 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now, identit
         VALUES (?,'record_episode',?,?,?,?)""",
         (entry["domain"], entry.get("agent"), episode_id, now, entry.get("why")),
     ).lastrowid
-    if unchanged:
-        fact_id = current["id"]
-    else:
-        fact_id = str(uuid.uuid4())
+    fact_id = current["id"] if unchanged else str(uuid.uuid4())
+    replaced = current is not None and not unchanged
+    # Replacing the newest value settles the slot: values that other spellings
+    # of its names held, as separate slots before the registry, retire with it.
+    merged = list(actives[1:]) if expected else []
+    # Old values leave the slot before the new one enters it, so the slot never
+    # holds two active values (0015).
+    for old in ([current] if replaced else []) + merged:
+        connection.execute(
+            "UPDATE facts SET status='retired', expired_at_utc=?, valid_to_utc=?, expired_tx_id=? WHERE id=?",
+            (now, now, tx, old["id"]),
+        )
+    if not unchanged:
         connection.execute(
             """INSERT INTO facts(id,domain,group_id,relation,fact_text,fact_hash,recorded_at_utc,
             valid_from_utc,valid_from_precision,created_tx_id,slot_key,value_key,cardinality,attributes_json,attributed_to)
@@ -369,11 +378,7 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now, identit
                 entry.get("agent"),
             ),
         )
-        if current is not None:
-            connection.execute(
-                "UPDATE facts SET status='retired', expired_at_utc=?, valid_to_utc=?, expired_tx_id=? WHERE id=?",
-                (now, now, tx, current["id"]),
-            )
+        if replaced:
             connection.execute(
                 "INSERT INTO fact_supersessions(old_fact_id,new_fact_id,reason,tx_id) VALUES (?,?,'manual',?)",
                 (current["id"], fact_id, tx),
@@ -390,24 +395,16 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now, identit
                 now,
             ),
         )
-    if expected:
-        # Replacing the newest value settles the slot: values that other
-        # spellings of its names held, as separate slots before the registry,
-        # retire with it.
-        for other in actives[1:]:
-            connection.execute(
-                "UPDATE facts SET status='retired', expired_at_utc=?, valid_to_utc=?, expired_tx_id=? WHERE id=?",
-                (now, now, tx, other["id"]),
-            )
-            connection.execute(
-                "INSERT INTO fact_supersessions(old_fact_id,new_fact_id,reason,tx_id) VALUES (?,?,'merge',?)",
-                (other["id"], fact_id, tx),
-            )
-            connection.execute(
-                """INSERT INTO fact_mutation_log(domain,action,fact_id,previous_fact_id,tx_id,reason,recorded_at_utc)
-                VALUES (?,'retire',?,NULL,?,?,?)""",
-                (entry["domain"], other["id"], tx, f"merged into {fact_id}", now),
-            )
+    for other in merged:
+        connection.execute(
+            "INSERT INTO fact_supersessions(old_fact_id,new_fact_id,reason,tx_id) VALUES (?,?,'merge',?)",
+            (other["id"], fact_id, tx),
+        )
+        connection.execute(
+            """INSERT INTO fact_mutation_log(domain,action,fact_id,previous_fact_id,tx_id,reason,recorded_at_utc)
+            VALUES (?,'retire',?,NULL,?,?,?)""",
+            (entry["domain"], other["id"], tx, f"merged into {fact_id}", now),
+        )
     connection.execute(
         "INSERT INTO fact_observations(fact_id,episode_id,reference_time_utc,episode_valid_at_utc,extractor_version) VALUES (?,?,?,?,?)",
         (fact_id, episode_id, now, now, "explicit-v1"),

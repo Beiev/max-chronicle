@@ -339,10 +339,10 @@ def test_mcp_tool_input_schemas_include_param_descriptions_and_query_mode_enum(c
     assert startup_props["compact"]["description"] == "Return the compact startup bundle variant."
 
     query_props = schemas["query_context"]["properties"]
-    assert query_props["query"]["description"] == "Search string to match across Chronicle, status sources, and Mem0."
-    assert query_props["mode"]["description"] == (
-        "Retrieval mode that controls whether derived layers and scenario hits are included."
+    assert query_props["query"]["description"] == (
+        "Search string matched across Chronicle events, status markdown sections and the Mem0 dump."
     )
+    assert query_props["mode"]["description"].startswith("truth_only: Chronicle events and status sources only.")
     assert query_props["mode"]["enum"] == [
         "truth_only",
         "truth_plus_interpretation",
@@ -1784,3 +1784,94 @@ def test_mcp_capture_snapshot_returns_a_receipt_not_the_whole_snapshot(
     for bulk_key in ("recent_ledger", "mem0_snapshot_hits", "source_excerpts"):
         assert bulk_key not in payload
     assert set(payload["normalized_entities"]) == {"count", "ids"}
+
+
+def test_query_context_leaves_old_situation_models_out(loaded_manifest) -> None:
+    from max_chronicle.store import store_situation_model
+
+    store_situation_model(config_from_manifest(loaded_manifest), {
+        "domain": "global", "status": "active", "summary_text": "Quarantine drill is the current focus",
+        "valid_at_utc": "2026-06-04T00:20:00Z"})
+
+    payload = query_context(loaded_manifest, query="Quarantine drill", domain="global", limit=5)
+
+    assert payload["interpretation_hits"] == []
+
+
+def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sandbox) -> None:
+    async def collect() -> dict[str, Any]:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        return {item.name: item for item in await server.list_tools()}
+
+    tools = asyncio.run(collect())
+    hints = {name: (tool.annotations.readOnlyHint, tool.annotations.destructiveHint, tool.annotations.openWorldHint)
+             for name, tool in tools.items()}
+
+    assert hints["query_memory"] == (True, None, False)
+    assert hints["record_event"] == (False, False, False)
+    assert hints["startup_bundle"] == (False, False, False)  # capture=true writes a snapshot
+    assert hints["entity_admin"] == (False, True, False)
+    assert hints.get("search_mem0_live", (True, None, True)) == (True, None, True)
+    recall_query = tools["query_memory"].inputSchema["properties"]["query"]["description"]
+    assert "Mem0" not in recall_query and "status" not in recall_query
+    window = tools["state_at"].inputSchema["properties"]["window_hours"]
+    assert (window["minimum"], window["maximum"]) == (1, 720)
+
+
+def _mem0_key() -> str:
+    import secrets
+
+    return "sk-" + "proj-" + secrets.token_urlsafe(36)
+
+
+def test_query_context_filters_the_mem0_dump_and_status_files(chronicle_sandbox, loaded_manifest) -> None:
+    key, other = _mem0_key(), _mem0_key()
+    (chronicle_sandbox.status_root / "mem0-dump.json").write_text(json.dumps({"memories": [
+        {"id": "m-1", "memory": f"Marmoset gateway credentials: {key}", "metadata": {}}]}), encoding="utf-8")
+    status = chronicle_sandbox.status_root / "status.md"
+    status.write_text(status.read_text(encoding="utf-8") + f"\n## Marmoset gateway\nThe marmoset key is {other}\n",
+                      encoding="utf-8")
+
+    payload = query_context(loaded_manifest, query="marmoset gateway", domain="global", limit=5,
+                            mode="truth_plus_interpretation")
+
+    text = json.dumps(payload)
+    assert payload["mem0_dump_hits"] and payload["status_hits"]
+    assert key not in text and other not in text and "[REDACTED:" in text
+
+
+def test_live_mem0_results_pass_the_secret_filter(loaded_manifest, monkeypatch) -> None:
+    import max_chronicle.service as service_module
+
+    key = _mem0_key()
+
+    class _Bridge:
+        returncode, stderr = 0, ""
+        stdout = json.dumps({"results": [{"id": "m-1", "memory": f"API key {key}", "metadata": {}}], "count": 1})
+
+    monkeypatch.setattr(service_module.subprocess, "run", lambda *args, **kwargs: _Bridge())
+    monkeypatch.setenv("CHRONICLE_FEATURE_SEARCH_MEM0_LIVE", "1")
+
+    out = service_module.search_mem0_live_service(loaded_manifest, query="api key", timeout_s=5)
+
+    assert key not in json.dumps(out) and out["redactions"]
+
+
+def test_mem0_metadata_keeps_a_secret_name_through_lists_and_encoded_json(loaded_manifest, monkeypatch) -> None:
+    import max_chronicle.service as service_module
+
+    password = "Pw-" + _mem0_key()[3:19]
+    metadata = {"password": [password],
+                "twice_encoded": json.dumps({"nested": json.dumps({"password": password})})}
+
+    class _Bridge:
+        returncode, stderr = 0, ""
+        stdout = json.dumps({"results": [{"id": "m-1", "memory": "deployment", "metadata": metadata}], "count": 1})
+
+    monkeypatch.setattr(service_module.subprocess, "run", lambda *args, **kwargs: _Bridge())
+    monkeypatch.setenv("CHRONICLE_FEATURE_SEARCH_MEM0_LIVE", "1")
+
+    out = service_module.search_mem0_live_service(loaded_manifest, query="deployment", timeout_s=5)
+
+    assert password not in json.dumps(out)
+    assert out["results"][0]["metadata"]["password"] == ["[REDACTED:assigned_secret]"]

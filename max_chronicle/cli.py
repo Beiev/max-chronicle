@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -41,7 +42,7 @@ from .native_automation import (
     run_git_commit_hook,
     sync_mem0_outbox,
 )
-from .runtime_context import load_manifest
+from .runtime_context import expand_path, load_manifest, read_toml
 from .service import (
     backfill_mem0_queue,
     build_activation,
@@ -119,11 +120,17 @@ def _with_db(manifest: dict[str, Any], db: Path | None) -> dict[str, Any]:
 
 
 def _config_from_args(args: argparse.Namespace) -> ChronicleConfig:
-    return default_config(
+    """The workspace config; without --db, the database the manifest names, as the server opens it."""
+    config = default_config(
         args.db,
         manifest_path=getattr(args, "manifest", None),
         automation_path=getattr(args, "automation_config", None),
     )
+    if args.db is None and config.manifest_path.is_file():
+        named = (read_toml(config.manifest_path).get("paths") or {}).get("chronicle_db")
+        if named:
+            config = replace(config, db_path=expand_path(str(named)))
+    return config
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
@@ -221,6 +228,7 @@ def cmd_timeline(args: argparse.Namespace) -> int:
         domain=args.domain,
         window_hours=args.window_hours,
         limit=args.limit,
+        as_of=args.as_of,
     )
 
     if args.format == "json":
@@ -253,6 +261,14 @@ def cmd_timeline(args: argparse.Namespace) -> int:
                 print(f"  why: {row['why']}")
     else:
         print("- No events in the selected window.")
+    if "facts" in payload:
+        print()
+        print("## Facts Current Then")
+        for fact in payload["facts"]:
+            retired = f" (retired {fact['retired_at_utc']})" if fact["retired_at_utc"] else ""
+            print(f"- {fact['slot']} = {fact['value']} [{fact['kind']}]{retired}")
+        if not payload["facts"]:
+            print("- No facts were current then.")
     return 0
 
 
@@ -1016,6 +1032,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_timeline.add_argument("--domain", default=None, help="Optional domain filter")
     p_timeline.add_argument("--window-hours", type=int, default=6, help="Event window around the timestamp")
     p_timeline.add_argument("--limit", type=int, default=3, help="Number of nearest snapshots to show")
+    p_timeline.add_argument("--as-of", action="store_true",
+                            help="Only what was known at the timestamp, and the facts current then")
     p_timeline.add_argument("--format", choices=["text", "json"], default="text")
     p_timeline.set_defaults(handler=cmd_timeline)
 

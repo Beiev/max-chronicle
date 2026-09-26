@@ -241,7 +241,8 @@ deleted one, and never writes to a note; the server runs the same sync every
 - **Projects.** A note inside a project root, or in the file memory of a
   directory inside that root, belongs to that project. In the file memory of a
   directory under the workspace, it belongs to that workspace child's project.
-  Any other note is global.
+  A note whose frontmatter names a project (`project: atlas`, any registered
+  spelling) belongs to that project wherever it lies. Any other note is global.
 
 `query_memory` returns notes in `notes`, next to events in `results`: the best
 section of each note, with its heading, path and id. In a project scope, the
@@ -254,7 +255,7 @@ serves a whole note; `chronicle notes status` counts what the index holds.
 | `query_memory` | Scoped lexical/vector recall with provenance and coverage. |
 | `query_context` | Broader search through source documents and optional Mem0 dump. |
 | `recent_events` | Recent event history. |
-| `state_at` | Historical snapshots/events; `detail="full"` restores the full payload. |
+| `state_at` | Historical snapshots/events; `mode="as_of"` keeps only what was known then and adds the facts current then; `detail="full"` restores the full payload. |
 | `sources_audit` | Source coverage, freshness, and trust metadata. |
 | `record_event` | Attributed observation, evidence, optional checkpoint or explicit fact. |
 | `capture_snapshot` | Archive runtime state and update readable projections. |
@@ -340,8 +341,10 @@ can separately report `side_effect_errors` for failed evidence/projection output
   identifier after a key (an SSH fingerprint, a random URL id) may be
   removed with it.
   Identifiers such as `request_id` and paths are left as given, the source file is
-  never modified, and binary evidence is archived unchanged. Not filtered yet:
-  snapshot excerpts, legacy imports, and Mem0 responses. Time is linear in the
+  never modified, and binary evidence is archived unchanged. `query_context`
+  filters what it reads from status files and the Mem0 dump, and
+  `search_mem0_live` what Mem0 returns. Not filtered yet: snapshot excerpts and
+  legacy imports. Time is linear in the
   input, so a hostile or huge text cannot stall the write path.
 - **Backups:** independent artifact copies, content-hash inventory, database
   integrity checks, and verification after relocation. Legacy backups disclose
@@ -359,7 +362,13 @@ knowledge updates, and latency percentiles, overall and per category and languag
 {"id": "why-sqlite", "query": "why did we pick SQLite", "category": "rationale", "lang": "en", "expected": ["event:<id>"], "scope": {"project": "demo"}}
 {"id": "db-now", "query": "current database", "category": "knowledge_update", "expected": ["event:<new>"], "stale": ["event:<old>"]}
 {"id": "unknown", "query": "office wifi password", "category": "abstention", "expected": []}
+{"id": "backup-rotation", "query": "how often do backups rotate", "category": "fact", "expected": ["note:~/notes/backups.md"]}
 ```
+
+A case expects events (`event:<id>`) or indexed notes (`note:<path>`), never both.
+Note cases are scored on the `notes` of the answer and ask recall for notes;
+event cases leave notes out, so their scores stay comparable across versions.
+The report adds a breakdown per surface.
 
 Categories follow LongMemEval: `fact`, `rationale`, `knowledge_update`, `temporal`,
 `handoff`, `abstention`. `--json` prints the full report, `--out` saves it, and
@@ -377,6 +386,7 @@ chronicle startup --project demo --task-id ship --focus "Continue review" --form
 chronicle query-memory "local storage" --project demo --task-id ship --format json
 chronicle eval --golden questions.jsonl --out results/baseline.json
 chronicle timeline --at "2026-09-15T12:00:00Z"
+chronicle timeline --at "2026-09-15T12:00:00Z" --as-of   # what was known then
 chronicle backup --force
 ```
 
