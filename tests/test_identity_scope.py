@@ -406,3 +406,16 @@ def test_content_hash_dedupe_folds_the_task_id(loaded_manifest, monkeypatch) -> 
     second = service.record_event(loaded_manifest, {**fields, "task_id": "launch-plan"}, source_kind="agent_command")
 
     assert second["id"] == first["id"] and second["dedupe_status"] == "content_hash_match"
+
+
+# Fourth review of #14 (identity part).
+
+
+def test_a_retry_under_another_name_is_refused_for_a_request_written_now(loaded_manifest) -> None:
+    manifest = {**loaded_manifest, "agents": [{"id": "auditor", "aliases": ["codex-bot"]}]}
+    fields = {"domain": "global", "text": "Audited the release", "request_id": "retry-alias-author"}
+    service.record_event(manifest, {**fields, "agent": "codex"})
+
+    # 0.12.0 read "codex-bot" as codex; that reading only ever applies to what 0.12.0 wrote.
+    with pytest.raises(ValueError, match="different input"):
+        service.record_event(manifest, {**fields, "agent": "codex-bot"})
