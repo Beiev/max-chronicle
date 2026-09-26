@@ -22,15 +22,15 @@ def _record(manifest: dict, text: str, **fields) -> dict:
 
 
 def _insert_fact(connection: sqlite3.Connection, fact_id: str, group_id: str | None, value: str,
-                 recorded_at: str) -> None:
+                 recorded_at: str, domain: str = "global") -> None:
     tx = connection.execute(
-        "INSERT INTO fact_transactions(domain,operation,recorded_at_utc) VALUES ('global','record_episode',?)",
-        (recorded_at,),
+        "INSERT INTO fact_transactions(domain,operation,recorded_at_utc) VALUES (?,'record_episode',?)",
+        (domain, recorded_at),
     ).lastrowid
     connection.execute(
         """INSERT INTO facts(id,domain,group_id,relation,fact_text,fact_hash,recorded_at_utc,created_tx_id,
-        slot_key,value_key,cardinality,attributes_json) VALUES (?,'global',?,'deploy.target',?,?,?,?,'deploy.target',?,'single','{}')""",
-        (fact_id, group_id, f"deploy.target: {value}", f"hash-{fact_id}", recorded_at, tx, value),
+        slot_key,value_key,cardinality,attributes_json) VALUES (?,?,?,'deploy.target',?,?,?,?,'deploy.target',?,'single','{}')""",
+        (fact_id, domain, group_id, f"deploy.target: {value}", f"hash-{fact_id}", recorded_at, tx, value),
     )
 
 
@@ -115,16 +115,20 @@ def test_the_migration_takes_a_fact_without_group_as_the_widest_scope(loaded_man
     assert status == {"older": "retired", "newer": "active"}
 
 
-def test_the_migration_is_one_pass(loaded_manifest, tmp_path) -> None:
+# Two values per slot: 4,000 slots of one domain took 16 s with a nested scan,
+# 16,000 slots of their own domains 4.4 s with an unindexed lookup of the retiring transaction.
+@pytest.mark.parametrize(("slots", "own_domains"), [(4000, False), (16000, True)])
+def test_the_migration_is_one_pass(loaded_manifest, tmp_path, slots, own_domains) -> None:
     import time
 
     from max_chronicle.store import prepare_database
 
     config = config_from_manifest(loaded_manifest)
     with open_connection(_before_0015(config, tmp_path)) as connection:
-        for index in range(8000):  # 4000 slots of two values; a nested scan took 16 s here
-            _insert_fact(connection, f"fact-{index}", f'["project-{index // 2}",null]', f"value-{index}",
-                         f"2026-09-01T00:00:{index % 2:02d}.000Z")
+        for index in range(slots * 2):
+            slot = index // 2
+            _insert_fact(connection, f"fact-{index}", f'["project-{slot}",null]', f"value-{index}",
+                         f"2026-09-01T00:00:{index % 2:02d}.000Z", f"domain-{slot}" if own_domains else "global")
         connection.commit()
 
     started = time.monotonic()
@@ -133,4 +137,4 @@ def test_the_migration_is_one_pass(loaded_manifest, tmp_path) -> None:
 
     with open_connection(config) as connection:
         active = connection.execute("SELECT count(*) FROM facts WHERE status = 'active'").fetchone()[0]
-    assert active == 4000 and elapsed < 3
+    assert active == slots and elapsed < 3

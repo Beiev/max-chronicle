@@ -138,6 +138,27 @@ def test_as_of_knows_a_legacy_import_from_the_import_on(loaded_manifest, monkeyp
     assert _texts(service.reconstruct_timeline(loaded_manifest, timestamp=early, as_of=True)) == []
 
 
+def test_a_legacy_import_leaves_the_current_handoff(loaded_manifest, monkeypatch) -> None:
+    from max_chronicle import bootstrap
+    from max_chronicle.memory import task_context
+
+    _record(loaded_manifest, "Current handoff", "2026-09-10T11:00:00Z", "2026-09-10T11:00:00Z", project="atlas",
+            task_id="ship", checkpoint={"goal": "Deploy v2", "next_steps": ["Watch v2 errors"]})
+    config = config_from_manifest(loaded_manifest)
+    config.ledger_path.write_text(json.dumps({
+        "id": "legacy-handoff", "text": "Old handoff", "domain": "global", "project": "atlas", "task_id": "ship",
+        "recorded_at": "2026-09-01T10:00:00Z", "checkpoint": {"goal": "Deploy v1", "next_steps": ["Deploy v1"]},
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "utc_now", lambda: "2026-09-10T12:00:00Z")
+    with open_connection(config) as connection, connection:
+        bootstrap.import_legacy_ledger(connection, config)
+
+    context = task_context(loaded_manifest, domain=None, project="atlas", task_id="ship")
+    assert context["checkpoint"]["checkpoint"]["goal"] == "Deploy v2"
+    assert [task["goal"] for task in task_context(loaded_manifest, domain=None, project="atlas",
+                                                  task_id=None)["open_tasks"]] == ["Deploy v2"]
+
+
 def test_the_cli_prints_the_facts_current_then(chronicle_sandbox, loaded_manifest, monkeypatch, capsys) -> None:
     _record(loaded_manifest, "Deploys go to staging", "2026-09-09T09:00:00Z", "2026-09-09T09:00:00Z",
             fact={"slot": "deploy.target", "value": "staging", "kind": "decision"})

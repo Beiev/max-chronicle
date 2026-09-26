@@ -509,10 +509,14 @@ def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset(),
 
 
 JSON_TEXT_MAX_LENGTH = 1 << 20
+JSON_TEXT_MAX_DEPTH = 32
 
 
 def _json_container(text: str) -> dict[str, Any] | list[Any] | None:
-    """The object or array that *text* holds as JSON, or None."""
+    """The object or array that *text* holds as JSON, nested at most JSON_TEXT_MAX_DEPTH deep, or None.
+
+    Deeper JSON stays text, filtered as text: walking it would exhaust the stack.
+    """
     stripped = text.strip()
     if stripped[:1] not in ("{", "[") or len(stripped) > JSON_TEXT_MAX_LENGTH:
         return None
@@ -520,4 +524,13 @@ def _json_container(text: str) -> dict[str, Any] | list[Any] | None:
         decoded = json.loads(stripped)
     except (ValueError, RecursionError):
         return None
-    return decoded if isinstance(decoded, (dict, list)) else None
+    if not isinstance(decoded, (dict, list)):
+        return None
+    pending = [(decoded, 1)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > JSON_TEXT_MAX_DEPTH:
+            return None
+        children = value.values() if isinstance(value, dict) else value
+        pending.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return decoded

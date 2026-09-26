@@ -873,3 +873,11 @@ def test_json_held_in_a_string_is_filtered_at_any_depth_of_encoding() -> None:
     assert json.loads(json.loads(value["twice"])["nested"]) == {"password": "[REDACTED:assigned_secret]",
                                                                 "note": "rotate monthly"}
     assert (value["plain"], value["list"]) == ("{not json", "[1, 2]")  # unchanged, byte for byte
+
+
+def test_json_nested_too_deep_stays_text() -> None:
+    deep = "[" * 1100 + "0" + "]" * 1100  # walking it as a value would exhaust the stack
+
+    value, counts = redact_value({"text": deep})
+
+    assert value == {"text": deep} and not counts

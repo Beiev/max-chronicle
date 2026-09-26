@@ -30,8 +30,9 @@ SELECT DISTINCT domain, 'retire', 'chronicle', strftime('%Y-%m-%dT%H:%M:%fZ', 'n
        'migration 0015: one active value per slot'
 FROM facts_0015_older;
 
-CREATE TEMP TABLE facts_0015_tx AS
-SELECT domain, max(id) AS tx_id FROM fact_transactions
+CREATE TEMP TABLE facts_0015_tx (domain TEXT PRIMARY KEY, tx_id INTEGER NOT NULL);
+INSERT INTO facts_0015_tx(domain, tx_id)
+SELECT domain, max(id) FROM fact_transactions
 WHERE reason = 'migration 0015: one active value per slot'
 GROUP BY domain;
 
