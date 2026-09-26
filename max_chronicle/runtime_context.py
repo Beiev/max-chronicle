@@ -11,7 +11,7 @@ from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
-from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION
+from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION, mem0_enabled
 from .db import utc_now  # re-exported: one timestamp format for the whole package
 from .identity import DomainMap, Names
 from .lexical import fold, query_terms
@@ -491,9 +491,11 @@ def build_runtime_snapshot(
     domain = manifest["domain_map"][domain_id]
     paths = manifest["paths"]
     mem0_hits: dict[str, list[dict[str, Any]]] = {}
-    mem0_dump_path = expand_path(paths["mem0_dump"])
-    for query in domain.get("mem0_queries", []):
-        mem0_hits[query] = search_mem0_dump(mem0_dump_path, query, 2)
+    mem0 = mem0_enabled(manifest)
+    if mem0:
+        mem0_dump_path = expand_path(paths["mem0_dump"])
+        for query in domain.get("mem0_queries", []):
+            mem0_hits[query] = search_mem0_dump(mem0_dump_path, query, 2)
 
     # Repo paths are optional: retiring a project means deleting its entry from
     # the manifest, and a snapshot must not hard-fail on a key that is simply
@@ -520,7 +522,7 @@ def build_runtime_snapshot(
         "source_freshness": source_freshness(manifest, domain["source_ids"]),
         "source_excerpts": build_source_excerpts(manifest, domain_id),
         "recent_ledger": recent_events[:8],
-        "mem0_dump": mem0_meta(manifest),
+        "mem0_dump": mem0_meta(manifest) if mem0 else {"enabled": False},
         "mem0_snapshot_hits": mem0_hits,
         "portfolio_assets": summarize_asset_manifest(expand_path(paths["portfolio_asset_manifest"])) if paths.get("portfolio_asset_manifest") else {},
         "repos": repos,

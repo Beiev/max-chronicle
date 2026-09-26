@@ -23,6 +23,7 @@ from .config import (
     env_float,
     env_int,
     feature_enabled,
+    mem0_enabled,
 )
 from .db import database_summary
 from .identity import fold
@@ -366,7 +367,10 @@ def _projection_note(manifest: dict[str, Any], source_id: str) -> str | None:
     return str(note).strip() or None if note else None
 
 
-def default_mem0_status(entry: dict[str, Any], *, source_kind: str) -> str | None:
+def default_mem0_status(entry: dict[str, Any], *, source_kind: str, mem0: bool = True) -> str | None:
+    """The Mem0 state a new event starts in; "off" whenever the installation runs without Mem0."""
+    if not mem0:
+        return "off"
     explicit = entry.get("mem0_status")
     if explicit not in {None, "", "auto"}:
         return str(explicit)
@@ -901,18 +905,20 @@ def build_sources_audit(
     domain_id = _domain_id(manifest, domain_id)
     attach_catalog = _source_catalog(manifest, domain_id)
     runtime_catalog = _runtime_source_catalog(manifest)
-    mem0_dump_path = _compat_path(manifest, "mem0_dump")
-    mem0_entry = _source_catalog_entry(
-        manifest,
-        source_id="mem0_dump",
-        source_class="semantic_recall",
-        label="Mem0 Dump",
-        path=str(mem0_dump_path),
-        trust_tier="semantic_recall",
-        freshness_policy=_source_freshness_policy(manifest, source_class="semantic_recall", source_id="mem0_dump"),
-        source={"id": "mem0_dump", "lane": "decisions"},
-        exists=mem0_dump_path.exists(),
-    )
+    mem0_entries = []
+    if mem0_enabled(manifest):
+        mem0_dump_path = _compat_path(manifest, "mem0_dump")
+        mem0_entries.append(_source_catalog_entry(
+            manifest,
+            source_id="mem0_dump",
+            source_class="semantic_recall",
+            label="Mem0 Dump",
+            path=str(mem0_dump_path),
+            trust_tier="semantic_recall",
+            freshness_policy=_source_freshness_policy(manifest, source_class="semantic_recall", source_id="mem0_dump"),
+            source={"id": "mem0_dump", "lane": "decisions"},
+            exists=mem0_dump_path.exists(),
+        ))
     latest_projection = _latest_projection_row(manifest)
     projection_entry = _source_catalog_entry(
         manifest,
@@ -932,7 +938,7 @@ def build_sources_audit(
 
     freshness = build_freshness_audit(manifest, domain_id=domain_id)
     lane_summary: dict[str, dict[str, Any]] = {}
-    all_entries = [*attach_catalog, *runtime_catalog, mem0_entry, projection_entry]
+    all_entries = [*attach_catalog, *runtime_catalog, *mem0_entries, projection_entry]
     for entry in all_entries:
         lane_id = entry["lane"]
         lane_contract = _lane_contracts(manifest).get(lane_id, {"label": lane_id.replace("_", " ").title(), "sensitive": False})
@@ -1168,7 +1174,7 @@ def build_freshness_audit(
         attach_sources.append(annotated)
 
     runtime_evidence = _runtime_evidence_rows(manifest)
-    mem0_dump = _annotate_freshness_row(
+    mem0_dump = {"enabled": False} if not mem0_enabled(manifest) else _annotate_freshness_row(
         mem0_meta(manifest),
         source_class="semantic_recall",
         trust_tier="semantic_recall",
@@ -1259,7 +1265,9 @@ def build_freshness_audit(
                 )
             )
 
-    if not mem0_dump.get("exists"):
+    if mem0_dump.get("enabled") is False:
+        pass  # the installation runs without Mem0: no dump to expect
+    elif not mem0_dump.get("exists"):
         issues.append(
             _freshness_issue(
                 "warn",
@@ -1721,7 +1729,8 @@ def build_startup_bundle(
                          }]
 
     # 8. Mem0 hits (from snapshot, no duplication)
-    mem0_dump_hits = {} if (focus or project or task_id) else snapshot.get("mem0_snapshot_hits", {})
+    mem0_dump_hits = {} if (focus or project or task_id or not mem0_enabled(manifest)) else snapshot.get(
+        "mem0_snapshot_hits", {})
 
     # 9. DB summary
     with open_connection(config) as connection:
@@ -1928,7 +1937,7 @@ def build_normalized_entities(
             )
 
     for system_name in ("chronicle", "mem0"):
-        if system_name == "mem0" and not agents_enabled:
+        if system_name == "mem0" and not (agents_enabled and mem0_enabled(manifest)):
             continue
         if system_name == "chronicle" and not decisions_enabled:
             continue
@@ -2140,7 +2149,8 @@ def record_event(
             for kind, count in found.items():
                 redactions[kind] = redactions.get(kind, 0) + count
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
-    resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind)
+    resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind,
+                                               mem0=mem0_enabled(manifest))
     if resolved_mem0_status is not None:
         normalized_entry["mem0_status"] = resolved_mem0_status
 
@@ -2576,6 +2586,8 @@ def backfill_mem0_queue(
 ) -> dict[str, Any]:
     config = _config(manifest)
     requeued: list[dict[str, Any]] = []
+    if not mem0_enabled(manifest):
+        return {"status": "disabled", "dry_run": dry_run, "requeued_count": 0, "requeued": []}
 
     with open_connection(config) as connection, connection:
         rows = connection.execute(
@@ -3046,8 +3058,8 @@ def query_context(
 
     mem0_hits: list[dict[str, Any]] = []
     mem0_meta = None
-    mem0_path = _compat_path(manifest, "mem0_dump")
-    if mode != "truth_only" and mem0_path.exists():
+    mem0_path = _compat_path(manifest, "mem0_dump") if mem0_enabled(manifest) else None
+    if mode != "truth_only" and mem0_path is not None and mem0_path.exists():
         mem0_hits = search_mem0_dump(mem0_path, query, limit)
         mem0_meta = {
             "path": str(mem0_path),
@@ -3292,6 +3304,8 @@ def search_mem0_live_service(
     ``{"status": "degraded", ...}`` with ``results=[]`` — never raises, so
     callers can trust Chronicle's own answers regardless of Mem0 health.
     """
+    if not mem0_enabled(manifest):
+        return {"status": "disabled", "reason": "[mem0] enabled = false", "results": []}
     if not feature_enabled(ENV_FEATURE_MEM0_LIVE_SEARCH):
         return {
             "status": "disabled",

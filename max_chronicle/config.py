@@ -121,6 +121,22 @@ def feature_enabled(env_name: str, *, default: bool = True) -> bool:
     return default
 
 
+def mem0_enabled(manifest: dict | None) -> bool:
+    """Whether this installation runs the optional Mem0 layer.
+
+    ``[mem0] enabled`` decides; without it, the layer is on when the manifest
+    names a bridge (``paths.mem0_bridge``), as before the switch existed. Off,
+    Chronicle queues nothing for Mem0, reads no Mem0 dump, and neither runs nor
+    checks the Mem0 jobs; the rows it queued earlier stay as they are.
+    """
+    section = (manifest or {}).get("mem0")
+    if isinstance(section, dict) and "enabled" in section:
+        if not isinstance(section["enabled"], bool):
+            raise ValueError("[mem0] enabled must be true or false")
+        return section["enabled"]
+    return bool(((manifest or {}).get("paths") or {}).get("mem0_bridge"))
+
+
 def env_float(env_name: str, *, default: float) -> float:
     raw = os.environ.get(env_name)
     if raw is None:
