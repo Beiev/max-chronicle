@@ -260,12 +260,30 @@ serves a whole note; `chronicle notes status` counts what the index holds.
 | `record_event` | Attributed observation, evidence, optional checkpoint or explicit fact. |
 | `capture_snapshot` | Archive runtime state and update readable projections. |
 | `entity_admin` | Report, normalize, alias, or merge entities. |
-| `search_mem0_live` | Optional external semantic mirror through an operator-supplied bridge. |
+| `search_mem0_live` | Optional external semantic mirror through an operator-supplied bridge; absent without Mem0. |
 
 `chronicle-mcp-readonly` exposes only read surfaces. The deprecated `activate_agent`
 alias remains compatible. Failures set MCP `isError` and carry a JSON envelope
 with `error_type`, `retryable`, and `hint`; follow that hint. A committed snapshot
 can separately report `side_effect_errors` for failed evidence/projection outputs.
+
+### Without Mem0
+
+The Mem0 mirror is optional. It is on when the manifest names a bridge
+(`paths.mem0_bridge`), unless the manifest turns it off:
+
+```toml
+[mem0]
+enabled = false
+```
+
+Off, new events are not queued for Mem0, the daily capture syncs nothing, the
+`mem0-dump` job ends as `skipped` without calling the bridge, `query_context` and
+snapshots read no Mem0 dump, `search_mem0_live` is not offered, the MCP
+instructions do not mention Mem0, and audits report no Mem0 backlog or stale dump.
+`chronicle launchd install` and `chronicle launchd doctor` leave the `mem0-dump` job out. Rows
+queued before stay as they are. To keep what Mem0 held, export it as notes the
+index reads (FR-10).
 
 ## Recall and durability
 
@@ -404,7 +422,7 @@ Agents / CLI / MCP
         |--- recall.py       scoped lexical/vector ranking
         |--- store.py        SQLite transactions and archived evidence
         |
-   SQLite (schema 10) + content-addressed files
+   SQLite (schema 15) + content-addressed files
         |--- Markdown projections
         |--- optional Mem0 mirror
 ```

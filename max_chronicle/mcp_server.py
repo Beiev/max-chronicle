@@ -28,7 +28,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 
 from . import __version__
 
-from .config import EXIT_CONFIG_ERROR, EXIT_SCHEMA_ACTION, ChronicleConfigError, default_manifest_path
+from .config import EXIT_CONFIG_ERROR, EXIT_SCHEMA_ACTION, ChronicleConfigError, default_manifest_path, mem0_enabled
 from .db import MigrationError
 from .runtime_context import load_manifest, load_manifest_cached, parse_when
 from .brief import BRIEF_DEFAULT_CHARS, build_brief
@@ -341,6 +341,13 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def manifest() -> dict:
         return load_manifest_cached(resolved_manifest_path)
 
+    # Whether Mem0 shows in the tools and instructions is decided when the
+    # server is built; the services check the manifest on every call.
+    try:
+        mem0_on = mem0_enabled(manifest())
+    except OSError:
+        mem0_on = True
+
     # Gate state: WeakSet of live session objects (pruned automatically when a
     # transport drops its session — the old id()-keyed set leaked forever and a
     # recycled memory address could spuriously unlock a fresh session). Tool
@@ -401,11 +408,13 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         name="Max Chronicle" if profile == CHRONICLER_PROFILE else "Max Chronicle Read Only",
         instructions=(
             "Chronicle is the canonical local-first memory system for this installation. "
-            "Use Chronicle DB as truth, status markdown as readable projections, and Mem0 as semantic recall. "
-            "Session protocol: call `startup_bundle` ONCE at session start — it returns the brief "
+            "Use Chronicle DB as truth, status markdown as readable projections"
+            + (", and Mem0 as semantic recall. " if mem0_on else ". ")
+            + "Session protocol: call `startup_bundle` ONCE at session start — it returns the brief "
             "and unlocks the write surface (read tools work without it but do not unlock). "
-            "Recall: `query_memory` is the primary search; `query_context` adds status-markdown and "
-            "mem0-dump context; `recent_events` is the cheap latest-N feed; `state_at` reconstructs "
+            "Recall: `query_memory` is the primary search; `query_context` adds status-markdown "
+            + ("and mem0-dump context" if mem0_on else "context") + "; "
+            "`recent_events` is the cheap latest-N feed; `state_at` reconstructs "
             "a moment in time. Write durable facts with `record_event`; use `entity_admin` for entity maintenance. "
             "Task handoffs: Use the same project/task_id across agents. Startup returns "
             "task_context (checkpoint, current_facts, changes, cursor); since resumes its change feed, "
@@ -899,6 +908,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                     "mem0_status": default_mem0_status(
                         {"category": category},
                         source_kind="chronicle_mcp",
+                        mem0=mem0_enabled(manifest()),
                     ),
                     "mem0_error": None,
                     "mem0_raw": None,
@@ -1032,31 +1042,32 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                 return {**result, "action": "merge"}
             raise ValueError(f"Unknown entity_admin action: {action}")
 
-        @register_tool(
-            writes=False,
-            open_world=True,
-            name="search_mem0_live",
-            description=(
-                "Live semantic search over the external Mem0 stack through the bridge script the manifest names. "
-                "Fail-closed: timeouts, non-zero exits, or unparseable output return status='degraded' with "
-                "results=[] instead of raising, so Chronicle stays usable when Mem0 is down."
-            ),
-        )
-        def tool_search_mem0_live(
-            query: Annotated[str, Field(description="Semantic query text.")],
-            limit: Annotated[int, Field(ge=1, le=100, description="Max results (1–100, default 10).")] = 10,
-            collection: Annotated[Literal["personal", "digest", "both"], Field(description="Which Mem0 collection to query.")] = "personal",
-            category: Annotated[str | None, Field(description="Optional metadata.category filter.")] = None,
-            timeout_s: Annotated[float | None, Field(gt=0, le=120, description="Override bridge timeout (seconds, at most 120).")] = None,
-        ) -> dict:
-            return search_mem0_live_service(
-                manifest(),
-                query=query,
-                limit=limit,
-                collection=collection,
-                category=category,
-                timeout_s=timeout_s,
+        if mem0_on:  # the live Mem0 search exists only while the installation runs Mem0
+            @register_tool(
+                writes=False,
+                open_world=True,
+                name="search_mem0_live",
+                description=(
+                    "Live semantic search over the external Mem0 stack through the bridge script the manifest names. "
+                    "Fail-closed: timeouts, non-zero exits, or unparseable output return status='degraded' with "
+                    "results=[] instead of raising, so Chronicle stays usable when Mem0 is down."
+                ),
             )
+            def tool_search_mem0_live(
+                query: Annotated[str, Field(description="Semantic query text.")],
+                limit: Annotated[int, Field(ge=1, le=100, description="Max results (1–100, default 10).")] = 10,
+                collection: Annotated[Literal["personal", "digest", "both"], Field(description="Which Mem0 collection to query.")] = "personal",
+                category: Annotated[str | None, Field(description="Optional metadata.category filter.")] = None,
+                timeout_s: Annotated[float | None, Field(gt=0, le=120, description="Override bridge timeout (seconds, at most 120).")] = None,
+            ) -> dict:
+                return search_mem0_live_service(
+                    manifest(),
+                    query=query,
+                    limit=limit,
+                    collection=collection,
+                    category=category,
+                    timeout_s=timeout_s,
+                )
 
     @register_prompt(
         name="activate",

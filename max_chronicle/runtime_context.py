@@ -11,7 +11,7 @@ from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
-from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION
+from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION, mem0_enabled
 from .db import utc_now  # re-exported: one timestamp format for the whole package
 from .identity import DomainMap, Names
 from .lexical import fold, query_terms
@@ -491,9 +491,11 @@ def build_runtime_snapshot(
     domain = manifest["domain_map"][domain_id]
     paths = manifest["paths"]
     mem0_hits: dict[str, list[dict[str, Any]]] = {}
-    mem0_dump_path = expand_path(paths["mem0_dump"])
-    for query in domain.get("mem0_queries", []):
-        mem0_hits[query] = search_mem0_dump(mem0_dump_path, query, 2)
+    mem0 = mem0_enabled(manifest)
+    if mem0:
+        mem0_dump_path = expand_path(paths["mem0_dump"])
+        for query in domain.get("mem0_queries", []):
+            mem0_hits[query] = search_mem0_dump(mem0_dump_path, query, 2)
 
     # Repo paths are optional: retiring a project means deleting its entry from
     # the manifest, and a snapshot must not hard-fail on a key that is simply
@@ -520,7 +522,7 @@ def build_runtime_snapshot(
         "source_freshness": source_freshness(manifest, domain["source_ids"]),
         "source_excerpts": build_source_excerpts(manifest, domain_id),
         "recent_ledger": recent_events[:8],
-        "mem0_dump": mem0_meta(manifest),
+        "mem0_dump": mem0_meta(manifest) if mem0 else {"enabled": False},
         "mem0_snapshot_hits": mem0_hits,
         "portfolio_assets": summarize_asset_manifest(expand_path(paths["portfolio_asset_manifest"])) if paths.get("portfolio_asset_manifest") else {},
         "repos": repos,
@@ -528,6 +530,7 @@ def build_runtime_snapshot(
 
 
 def render_activation_prompt(snapshot: dict[str, Any]) -> str:
+    mem0 = (snapshot.get("mem0_dump") or {}).get("enabled") is not False  # a snapshot says when Mem0 is off
     portfolio = snapshot["portfolio_assets"]
     recent_ledger = snapshot["recent_ledger"][:5]
 
@@ -557,7 +560,8 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "Operating contract:",
         "- Treat `chronicle.db` as canonical truth.",
         "- Treat `status/` as the authoritative readable structure and operator-facing view.",
-        "- Treat `Mem0` and `mem0-dump.json` as derived semantic recall layers, not as truth.",
+        *(["- Treat `Mem0` and `mem0-dump.json` as derived semantic recall layers, not as truth."]
+          if mem0 else []),
         "- Treat `ssot-ledger.jsonl` and `chronicle-snapshots.jsonl` as compatibility logs; write through tools, not by hand.",
         "- Communicate in Russian. Write code and commits in English.",
         "- Prefer incremental shipping over rebuilding systems.",
@@ -568,7 +572,8 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "- At session start, load the activation context before making assumptions.",
         "- During work, record durable decisions, blockers, state changes, and rationale with `why`.",
         "- Before context switches, handoff, or thread end, capture a timestamped snapshot.",
-        "- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later.",
+        *(["- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later."]
+          if mem0 else []),
         "",
         "Current task:",
         f"- Focus: {snapshot.get('focus') or 'Read current project context before choosing work.'}",

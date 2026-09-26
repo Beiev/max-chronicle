@@ -19,7 +19,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .automation import AutomationConfig, ensure_automation_dirs, load_automation_config, load_env_file, repo_by_slug, repo_slug_for_path
-from .config import default_automation_path, feature_enabled
+from .config import default_automation_path, feature_enabled, mem0_enabled
 from .runtime_context import expand_path, read_json, utc_now
 from .service import backfill_mem0_queue, build_freshness_audit, capture_runtime_snapshot, embed_backfill, record_event, repair_mem0_state, ENV_FEATURE_EVENT_EMBEDDINGS
 from .store import (
@@ -73,6 +73,14 @@ def launchd_labels(automation) -> dict[str, str]:
     """
     prefix = getattr(automation, "launchd_label_prefix", "com.chronicle")
     return {key: f"{prefix}.chronicle.{suffix}" for key, suffix in LAUNCHD_JOB_SUFFIXES.items()}
+
+
+def _installed_jobs(manifest: dict[str, Any], automation) -> dict[str, str]:
+    """The launchd jobs this installation runs: without Mem0, no Mem0 dump."""
+    labels = launchd_labels(automation)
+    if not mem0_enabled(manifest):
+        labels.pop("mem0_dump", None)
+    return labels
 
 MEM0_OUTBOX_PRUNE_AFTER_DAYS = 30
 MEM0_OUTBOX_PRUNE_BATCH = 5000
@@ -254,6 +262,8 @@ def _run_mem0_dump(
     trigger_source: str,
     automation_run_id: str | None = None,
 ) -> dict[str, Any]:
+    if not mem0_enabled(manifest):
+        return {"status": "skipped", "reason": "[mem0] enabled = false", "trigger_source": trigger_source}
     _maybe_load_env(automation)
     config = config_from_manifest(manifest)
     dump_path = expand_path(manifest["paths"]["mem0_dump"])
@@ -548,6 +558,9 @@ def sync_mem0_outbox(
 ) -> dict[str, Any]:
     config = config_from_manifest(manifest)
     batch_limit = limit or automation.guards.mem0_sync_batch_size
+    if not mem0_enabled(manifest):
+        return {"status": "disabled", "reason": "[mem0] enabled = false", "trigger_source": trigger_source,
+                "requested_limit": batch_limit, "seen": 0, "synced": 0, "failed": 0, "skipped": 0, "processed": []}
     entries = fetch_mem0_outbox_entries(config, limit=batch_limit)
     synced = 0
     failed = 0
@@ -2101,11 +2114,16 @@ def _evaluate_audit(
     latest_projection = fetch_latest_projection_run(config)
     latest_backup = fetch_latest_backup_run(config, successful_only=True)
     backup_target_available = automation.backup_root.exists()
-    pending_mem0 = count_mem0_outbox(config, status="pending")
-    failed_mem0 = count_mem0_outbox(config, status="failed")
     freshness_audit = build_freshness_audit(manifest, domain_id="memory" if "memory" in manifest["domain_map"] else "global")
-    mem0_state_drift = repair_mem0_state(manifest, dry_run=True)
-    mem0_queue_backfill = backfill_mem0_queue(manifest, dry_run=True)
+    if mem0_enabled(manifest):
+        pending_mem0 = count_mem0_outbox(config, status="pending")
+        failed_mem0 = count_mem0_outbox(config, status="failed")
+        mem0_state_drift = repair_mem0_state(manifest, dry_run=True)
+        mem0_queue_backfill = backfill_mem0_queue(manifest, dry_run=True)
+    else:  # rows queued before Mem0 was switched off are no backlog
+        pending_mem0 = failed_mem0 = 0
+        mem0_state_drift = {"repaired_count": 0, "repaired": []}
+        mem0_queue_backfill = {"requeued_count": 0, "requeued": []}
     legacy_surface_findings = _legacy_surface_findings(manifest)
 
     if not latest_snapshot:
@@ -2655,7 +2673,7 @@ def install_launchd(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     installed: list[dict[str, Any]] = []
-    for key, label in launchd_labels(automation).items():
+    for key, label in _installed_jobs(manifest, automation).items():
         wrapper_path = runtime_dir / f"{key}.sh"
         _write_executable_script(wrapper_path, _launchd_wrapper(manifest, automation, key.replace("_", "-")))
 
@@ -2747,7 +2765,7 @@ def doctor_launchd(
     timeout_seconds = _subprocess_timeout_seconds(automation)
     jobs: list[dict[str, Any]] = []
     issue_count = 0
-    for key, label in launchd_labels(automation).items():
+    for key, label in _installed_jobs(manifest, automation).items():
         plist_path = agent_dir / f"{label}.plist"
         wrapper_path = runtime_dir / f"{key}.sh"
         lint = (
