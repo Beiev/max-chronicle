@@ -221,8 +221,20 @@ def _prepare_migration_v8(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE events ADD COLUMN content_hash TEXT")
 
 
+def _prepare_migration_v14(connection: sqlite3.Connection) -> None:
+    """documents.index_version for 0014_documents_index_version, when it is missing.
+
+    Pre-release builds of 0013 differ: some created the column, some did not.
+    Adding it here only when absent upgrades both.
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(documents)")}
+    if "index_version" not in columns:
+        connection.execute("ALTER TABLE documents ADD COLUMN index_version INTEGER NOT NULL DEFAULT 0")
+
+
 _MIGRATION_PREHOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _prepare_migration_v8,
+    14: _prepare_migration_v14,
 }
 
 

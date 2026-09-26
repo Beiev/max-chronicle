@@ -321,10 +321,16 @@ can separately report `side_effect_errors` for failed evidence/projection output
   evidence file, or a generated text artifact (daybook, commit summary, audit
   report) is stored. It catches known key prefixes, values assigned to secret
   names, labelled keys (`key: <random>`), bearer and basic credentials, URL
-  passwords, private key blocks, and high-entropy tokens near a word such as
+  passwords, private keys, and high-entropy tokens near a word such as
   token, password, secret, or API key (anywhere on a short line, within 256
   characters on a long one). Hex digests, UUIDs, and pieces of long base64 runs
   (encoded images) never count as high-entropy tokens.
+  A private key is found by its BEGIN or END line, whatever wraps it (quotes,
+  lists, code fences, headings, any line ending). From BEGIN to the END of the
+  same kind, or to the end of the text when the key was cut short, every run of
+  16 or more base64 characters that could be key bytes is removed; words and hex
+  digests stay. A key body cut into pieces shorter than 16 characters is not
+  recognised.
   Identifiers such as `request_id` and paths are left as given, the source file is
   never modified, and binary evidence is archived unchanged. Not filtered yet:
   snapshot excerpts, legacy imports, and Mem0 responses. Time is linear in the

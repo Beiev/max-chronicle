@@ -1006,10 +1006,65 @@ def test_record_with_the_db_flag_and_no_paths_table_does_not_fail_after_writing(
     capsys.readouterr()
 
 
+
+# Fourth review of #14.
+
+
+def test_a_note_with_lone_carriage_returns_keeps_no_key(notes) -> None:
+    manifest, files = notes
+    block, body = _pem_block(8)
+    path = files["global"].with_name("old-mac.md")
+    path.write_bytes(("# Old Mac note\r\r## Box\rAccess:\r" + block.split("\n-----END")[0] + "\r").replace("\n", "\r")
+                     .encode())
+
+    sync_notes(manifest)
+
+    stored = _stored_text(manifest)
+    assert not any(line[:40] in stored for line in body)
+    assert [heading for heading, _ in _chunks(manifest, path)] == ["Old Mac note › Box"]
+
+
+def test_a_quoted_frontmatter_key_may_hold_a_colon(notes) -> None:
+    manifest, files = notes
+    path = files["global"].with_name("quoted.md")
+    path.write_text('---\n"external:id": 1\nname: Real title\n---\n# Body\nText.\n', encoding="utf-8")
+
+    sync_notes(manifest)
+
+    assert _documents(manifest)[str(path)]["title"] == "Real title"
+    assert "external" not in "".join(text for _, text in _chunks(manifest, path))
+
+
+@pytest.mark.parametrize("with_column", [False, True], ids=["0013-as-released", "0013-pre-release"])
+def test_both_builds_of_0013_upgrade(chronicle_sandbox, loaded_manifest, tmp_path, with_column) -> None:
+    from max_chronicle.config import MIGRATIONS_DIR
+    from max_chronicle.store import prepare_database
+
+    early = tmp_path / "migrations"
+    early.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:4]) <= 13:
+            sql = path.read_text(encoding="utf-8")
+            if with_column and path.name.startswith("0013"):
+                sql = sql.replace("redactions      INTEGER NOT NULL DEFAULT 0\n",
+                                  "redactions      INTEGER NOT NULL DEFAULT 0,\n    index_version   INTEGER NOT NULL DEFAULT 0\n")
+                assert "index_version" in sql
+            (early / path.name).write_text(sql, encoding="utf-8")
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(replace(config, migrations_dir=early)):
+        pass
+
+    prepare_database(config, allow_upgrade=True)
+
+    with open_connection(config) as connection:
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(documents)")]
+    assert columns.count("index_version") == 1
+
+
 # The parser and the secret filter, as indexed notes were made with them.
 # Changing either changes this digest: bump NOTE_INDEX_VERSION so every note
 # is indexed again, then record the new digest under the new version.
-INDEX_DIGESTS = {1: "5377d9f91bca60c960e5165678c9395fc538d8a311712b4038e72b101258ddd4"}
+INDEX_DIGESTS = {1: "f9eeb8b601a0e073ed95266fd734645932df286b7166377725d692a2549ba463"}
 
 
 def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:
@@ -1019,7 +1074,7 @@ def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:
     from max_chronicle import redaction
 
     parts = [inspect.getsource(redaction)] + [inspect.getsource(getattr(notes_module, name)) for name in (
-        "_frontmatter", "_is_key_line", "_split", "_in_code", "chunk_note", "_decode", "_first_title", "parse_note")]
+        "_frontmatter", "_key_value", "_is_key_line", "_split", "_in_code", "chunk_note", "_decode", "_first_title", "parse_note")]
     parts += [repr(getattr(notes_module, name)) for name in ("CHUNK_CHARS", "_HEADING", "_FENCE")]
     parts.append(repr(sorted(notes_module._BLOCK_SCALARS)))  # a set's order changes from run to run
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()

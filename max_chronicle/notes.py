@@ -299,22 +299,37 @@ def _frontmatter(text: str) -> tuple[dict[str, str], str]:
         if scalar_indent is not None and indent > scalar_indent:
             continue
         scalar_indent = None
-        key, sep, value = line.strip().partition(":")
-        value = value.strip()
-        if not sep or not key.strip():
+        pair = _key_value(line.strip())
+        if pair is None:
             continue
+        key, value = pair
         if value in _BLOCK_SCALARS:
             scalar_indent = indent
         elif value:
-            (top if indent == 0 else nested).setdefault(key.strip().strip("\"'"), value.strip("\"'"))
+            (top if indent == 0 else nested).setdefault(key, value.strip("\"'"))
     return nested | top, "\n".join(lines[end + 1:])
 
 
+def _key_value(line: str) -> tuple[str, str] | None:
+    """The key and value of a `key: value` line, the key bare or quoted; None for another line. Linear."""
+    quote = line[:1]
+    if quote in ("\"", "'"):
+        close = line.find(quote, 1)
+        if close < 0 or not line.startswith(":", close + 1):
+            return None
+        key, rest = line[1:close], line[close + 2:]
+    else:
+        key, sep, rest = line.partition(":")
+        if not sep:
+            return None
+    if not key.strip() or rest[:1] not in ("", " ", "\t"):
+        return None
+    return key.strip(), rest.strip()
+
+
 def _is_key_line(line: str) -> bool:
-    """Whether *line* is a top-level `key: value` or `key:` line of frontmatter; linear in its length."""
-    key, sep, rest = line.partition(":")
-    return (bool(sep) and bool(key.strip()) and not key[:1].isspace() and key[:1] not in "-#"
-            and (not rest or rest[:1] in " \t"))
+    """Whether *line* is a top-level `key: value` or `key:` line of frontmatter."""
+    return not line[:1].isspace() and line[:1] not in ("-", "#") and _key_value(line) is not None
 
 
 def _split(text: str, limit: int = CHUNK_CHARS) -> list[str]:
@@ -427,7 +442,8 @@ def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
     text = _decode(data)
     if text is None:
         raise NotText(str(path))
-    fields, body = _frontmatter(text)
+    # One line ending for the parser and the filter alike: a lone CR ends a line too.
+    fields, body = _frontmatter(text.replace("\r\n", "\n").replace("\r", "\n"))
     redactions = 0
 
     def clean(value: str | None) -> str | None:

@@ -2,7 +2,8 @@
 --
 -- A note indexed by an older parser or filter is indexed again on the next
 -- sync (notes.NOTE_INDEX_VERSION), so an improved filter reaches notes that did
--- not change. 0013 stays as first written: databases built with it get the
--- column here.
-
-ALTER TABLE documents ADD COLUMN index_version INTEGER NOT NULL DEFAULT 0;
+-- not change.
+--
+-- The column is documents.index_version INTEGER NOT NULL DEFAULT 0. SQLite has
+-- no ADD COLUMN IF NOT EXISTS, and pre-release builds of 0013 differ (some
+-- created the column), so db._prepare_migration_v14 adds it only when missing.

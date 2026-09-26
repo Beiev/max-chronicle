@@ -18,7 +18,7 @@ Current operational database version:
 
 - `PRAGMA user_version = 14`
 - latest applied migration: `0014_documents_index_version.sql`
-- next migration number: `0014`
+- next migration number: `0015`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.

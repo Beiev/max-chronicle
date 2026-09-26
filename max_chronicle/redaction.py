@@ -44,8 +44,6 @@ ENTROPY_CUE_REACH = 256  # how far from a cue a token may start or end in a long
 ENTROPY_MAX_TOKEN_LENGTH = 1024
 ASSIGNED_VALUE_MIN_LENGTH = 8
 VALUE_MAX_LENGTH = 4096
-PRIVATE_KEY_MAX_LENGTH = 16384
-PRIVATE_KEY_MAX_LINES = 512  # of a block cut before its END line
 _CHARACTER_CLASSES = ((r"[a-z]", 26), (r"[A-Z]", 26), (r"[0-9]", 10), (r"[\-_+]", 3))
 
 # Most specific first: an Anthropic or OpenRouter key also starts with "sk-".
@@ -73,36 +71,67 @@ _PREFIXED = tuple(
         ("telegram_bot_token", r"\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b"),
     )
 )
-# Private keys, whole or cut short. A BEGIN line starts a key; the block runs to
-# its END when real key material (a long base64 run) lies between, whatever
-# else does (JSON "\\n" escapes, code quotes, a heading pasted into it). With
-# no END, or only prose before it, the key is the BEGIN line and the lines a key
-# body holds after it: base64 of any length, PEM headers such as Proc-Type, and
-# blank lines, indented or ">"-quoted. The body stops at the first other line,
-# so prose after a mention of a key stays.
-_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
-_KEY_END = re.compile(r"-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
-_KEY_MATERIAL = re.compile(r"[A-Za-z0-9+/]{40}")
-_KEY_BODY = re.compile(
-    r"(?>[ \t]*[A-Za-z0-9+/=]+[ \t]*(?=\r?\n|\Z))?"  # base64 right after BEGIN, on its line
-    r"(?:\r?\n(?>[ \t>]*)(?>[A-Za-z][A-Za-z0-9-]*:[ \t]*[A-Za-z0-9+/=,.:-]*|[A-Za-z0-9+/=]*)(?>[ \t]*)"
-    r"(?=\r?\n|\Z)){0,%d}" % PRIVATE_KEY_MAX_LINES
+# Private keys, whole or cut short. A key's region runs from its BEGIN marker to
+# the END marker of the same kind, or to the end of the text when none follows;
+# an END with no BEGIN before it closes a region that starts where the text (or
+# the previous region) does. Line structure does not matter: the region loses
+# its markers and every piece of key material, however the key was wrapped,
+# quoted, indented, fenced, listed or cut. Key material is a run of base64
+# characters long enough to be key bytes, mixing at least two of lower case,
+# upper case and digits, and not a hexadecimal digest. Words and digests stay,
+# so prose after a mention of a key survives. Pieces with nothing but spaces or
+# punctuation between them become one marker.
+PRIVATE_KEY_MIN_PIECE = 16  # a key body cut into shorter pieces is not recognised
+_KEY_MARKER = re.compile(
+    r"-{0,5}[ \t]?\b(?P<edge>BEGIN|END)[ \t]{1,8}(?P<kind>(?:[A-Z0-9]{1,20}[ \t]{1,8}){0,3}?)"
+    r"PRIVATE[ \t]{1,8}KEY(?P<block>[ \t]{1,8}BLOCK)?(?:[ \t]?-{1,5})?"
 )
+_KEY_REGION_ITEM = re.compile(
+    _KEY_MARKER.pattern + r"|(?P<piece>[A-Za-z0-9+/=]{%d,})" % PRIVATE_KEY_MIN_PIECE
+)
+_HEXADECIMAL = re.compile(r"[0-9a-f]+|[0-9A-F]+")
+_LOWER, _UPPER, _DIGIT = re.compile(r"[a-z]"), re.compile(r"[A-Z]"), re.compile(r"[0-9]")
+_MARKER_GAP = re.compile(r"[^A-Za-z0-9]*")
+
+
+def _key_kind(marker: re.Match[str]) -> tuple[str, bool]:
+    return " ".join(marker.group("kind").split()), marker.group("block") is not None
+
+
+def _key_piece(run: str) -> bool:
+    """Whether a base64 run can be a piece of key bytes rather than a word or a digest."""
+    core = run.strip("=")
+    if len(core) < PRIVATE_KEY_MIN_PIECE or _HEXADECIMAL.fullmatch(core):
+        return False
+    return sum(bool(pattern.search(core)) for pattern in (_LOWER, _UPPER, _DIGIT)) >= 2
+
+
+def _redact_key_region(text: str, start: int, stop: int, mark: Callable[[str], str]) -> str:
+    """*text[start:stop]* without its key markers and key material; one marker per run of them."""
+    pieces, position, marked = [], start, False
+    for item in _KEY_REGION_ITEM.finditer(text, start, stop):
+        if item.group("piece") is not None and not _key_piece(item.group("piece")):
+            continue
+        gap = text[position:item.start()]
+        if not (marked and _MARKER_GAP.fullmatch(gap)):
+            pieces += [gap, mark("private_key")]
+        marked, position = True, item.end()
+    pieces.append(text[position:stop])
+    return "".join(pieces)
 
 
 def _redact_private_keys(text: str, mark: Callable[[str], str]) -> str:
     """Every private key in *text*, whole or cut short, replaced by a marker; linear in *text*."""
     pieces, position = [], 0
-    while (begin := _KEY_BEGIN.search(text, position)) is not None:
-        limit = min(len(text), begin.end() + PRIVATE_KEY_MAX_LENGTH)
-        following = _KEY_BEGIN.search(text, begin.end(), limit)
-        limit = following.start() if following else limit
-        end = _KEY_END.search(text, begin.end(), limit)
-        if end is not None and _KEY_MATERIAL.search(text, begin.end(), end.start()):
-            stop = end.end()
+    while (marker := _KEY_MARKER.search(text, position)) is not None:
+        if marker.group("edge") == "END":
+            start, stop = position, marker.end()  # the body of a key whose BEGIN was cut off
         else:
-            stop = _KEY_BODY.match(text, begin.end()).end()
-        pieces += [text[position:begin.start()], mark("private_key")]
+            kind = _key_kind(marker)
+            closing = next((end for end in _KEY_MARKER.finditer(text, marker.end())
+                            if end.group("edge") == "END" and _key_kind(end) == kind), None)
+            start, stop = marker.start(), closing.end() if closing else len(text)
+        pieces += [text[position:start], _redact_key_region(text, start, stop, mark)]
         position = stop
     return "".join(pieces) + text[position:]
 

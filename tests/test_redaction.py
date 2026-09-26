@@ -525,3 +525,54 @@ def test_encoded_blobs_are_archived_unchanged(loaded_manifest, tmp_path, monkeyp
     [evidence] = receipt["evidence"]
     assert "redactions" not in evidence
     assert evidence["sha256"] == hashlib.sha256(response.read_bytes()).hexdigest()
+
+
+# Fourth review of #14: a key's region loses its key material however the key is laid out.
+
+_OPENSSH_END = "-----END OPENSSH " + "PRIVATE KEY-----"
+
+
+def _layouts(body: list[str]) -> dict[str, str]:
+    pgp = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----"
+    return {
+        "space_after_begin": _BEGIN + " \n" + "\n".join(body),
+        "tab_crlf_after_begin": _BEGIN + "\t\r\n" + "\r\n".join(body),
+        "comment_header": _BEGIN + "\nComment: imported from backup\n" + "\n".join(body),
+        "lone_cr": _BEGIN + "\r" + "\r".join(body),
+        "code_fence": _BEGIN + "\n```\n" + "\n".join(body) + "\n```",
+        "list_items": "- " + _BEGIN + "\n" + "\n".join("- " + line for line in body),
+        "heading_inside": _BEGIN + "\n## inserted\n" + "\n".join(body),
+        "text_on_begin_line": _BEGIN + " pasted here\n" + "\n".join(body),
+        "pgp_version": pgp + "\nVersion: GnuPG v2\n\n" + "\n".join(body),
+        "past_any_line_limit": _BEGIN + "\n" + "\n".join(body * 70) + "\n",
+        "foreign_end_inside": _BEGIN + "\n" + "\n".join(body[:4]) + "\n" + _OPENSSH_END + "\n" + "\n".join(body[4:]) + "\n" + _END,
+        "begin_cut_off": "\n".join(body) + "\n" + _END,
+        "no_dashes": "BEGIN RSA " + "PRIVATE KEY\n" + "\n".join(body),
+    }
+
+
+@pytest.mark.parametrize("shape", list(_layouts(["x"])))
+def test_a_key_region_keeps_no_key_material(shape: str) -> None:
+    body = _key_body()
+    text = "Before.\n" + _layouts(body)[shape] + "\n"
+
+    result = redact(text)
+
+    assert not any(line[i:i + 16] in result.text for line in body for i in range(0, 49, 16))
+    assert result.text.startswith("Before.") and result.counts.get("private_key")
+
+
+def test_a_whole_key_is_one_marker() -> None:
+    result = redact("Before.\n" + _BEGIN + "\n" + "\n".join(_key_body()) + "\n" + _END + "\nAfter.\n")
+
+    assert (result.text, result.counts) == ("Before.\n[REDACTED:private_key]\nAfter.\n", {"private_key": 1})
+
+
+def test_words_and_digests_in_a_key_region_stay() -> None:
+    digest = hashlib.sha1(b"public-build").hexdigest()
+    text = ("## Format\nA key file starts with " + _BEGIN + ".\n\n## Deployment\nRun the deploy script, then check "
+            f"build {digest} and the documentation for troubleshooting.\n\n## Terminator\nIt ends with " + _END + ".\n")
+
+    result = redact(text).text
+
+    assert digest in result and "## Deployment\nRun the deploy script" in result and "troubleshooting" in result
