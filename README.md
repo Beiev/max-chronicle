@@ -361,7 +361,13 @@ knowledge updates, and latency percentiles, overall and per category and languag
 {"id": "why-sqlite", "query": "why did we pick SQLite", "category": "rationale", "lang": "en", "expected": ["event:<id>"], "scope": {"project": "demo"}}
 {"id": "db-now", "query": "current database", "category": "knowledge_update", "expected": ["event:<new>"], "stale": ["event:<old>"]}
 {"id": "unknown", "query": "office wifi password", "category": "abstention", "expected": []}
+{"id": "backup-rotation", "query": "how often do backups rotate", "category": "fact", "expected": ["note:~/notes/backups.md"]}
 ```
+
+A case expects events (`event:<id>`) or indexed notes (`note:<path>`), never both.
+Note cases are scored on the `notes` of the answer and ask recall for notes;
+event cases leave notes out, so their scores stay comparable across versions.
+The report adds a breakdown per surface.
 
 Categories follow LongMemEval: `fact`, `rationale`, `knowledge_update`, `temporal`,
 `handoff`, `abstention`. `--json` prints the full report, `--out` saves it, and
