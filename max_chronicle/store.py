@@ -3348,7 +3348,15 @@ def timeline_state(
     limit: int = 3,
     visibility: str = "default",
     detail: str = "digest",
+    as_of: bool = False,
 ) -> dict[str, Any]:
+    """Snapshots and events around *target*, or, *as_of*, what Chronicle knew at *target*.
+
+    Around: the nearest snapshots and the events within the window on either
+    side. As of: snapshots taken by then, events of the window before it that
+    the server had received by then (their first observation), and the facts
+    that were current then, retired since or not.
+    """
     if detail not in ("digest", "full"):
         raise ValueError(f"detail must be 'digest' or 'full', got {detail!r}")
     resolved_visibility = _normalize_event_visibility(visibility)
@@ -3356,6 +3364,16 @@ def timeline_state(
     snapshot_sql, snapshot_params = config.identities.scope(domain=domain).where(
         domain="domain", project="NULL", task="NULL")
     scope_sql, scope_params = _event_scope(config, domain=domain)
+    if as_of:
+        snapshot_sql += " AND unixepoch(captured_at_utc) <= unixepoch(?)"
+        snapshot_params = (*snapshot_params, target_utc)
+        window_sql = """unixepoch(e.occurred_at_utc) BETWEEN unixepoch(?) - ? AND unixepoch(?)
+              AND (SELECT MIN(unixepoch(ob.recorded_at_utc)) FROM event_observations AS ob
+                   WHERE ob.event_id = e.id) <= unixepoch(?)"""
+        window_params: tuple[Any, ...] = (target_utc, window_hours * 3600, target_utc, target_utc)
+    else:
+        window_sql = "ABS(unixepoch(e.occurred_at_utc) - unixepoch(?)) <= ?"
+        window_params = (target_utc, window_hours * 3600)
 
     with open_connection(config) as connection:
         snapshot_rows = connection.execute(
@@ -3393,12 +3411,13 @@ def timeline_state(
             LEFT JOIN mem0_outbox AS o
                 ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
-              AND ABS(unixepoch(e.occurred_at_utc) - unixepoch(?)) <= ?
+              AND """ + window_sql + """
               AND """ + scope_sql + """
             ORDER BY e.occurred_at_utc ASC
             """,
-            (resolved_visibility, target_utc, window_hours * 3600, *scope_params),
+            (resolved_visibility, *window_params, *scope_params),
         ).fetchall()
+        fact_rows = _facts_as_of(connection, config, target_utc, domain) if as_of else []
 
     snapshots: list[dict[str, Any]] = []
     for row in snapshot_rows:
@@ -3407,13 +3426,48 @@ def timeline_state(
         payload["delta_seconds"] = int(row["delta_seconds"])
         snapshots.append(payload if detail == "full" else digest_snapshot(payload))
 
-    return {
+    payload = {
         "target_utc": target_utc,
         "target_local": target.astimezone(ZoneInfo(config.timezone)).isoformat(timespec="seconds"),
         "domain": domain,
+        "mode": "as_of" if as_of else "around",
         "nearest_snapshots": snapshots,
         "events": [_event_row_to_entry(row) for row in event_rows],
     }
+    if as_of:
+        payload["facts"] = fact_rows
+    return payload
+
+
+FACTS_AS_OF_LIMIT = 50
+
+
+def _facts_as_of(connection: sqlite3.Connection, config: ChronicleConfig, target_utc: str,
+                 domain: str | None) -> list[dict[str, Any]]:
+    """The facts current at *target_utc*: recorded by then and not yet retired, newest first."""
+    scope_sql, scope_params = config.identities.scope(domain=domain).where(
+        domain="domain", project="json_extract(group_id,'$[0]')", task="json_extract(group_id,'$[1]')")
+    rows = connection.execute(
+        """SELECT id, domain, group_id, slot_key, value_key, attributes_json, attributed_to,
+                  recorded_at_utc, expired_at_utc
+           FROM facts
+           WHERE status NOT IN ('redacted', 'purged') AND """ + scope_sql + """
+             AND unixepoch(recorded_at_utc) <= unixepoch(?)
+             AND (expired_at_utc IS NULL OR unixepoch(expired_at_utc) > unixepoch(?))
+           ORDER BY recorded_at_utc DESC, row_id DESC
+           LIMIT ?""",
+        (*scope_params, target_utc, target_utc, FACTS_AS_OF_LIMIT),
+    ).fetchall()
+    facts = []
+    for row in rows:
+        project, task_id = (json.loads(row["group_id"]) + [None, None])[:2] if row["group_id"] else (None, None)
+        facts.append({
+            "id": row["id"], "domain": row["domain"], "project": project, "task_id": task_id,
+            "slot": row["slot_key"], "value": row["value_key"],
+            "kind": (_load_json(row["attributes_json"]) or {}).get("kind"), "agent": row["attributed_to"],
+            "recorded_at_utc": row["recorded_at_utc"], "retired_at_utc": row["expired_at_utc"],
+        })
+    return facts
 
 
 def update_event_memory_guard(

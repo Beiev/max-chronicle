@@ -228,6 +228,7 @@ def cmd_timeline(args: argparse.Namespace) -> int:
         domain=args.domain,
         window_hours=args.window_hours,
         limit=args.limit,
+        as_of=args.as_of,
     )
 
     if args.format == "json":
@@ -260,6 +261,14 @@ def cmd_timeline(args: argparse.Namespace) -> int:
                 print(f"  why: {row['why']}")
     else:
         print("- No events in the selected window.")
+    if "facts" in payload:
+        print()
+        print("## Facts Current Then")
+        for fact in payload["facts"]:
+            retired = f" (retired {fact['retired_at_utc']})" if fact["retired_at_utc"] else ""
+            print(f"- {fact['slot']} = {fact['value']} [{fact['kind']}]{retired}")
+        if not payload["facts"]:
+            print("- No facts were current then.")
     return 0
 
 
@@ -1023,6 +1032,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_timeline.add_argument("--domain", default=None, help="Optional domain filter")
     p_timeline.add_argument("--window-hours", type=int, default=6, help="Event window around the timestamp")
     p_timeline.add_argument("--limit", type=int, default=3, help="Number of nearest snapshots to show")
+    p_timeline.add_argument("--as-of", action="store_true",
+                            help="Only what was known at the timestamp, and the facts current then")
     p_timeline.add_argument("--format", choices=["text", "json"], default="text")
     p_timeline.set_defaults(handler=cmd_timeline)
 

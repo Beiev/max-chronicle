@@ -120,6 +120,13 @@ SNAPSHOT_DETAIL_ARG = Annotated[
         )
     ),
 ]
+TIMELINE_MODE_ARG = Annotated[
+    Literal["around", "as_of"],
+    Field(description=(
+        "around: the window on both sides of the timestamp. as_of: only what Chronicle knew at "
+        "the timestamp, plus the facts current then."
+    )),
+]
 QUERY_ARG = Annotated[str, Field(description="Search string matched across Chronicle events, status markdown sections and the Mem0 dump.")]
 RECALL_QUERY_ARG = Annotated[str, Field(description="What to recall: words or a question, in any language.")]
 QUERY_MODE_ARG = Annotated[
@@ -709,7 +716,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         description=(
             "Timeline archaeology: reconstruct what was true around an ISO timestamp "
             "(nearest snapshots + events in a window). Use for 'what was happening on <date>'; "
-            "for topic search use query_memory. Snapshots come back digested — their "
+            "for topic search use query_memory. mode='as_of' answers 'what did we know then': "
+            "only snapshots taken by then, events of the window before it that had been recorded "
+            "by then, and the facts current then. Snapshots come back digested — their "
             "capture-time copies of the ledger and of semantic recall are replaced by a "
             "count, since live recall serves those better; pass detail=\"full\" to get the "
             "stored payload verbatim (tens of KB per snapshot)."
@@ -721,6 +730,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         window_hours: WINDOW_HOURS_ARG = 6,
         limit: LIMIT_ARG = 3,
         detail: SNAPSHOT_DETAIL_ARG = "digest",
+        mode: TIMELINE_MODE_ARG = "around",
     ) -> dict:
         loaded = manifest()
         target = parse_when(timestamp, loaded)
@@ -731,6 +741,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             window_hours=window_hours,
             limit=limit,
             detail=detail,
+            as_of=mode == "as_of",
+            visibility="default",  # agents never see quarantined events; the operator's CLI does
         )
 
     @register_tool(

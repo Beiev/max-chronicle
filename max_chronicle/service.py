@@ -2085,7 +2085,10 @@ def reconstruct_timeline(
     window_hours: int = 6,
     limit: int = 3,
     detail: str = "digest",
+    as_of: bool = False,
+    visibility: str = "raw",
 ) -> dict[str, Any]:
+    """The timeline around *timestamp*; *visibility* "default" leaves quarantined (raw_only) events out."""
     config = _config(manifest)
     payload = timeline_state(
         config,
@@ -2093,8 +2096,9 @@ def reconstruct_timeline(
         domain=domain,
         window_hours=window_hours,
         limit=limit,
-        visibility="raw",
+        visibility=visibility,
         detail=detail,
+        as_of=as_of,
     )
     payload["contract_name"] = ACTIVATION_CONTRACT_NAME
     payload["contract_version"] = ACTIVATION_CONTRACT_VERSION

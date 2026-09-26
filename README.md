@@ -254,7 +254,7 @@ serves a whole note; `chronicle notes status` counts what the index holds.
 | `query_memory` | Scoped lexical/vector recall with provenance and coverage. |
 | `query_context` | Broader search through source documents and optional Mem0 dump. |
 | `recent_events` | Recent event history. |
-| `state_at` | Historical snapshots/events; `detail="full"` restores the full payload. |
+| `state_at` | Historical snapshots/events; `mode="as_of"` keeps only what was known then and adds the facts current then; `detail="full"` restores the full payload. |
 | `sources_audit` | Source coverage, freshness, and trust metadata. |
 | `record_event` | Attributed observation, evidence, optional checkpoint or explicit fact. |
 | `capture_snapshot` | Archive runtime state and update readable projections. |
@@ -379,6 +379,7 @@ chronicle startup --project demo --task-id ship --focus "Continue review" --form
 chronicle query-memory "local storage" --project demo --task-id ship --format json
 chronicle eval --golden questions.jsonl --out results/baseline.json
 chronicle timeline --at "2026-09-15T12:00:00Z"
+chronicle timeline --at "2026-09-15T12:00:00Z" --as-of   # what was known then
 chronicle backup --force
 ```
 
