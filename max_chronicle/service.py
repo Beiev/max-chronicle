@@ -1656,8 +1656,9 @@ def build_startup_bundle(
     recent_events = fetch_recent_events(config, limit=limit, domain=domain_id)
     recall_status = None
     if focus:
+        # The bundle shows events only, so its confidence must come from events too.
         recall = query_memory(manifest, query=focus, domain=domain_id, project=project,
-                              task_id=task_id, limit=limit)
+                              task_id=task_id, limit=limit, include_notes=False)
         recall_status = {key: recall[key] for key in (
             "degraded", "channel_errors", "vector_coverage", "relaxed", "no_confident_match", "hint",
         ) if key in recall}
@@ -2290,7 +2291,8 @@ def record_event(
     if category_fallback:
         stored["category_fallback"] = category_fallback
 
-    if append_compat and not existing:
+    # The JSONL ledger is optional: a manifest without paths.ledger_file keeps none.
+    if append_compat and not existing and (manifest.get("paths") or {}).get("ledger_file"):
         ledger_row = dict(stored)
         ledger_row["source_files"] = entry.get("source_files") or []
         ledger_row["mem0_status"] = entry.get("mem0_status")

@@ -206,6 +206,48 @@ built in; an `[[agents]]` entry with the same id replaces a built-in one. A
 session that never names its agent is attributed to its MCP client, such as
 `claude-code`.
 
+### Notes written on purpose
+
+Agents often keep durable notes as files, such as Claude's file memory. With a
+`[notes]` section in the manifest, Chronicle indexes them so every agent can
+recall them (FR-10):
+
+```toml
+[notes]
+paths = ["~/.claude/projects/*/memory/*.md"]  # absolute, or from ~
+exclude = ["*.bak-*", "*/_archive/*"]
+deny = ["*api-key*", "*keys.md"]  # never read, whatever they hold
+sync_minutes = 15                  # the long-running server re-syncs this often
+```
+
+`chronicle notes sync` re-indexes the changed notes, keeps a tombstone for a
+deleted one, and never writes to a note; the server runs the same sync every
+`sync_minutes`.
+
+- **Secrets.** The secret filter runs on each section of a note (text under one
+  heading) as a whole, before a long section is cut into pieces: a key is never
+  cut in two, and a pattern never spans two sections. Every other stored string
+  is filtered too. Built-in name patterns such as `*secret*`, `*credential*`,
+  `*private-key*`, `id_rsa*` and `*.pem` apply on top of `deny`. When the parser
+  or the filter changes, every note is indexed again.
+- **Files not read.** A file reached through a symbolic link below the fixed
+  part of a pattern, a file whose path holds a likely secret, and a file that is
+  not UTF-8 text are reported, not read. `**` never descends through a link,
+  and wildcards skip hidden files and folders.
+- **Removal.** A deleted or newly denied note keeps only its path as a
+  tombstone. The sync compacts the full-text index, deletes with
+  `secure_delete`, and empties the write-ahead log when no reader holds it;
+  until then the log may keep an older copy.
+- **Projects.** A note inside a project root, or in the file memory of a
+  directory inside that root, belongs to that project. In the file memory of a
+  directory under the workspace, it belongs to that workspace child's project.
+  Any other note is global.
+
+`query_memory` returns notes in `notes`, next to events in `results`: the best
+section of each note, with its heading, path and id. In a project scope, the
+project's own notes come before global ones. `chronicle://note/{document_id}`
+serves a whole note; `chronicle notes status` counts what the index holds.
+
 | Tool | Purpose |
 | --- | --- |
 | `startup_bundle` | Task context, checkpoint, current facts, change cursor; unlock writes. `mode="brief"`: only the brief. |
@@ -279,10 +321,24 @@ can separately report `side_effect_errors` for failed evidence/projection output
   evidence file, or a generated text artifact (daybook, commit summary, audit
   report) is stored. It catches known key prefixes, values assigned to secret
   names, labelled keys (`key: <random>`), bearer and basic credentials, URL
-  passwords, private key blocks, and high-entropy tokens near a word such as
+  passwords, private keys, and high-entropy tokens near a word such as
   token, password, secret, or API key (anywhere on a short line, within 256
   characters on a long one). Hex digests, UUIDs, and pieces of long base64 runs
   (encoded images) never count as high-entropy tokens.
+  Private keys are found by their BEGIN or END line (in any case, spacing or
+  escaping) or by their own bytes: PKCS#1, PKCS#8, SEC1, encrypted PKCS#8 and
+  PKCS#12 bodies, OpenSSH and OpenPGP secret keys, a PEM encoded again in base64
+  (Kubernetes secrets, cloud key downloads), X25519, Ed448 and X448 keys,
+  PuTTY key files, JWK private members (in any order, quoting or escaping),
+  .NET XML RSA keys, and `openssl ... -text` dumps. From that line on, the
+  markers go, colon-separated hex dumps go, every line that continues a key
+  goes (however its line breaks are escaped), and so does every run of 16 or
+  more base64 characters that reads as random bytes; words, paths, links,
+  assignments, hex digests, UUIDs and image data stay, and so does everything
+  before the key. A key body cut into pieces shorter than 16 characters and
+  interrupted by other text is not recognised, and a random-looking
+  identifier after a key (an SSH fingerprint, a random URL id) may be
+  removed with it.
   Identifiers such as `request_id` and paths are left as given, the source file is
   never modified, and binary evidence is archived unchanged. Not filtered yet:
   snapshot excerpts, legacy imports, and Mem0 responses. Time is linear in the

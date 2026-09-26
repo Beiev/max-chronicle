@@ -287,6 +287,76 @@ def test_a_value_under_any_secret_name_is_redacted_whole(key: str) -> None:
     assert counts == {"assigned_secret": 1}
 
 
+@pytest.mark.parametrize(("encrypted", "prefix"), [(True, ""), (False, "> "), (False, "")],
+                         ids=["pem-headers", "quoted", "plain"])
+def test_a_private_key_cut_before_its_end_line_is_redacted(encrypted: bool, prefix: str) -> None:
+    body = [_random(64) for _ in range(8)]
+    lines = ["-----BEGIN " + "RSA PRIVATE" + " KEY-----"]
+    if encrypted:
+        lines += ["Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC," + _random(32, "0123456789ABCDEF"), ""]
+    text = "The key as pasted:\n" + "\n".join(prefix + line for line in lines + body) + "\n\nThen rotate it.\n"
+
+    result = redact(text).text
+
+    assert not any(line in result for line in body)
+    assert result.startswith("The key as pasted:\n") and result.endswith("\nThen rotate it.\n")
+
+
+def _key_body(lines: int = 8) -> list[str]:
+    return [_random(64, ALNUM + "+/") for _ in range(lines)]
+
+
+_BEGIN = "-----BEGIN " + "RSA PRIVATE" + " KEY-----"
+_END = "-----END " + "RSA PRIVATE" + " KEY-----"
+
+
+@pytest.mark.parametrize("shape", ["long_line", "indented", "tabs", "on_begin_line"])
+def test_a_cut_private_key_is_redacted_in_any_layout(shape: str) -> None:
+    body = _key_body()
+    if shape == "long_line":
+        text = _BEGIN + "\n" + "".join(body) + "\n"
+    elif shape == "on_begin_line":
+        text = _BEGIN + "".join(body) + "\n"
+    else:
+        indent = " " * 12 if shape == "indented" else "\t" * 9
+        text = "\n".join([indent + _BEGIN, *(indent + line for line in body)]) + "\n"
+
+    result = redact("Pasted:\n" + text + "Then rotate it.\n").text
+
+    assert not any(line[8:40] in result for line in body)
+    assert result.endswith("Then rotate it.\n")
+
+
+@pytest.mark.parametrize("shape", ["heading_begin", "heading_inside", "json_escaped", "code_string", "pgp"])
+def test_a_whole_private_key_goes_whatever_surrounds_it(shape: str) -> None:
+    body = _key_body()
+    if shape == "heading_begin":
+        text = "## " + _BEGIN + "\n" + "\n".join(body) + "\n" + _END
+    elif shape == "heading_inside":
+        text = _BEGIN + "\n" + "\n".join(body[:4]) + "\n## Pasted in the middle\n" + "\n".join(body[4:]) + "\n" + _END
+    elif shape == "json_escaped":
+        text = '{"private_key": "' + _BEGIN + "\\n" + "\\n".join(body) + "\\n" + _END + '\\n"}'
+    elif shape == "code_string":
+        text = 'key = ("' + _BEGIN + '\\n"\n' + "\n".join(f'       "{line}\\n"' for line in body) + '\n       "' + _END + '")'
+    else:
+        begin, end = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----", "-----END PGP " + "PRIVATE KEY BLOCK-----"
+        text = begin + "\n\n" + "\n".join(body) + "\n" + end
+
+    result = redact("Before.\n" + text + "\nAfter.\n").text
+
+    assert not any(line[8:40] in result for line in body)
+    assert result.startswith("Before.") and result.endswith("After.\n")
+
+
+def test_prose_between_two_mentions_of_a_key_stays() -> None:
+    text = ("A key file starts with " + _BEGIN + " on its own.\n\n## Where it lives\n"
+            "The deploy key lives in the password manager entry farm.\n\nIt ends with " + _END + ".\n")
+
+    result = redact(text).text
+
+    assert "password manager entry farm" in result and "## Where it lives" in result
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -294,6 +364,12 @@ def test_a_value_under_any_secret_name_is_redacted_whole(key: str) -> None:
         "a." * 500_000,
         "a+" * 500_000,
         "-----BEGIN " + "PRIVATE KEY-----\n" * 40_000,
+        " " * 1_000_000,
+        "-----BEGIN " + "PRIVATE KEY-----" + " " * 1_000_000 + "x",
+        ("BEGIN " + " " * 50 + "A" + " " * 50) * 9_000,
+        "&nbsp;" * 170_000,
+        "-----BEGIN " + "PRIVATE KEY-----\n" + "\\" * 1_000_000,
+        ("\\/" + "Ab1" * 5) * 50_000 + "-----END " + "PRIVATE KEY-----",
         "api_key=" * 130_000,
         "https://a:" * 100_000,
         "ey" + "J" + "a" * 1_000_000,
@@ -311,6 +387,12 @@ def test_a_value_under_any_secret_name_is_redacted_whole(key: str) -> None:
         "dots",
         "pluses",
         "open-key-blocks",
+        "spaces",
+        "key-then-spaces",
+        "spaced-markers",
+        "html-spaces",
+        "backslashes",
+        "escaped-runs",
         "assignments",
         "url-schemes",
         "jwt-head",
@@ -455,3 +537,319 @@ def test_encoded_blobs_are_archived_unchanged(loaded_manifest, tmp_path, monkeyp
     [evidence] = receipt["evidence"]
     assert "redactions" not in evidence
     assert evidence["sha256"] == hashlib.sha256(response.read_bytes()).hexdigest()
+
+
+# Fourth review of #14: a key's region loses its key material however the key is laid out.
+
+_OPENSSH_END = "-----END OPENSSH " + "PRIVATE KEY-----"
+
+
+def _layouts(body: list[str]) -> dict[str, str]:
+    pgp = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----"
+    return {
+        "space_after_begin": _BEGIN + " \n" + "\n".join(body),
+        "tab_crlf_after_begin": _BEGIN + "\t\r\n" + "\r\n".join(body),
+        "comment_header": _BEGIN + "\nComment: imported from backup\n" + "\n".join(body),
+        "lone_cr": _BEGIN + "\r" + "\r".join(body),
+        "code_fence": _BEGIN + "\n```\n" + "\n".join(body) + "\n```",
+        "list_items": "- " + _BEGIN + "\n" + "\n".join("- " + line for line in body),
+        "heading_inside": _BEGIN + "\n## inserted\n" + "\n".join(body),
+        "text_on_begin_line": _BEGIN + " pasted here\n" + "\n".join(body),
+        "pgp_version": pgp + "\nVersion: GnuPG v2\n\n" + "\n".join(body),
+        "past_any_line_limit": _BEGIN + "\n" + "\n".join(body * 70) + "\n",
+        "foreign_end_inside": _BEGIN + "\n" + "\n".join(body[:4]) + "\n" + _OPENSSH_END + "\n" + "\n".join(body[4:]) + "\n" + _END,
+        "begin_cut_off": "\n".join(body) + "\n" + _END,
+        "no_dashes": "BEGIN RSA " + "PRIVATE KEY\n" + "\n".join(body),
+    }
+
+
+@pytest.mark.parametrize("shape", list(_layouts(["x"])))
+def test_a_key_region_keeps_no_key_material(shape: str) -> None:
+    body = _key_body()
+    text = "Before.\n" + _layouts(body)[shape] + "\n"
+
+    result = redact(text)
+
+    assert not any(line[i:i + 16] in result.text for line in body for i in range(0, 49, 16))
+    assert result.text.startswith("Before.") and result.counts.get("private_key")
+
+
+def test_a_whole_key_is_one_marker() -> None:
+    result = redact("Before.\n" + _BEGIN + "\n" + "\n".join(_key_body()) + "\n" + _END + "\nAfter.\n")
+
+    assert (result.text, result.counts) == ("Before.\n[REDACTED:private_key]\nAfter.\n", {"private_key": 1})
+
+
+def test_words_and_digests_in_a_key_region_stay() -> None:
+    digest = hashlib.sha1(b"public-build").hexdigest()
+    text = ("## Format\nA key file starts with " + _BEGIN + ".\n\n## Deployment\nRun the deploy script, then check "
+            f"build {digest} and the documentation for troubleshooting.\n\n## Terminator\nIt ends with " + _END + ".\n")
+
+    result = redact(text).text
+
+    assert digest in result and "## Deployment\nRun the deploy script" in result and "troubleshooting" in result
+
+
+# Fifth review of #14: a text bearing a key loses the key however the key is spelled or encoded.
+
+_PKCS1 = bytes.fromhex("308204a40201000282010100")
+_PKCS8 = bytes.fromhex("30820276020100300d06092a864886f70d0101010500048202")
+
+
+def _pem(label: str = "RSA ", prefix: bytes = _PKCS1, size: int = 1190) -> tuple[str, list[str]]:
+    body = base64.b64encode(prefix + random.randbytes(size - len(prefix))).decode()
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    begin, end = "-----BEGIN " + label + "PRIVATE" + " KEY-----", "-----END " + label + "PRIVATE" + " KEY-----"
+    return "\n".join([begin, *lines, end]) + "\n", lines
+
+
+def _spelled(pem: str) -> dict[str, str]:
+    marker = "PRIVATE" + " KEY"
+    return {
+        "nine_spaces": pem.replace("BEGIN ", "BEGIN" + " " * 9).replace("RSA " + marker, "RSA" + " " * 9 + marker),
+        "lower_case": pem.replace("BEGIN RSA " + marker, "begin rsa private key").replace("END RSA " + marker, "end rsa private key"),
+        "split_marker": pem.replace(marker, "PRIVATE\nKEY"),
+        "split_marker_crlf": pem.replace(marker, "PRIVATE\r\nKEY"),
+        "json_slashes": json.dumps({"data": pem}).replace("/", "\\/"),
+        "json_unicode_spaces": json.dumps({"data": pem}).replace(" ", "\\u0020"),
+        "html": pem.replace("/", "&#47;").replace(" ", "&nbsp;"),
+        "url_encoded": __import__("urllib.parse").parse.quote(pem, safe=""),
+        "base64url": pem.replace("+", "-").replace("/", "_"),
+        "early_quoted_end": pem.split("\n")[0] + "\nThe terminator is `" + pem.rstrip("\n").split("\n")[-1] + "`.\n\n"
+                            + "\n".join(pem.split("\n")[1:4]),
+        "no_markers": "\n".join(pem.split("\n")[1:-2]),
+    }
+
+
+@pytest.mark.parametrize("shape", list(_spelled(_pem()[0])))
+def test_a_key_goes_however_it_is_spelled_or_encoded(shape: str) -> None:
+    pem, lines = _pem()
+    text = "Keys:\n" + _spelled(pem)[shape] + "\nRotate them.\n"
+
+    result = redact(text).text
+    readable = __import__("urllib.parse").parse.unquote(result.replace("\\/", "/").replace("&#47;", "/"))
+
+    assert not any(line[i:i + 12] in readable for line in lines[:12] for i in range(len(line) - 11))
+    assert result.startswith("Keys:") and result.endswith("Rotate them.\n")
+
+
+@pytest.mark.parametrize("tail", [16, 12])
+def test_the_short_last_line_of_a_key_goes_with_it(tail: int) -> None:
+    size = {16: 634, 12: 631}[tail]  # base64 of these sizes ends in a line of `tail` characters with == padding
+    pem, lines = _pem("", _PKCS8, size)
+
+    result = redact("Export:\n" + pem).text
+
+    assert len(lines[-1]) == tail and lines[-1].endswith("==")
+    assert lines[-1] not in result and result == "Export:\n[REDACTED:private_key]\n"
+
+
+def test_a_mention_of_a_key_keeps_paths_links_names_and_images() -> None:
+    image = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + random.randbytes(600)).decode()
+    kept = ["/usr/local/bin/python3", "https://github.com/example/tool/commit/" + hashlib.sha1(b"c").hexdigest(),
+            "https://example.org/api/v1/conversations", "release20260926candidate1", image]
+    text = "A key file starts with " + "-----BEGIN " + "RSA PRIVATE" + " KEY-----" + ".\n\n" + "\n".join(kept) + "\n"
+
+    result = redact(text).text
+
+    assert all(item in result for item in kept)
+
+
+# Sixth review of #14: key formats known by their content, escaped line breaks, and what stays.
+
+_DER_STARTS = {  # structure only; the private bytes that follow are random
+    "pkcs12": "308209f2020103308209a806092a864886f70d010701a082",
+    "p384_pkcs8": "3081b6020100301006072a8648ce3d020106052b81040022",
+    "p384_sec1": "3081a40201010430",
+    "p384_pbes2": "30820124305f06092a864886f70d01050d3052303106092a",
+    "p521_pkcs8": "3081ee020100301006072a8648ce3d020106052b81040023",
+    "secp256k1_pkcs8": "308184020100301006072a8648ce3d020106052b8104000a",
+    "secp256k1_sec1": "30740201010420",
+    "secp256k1_pbes2": "3081f4305f06092a864886f70d01050d3052303106092a86",
+    "openpgp_secret": "c5c2d8046ab80dd8",
+}
+
+
+def _b64_lines(data: bytes, width: int = 64) -> list[str]:
+    body = base64.b64encode(data).decode()
+    return [body[i:i + width] for i in range(0, len(body), width)]
+
+
+@pytest.mark.parametrize("name", list(_DER_STARTS))
+def test_a_bare_key_body_is_known_by_its_first_bytes(name: str) -> None:
+    lines = _b64_lines(bytes.fromhex(_DER_STARTS[name]) + random.randbytes(300))
+    result = redact("Pasted:\n" + "\n".join(lines) + "\nDone.\n").text
+
+    assert not any(line[i:i + 12] in result for line in lines[1:] for i in range(len(line) - 11))
+    assert result.startswith("Pasted:\n") and result.endswith("Done.\n")
+
+
+def _ppk() -> tuple[str, list[str]]:
+    private = _b64_lines(random.randbytes(640))
+    text = ("PuTTY-User-Key-File-3: ssh-rsa\nEncryption: none\nComment: example\nPublic-Lines: 2\n"
+            + "\n".join(_b64_lines(random.randbytes(90))) + f"\nPrivate-Lines: {len(private)}\n" + "\n".join(private)
+            + "\nPrivate-MAC: " + random.randbytes(32).hex() + "\n")
+    return text, private
+
+
+def _jwk() -> tuple[str, list[str]]:
+    def member() -> str:
+        return base64.urlsafe_b64encode(random.randbytes(256)).decode().rstrip("=")
+
+    values = {name: member() for name in ("n", "d", "p", "q", "dp", "dq", "qi")}
+    return json.dumps({"kty": "RSA", "e": "AQAB", **values}, indent=2), [values[name] for name in ("d", "p", "q")]
+
+
+def _wrapped_pem() -> tuple[str, list[str]]:
+    pem, lines = _pem()
+    return base64.b64encode(pem.encode()).decode(), [base64.b64encode(pem.encode()).decode()[200:600]]
+
+
+@pytest.mark.parametrize("shape", ["ppk", "jwk", "kubernetes", "cloud_key_download", "non_image_data_uri"])
+def test_keys_in_other_formats_go(shape: str) -> None:
+    if shape == "ppk":
+        text, secrets_ = _ppk()
+    elif shape == "jwk":
+        text, secrets_ = _jwk()
+    elif shape == "kubernetes":
+        encoded, secrets_ = _wrapped_pem()
+        text = "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: " + encoded + "\n"
+    elif shape == "cloud_key_download":
+        pem, _ = _pem("", _PKCS8)
+        encoded = base64.b64encode(json.dumps({"type": "service_account", "private_key": pem}).encode()).decode()
+        text, secrets_ = json.dumps({"privateKeyData": encoded}), [encoded[300:700]]
+    else:
+        pem, lines = _pem()
+        text = "-----BEGIN RSA " + "PRIVATE KEY-----\ndata:application/octet-stream;base64," + "".join(lines) + "\n"
+        secrets_ = lines[2:6]
+
+    result = redact(text).text
+
+    assert not any(value[i:i + 16] in result for value in secrets_ for i in range(len(value) - 15))
+
+
+@pytest.mark.parametrize("wrap", ["json", "double_json", "toml", "html_br", "json_unicode", "html_named"])
+def test_every_line_of_a_key_goes_through_escaped_line_breaks(wrap: str) -> None:
+    pem, lines = _pem("", _PKCS8, 631)  # ends in a 12-character line
+    presented = {
+        "json": json.dumps({"key": pem}),
+        "double_json": json.dumps({"payload": json.dumps({"key": pem})}),
+        "toml": 'key = "' + pem.replace("\n", "\\n") + '"',
+        "html_br": pem.replace("\n", "<br>"),
+        "json_unicode": json.dumps({"key": pem}).replace("/", "\\u002f").replace("+", "\\u002b"),
+        "html_named": "<pre>" + pem.replace("/", "&sol;").replace("+", "&plus;").replace("=", "&equals;") + "</pre>",
+    }[wrap]
+
+    result = redact(presented).text
+
+    assert len(lines[-1]) == 12 and lines[-1].rstrip("=") not in result
+    assert not any(line[i:i + 12] in result for line in lines for i in range(len(line) - 11))
+
+
+def test_word_like_and_short_last_lines_go_with_their_key() -> None:
+    body = [line for line in _pem()[1][:-1]] + ["kQymwxFEVEFbtfpW"]
+    wrapped = [piece for line in body for piece in (line[i:i + 16] for i in range(0, len(line), 16))]
+    for lines in (body, wrapped):
+        result = redact("-----BEGIN RSA " + "PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA " + "PRIVATE KEY-----\n")
+        assert result.text == "[REDACTED:private_key]\n"
+
+
+def test_text_before_a_key_and_prose_between_its_parts_stay() -> None:
+    kept = ["/usr/lib/x86_64-linux-gnu", "/api/v1/users/123456", "CHRONICLE_DB=/tmp/demo.db",
+            "AWS_DEFAULT_REGION=us-east-1", "foo_bar_baz_quux_123", "01234567-89aB-cDef-0123-456789abcdef",
+            "A0b1C2d3E4f5A0b1C2d3E4f5A0b1C2d3E4f5A0b1"]
+    pem, lines = _pem()
+    head, tail = pem.split("\n", 5)[:5], pem.split("\n", 5)[5]
+    text = "\n".join(kept) + "\n\n" + "\n".join(head) + "\nЭто ключ продакшена, не трогать до ротации.\n" + tail
+
+    result = redact(text).text
+
+    assert all(item in result for item in kept) and "Это ключ продакшена, не трогать до ротации." in result
+    assert not any(line[i:i + 12] in result for line in lines for i in range(len(line) - 11))
+
+
+def test_a_long_run_of_zeros_in_an_entity_does_not_break_the_filter() -> None:
+    pem, _ = _pem()
+
+    assert "[REDACTED:private_key]" in redact(pem + "&#" + "0" * 5000 + "47;").text
+
+
+# Seventh review of #14: more real export formats, nested escaping, and text after a key.
+
+_DER_STARTS_7 = {  # structure only
+    "x25519": ("302e020100300506032b656e04220420", 32),
+    "ed448": ("3047020100300506032b6571043b0439", 57),
+    "x448": ("3046020100300506032b656f043a0438", 56),
+}
+
+
+@pytest.mark.parametrize("name", list(_DER_STARTS_7))
+def test_bare_modern_curve_keys_go(name: str) -> None:
+    start, size = _DER_STARTS_7[name]
+    body = base64.b64encode(bytes.fromhex(start) + random.randbytes(size)).decode()
+
+    result = redact("Pasted from the export:\n" + body + "\n").text  # no word that names a key
+
+    assert body[-20:] not in result and result.startswith("Pasted from the export:")
+
+
+def _jwk_members() -> dict[str, str]:
+    return {name: base64.urlsafe_b64encode(random.randbytes(128)).decode().rstrip("=")
+            for name in ("n", "p", "q", "dp", "dq", "qi", "d")}
+
+
+@pytest.mark.parametrize("shape", ["d_last", "double_json", "python_repr"])
+def test_a_jwk_goes_in_any_order_or_serialization(shape: str) -> None:
+    members = _jwk_members()
+    jwk = {"kty": "RSA", "e": "AQAB", **members}  # "d" comes last
+    text = {"d_last": json.dumps(jwk, indent=2), "double_json": json.dumps({"key": json.dumps(jwk)}),
+            "python_repr": repr(jwk)}[shape]
+
+    result = redact(text).text
+
+    assert not any(members[name][i:i + 16] in result for name in ("p", "q", "d") for i in range(0, 150, 16))
+
+
+def test_a_dotnet_xml_key_goes() -> None:
+    parts = {name: base64.b64encode(random.randbytes(128)).decode() for name in ("P", "Q", "DP", "DQ", "InverseQ", "D")}
+    text = ("<RSAKeyValue><Modulus>" + base64.b64encode(random.randbytes(256)).decode() + "</Modulus><Exponent>AQAB"
+            "</Exponent>" + "".join(f"<{name}>{value}</{name}>" for name, value in parts.items()) + "</RSAKeyValue>")
+
+    result = redact(text).text
+
+    assert not any(value[i:i + 16] in result for value in parts.values() for i in range(0, 150, 16))
+
+
+def test_an_openssl_text_dump_goes() -> None:
+    def dump(data: bytes) -> str:
+        pairs = [f"{byte:02x}" for byte in data]
+        return "\n".join("    " + ":".join(pairs[i:i + 15]) + ":" for i in range(0, len(pairs), 15))
+
+    secret = random.randbytes(256)
+    text = ("Private-Key: (2048 bit, 2 primes)\nmodulus:\n" + dump(random.randbytes(257)) + "\npublicExponent: 65537 "
+            "(0x10001)\nprivateExponent:\n" + dump(secret) + "\n")
+
+    result = redact(text).text
+
+    assert not any(f"{secret[i]:02x}:{secret[i + 1]:02x}:{secret[i + 2]:02x}" in result for i in range(0, 250, 5))
+    assert "publicExponent: 65537" in result
+
+
+def test_a_key_in_json_nested_in_json_goes() -> None:
+    pem, lines = _pem("", _PKCS8)
+    inner = json.dumps({"data": pem}).replace("+", "\\u002b").replace("/", "\\u002f")
+
+    result = redact(json.dumps({"message": inner})).text
+
+    assert not any(line[i:i + 12] in result for line in lines for i in range(len(line) - 11))
+
+
+def test_code_and_links_after_a_key_stay() -> None:
+    pem, _ = _pem()
+    kept = ["const client = new AWSKMSClientBuilder();", "class XMLHTTPRequestHandler:",
+            "https://example.invalid/docs/XMLHTTPRequestHandler", "https://api.example.com/v1/users/123456",
+            "git clone https://git.example.com/v1/api/v2/tool", "GET /v1/projects/42/instances/9"]
+
+    result = redact(pem + "\n" + "\n".join(kept) + "\n").text
+
+    assert all(item in result for item in kept)

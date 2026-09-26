@@ -62,6 +62,7 @@ from .store import (
     target_schema_version,
 )
 from .identity import UNKNOWN_AGENT, Registry
+from .notes import note_settings, read_note, sync_notes
 from .memory import Checkpoint, FactInput
 
 READ_ONLY_PROFILE = "readonly"
@@ -586,6 +587,14 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         return reconstruct_timeline(loaded, timestamp=target, domain=domain, window_hours=6, limit=3)
 
     @register_resource(
+        "chronicle://note/{document_id}",
+        title="Indexed Note",
+        description="The full indexed (redacted) text of a note that query_memory returned in `notes`.",
+    )
+    def resource_note(document_id: str) -> dict:
+        return read_note(manifest(), document_id) or {"status": "not_found", "document_id": document_id}
+
+    @register_resource(
         "chronicle://project/{project}",
         title="Project State",
         description="Recent events and relations for a project slug.",
@@ -728,7 +737,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         name="query_memory",
         description=(
             "PRIMARY recall — start here for 'what do we know about X'. Fuses full-text and vector "
-            "matches over Chronicle events; recency only breaks ties. Works offline on full text "
+            "matches over Chronicle events (`results`) and indexed notes (`notes`, the best section "
+            "of each; read a whole note at chronicle://note/{document_id}); recency only breaks ties. Works offline on full text "
             "when Ollama is down. `degraded` reports skipped channels, `relaxed` a weaker "
             "word-stem match, and `no_confident_match` that no result is a strong match: treat "
             "those results as leads and verify them. A weak or empty result does not prove the "
@@ -1095,7 +1105,10 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
     read_only = args.profile == READ_ONLY_PROFILE
     try:
         manifest_path = args.manifest or default_manifest_path()
-        config = config_from_manifest(load_manifest(manifest_path))
+        loaded = load_manifest(manifest_path)
+        config = config_from_manifest(loaded)
+        if not read_only and args.transport != "stdio":  # only such a server syncs notes
+            note_settings(loaded)  # a bad [notes] section stops the start, not the sync thread later
         prepared = prepare_database(config, allow_upgrade=args.migrate and not read_only, read_only=read_only)
     except (ChronicleConfigError, MigrationError, sqlite3.Error, OSError, ValueError) as exc:
         _LOGGER.error("chronicle-mcp cannot start: %s: %s", type(exc).__name__, exc)
@@ -1147,8 +1160,45 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         manifest_path,
         Path(__file__).resolve().parent,
     )
+    if not read_only and args.transport != "stdio":
+        _start_notes_sync(manifest_path)
     server.run(transport=args.transport)
     return 0
+
+
+NOTES_SYNC_FALLBACK_MINUTES = 15  # after a failed or unconfigured round
+
+
+def _start_notes_sync(manifest_path: Path) -> threading.Thread | None:
+    """Keep the note index fresh from a long-running server: sync now, then every [notes] sync_minutes.
+
+    A stdio server lives as long as one client and does not sync; `chronicle
+    notes sync` does the same by hand.
+    """
+    try:
+        minutes = note_settings(load_manifest(manifest_path)).sync_minutes
+    except (OSError, ValueError) as exc:
+        _LOGGER.error("notes sync not started: %s: %s", type(exc).__name__, exc)
+        return None
+    if not minutes:
+        return None
+
+    def loop() -> None:
+        minutes = 0
+        while True:
+            time.sleep(minutes * 60)
+            minutes = NOTES_SYNC_FALLBACK_MINUTES
+            try:
+                loaded = load_manifest_cached(manifest_path)
+                minutes = note_settings(loaded).sync_minutes or NOTES_SYNC_FALLBACK_MINUTES
+                report = sync_notes(loaded)
+                _LOGGER.info("notes sync: %s", {key: report[key] for key in ("indexed", "unchanged", "removed")})
+            except Exception:  # noqa: BLE001 - a failed sync must not stop the server or the next sync
+                _LOGGER.exception("notes sync failed")
+
+    thread = threading.Thread(target=loop, name="chronicle-notes-sync", daemon=True)
+    thread.start()
+    return thread
 
 
 def main() -> int:

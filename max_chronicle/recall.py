@@ -5,9 +5,11 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
+import struct
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .notes import recall_notes
 from .store import (
     _parse_iso,
     config_from_manifest,
@@ -18,6 +20,7 @@ from .store import (
     strict_matches,
 )
 
+NOTE_LIMIT = 5  # notes per recall, each its best section
 ENV_MIN_SIMILARITY = "CHRONICLE_VECTOR_MIN_SIMILARITY"
 ENV_CONFIDENT_SIMILARITY = "CHRONICLE_VECTOR_CONFIDENT_SIMILARITY"
 NO_CONFIDENT_MATCH_HINT = (
@@ -45,8 +48,13 @@ def query_memory(
     limit: int = 10,
     project: str | None = None,
     task_id: str | None = None,
+    include_notes: bool = True,
 ) -> dict[str, Any]:
     """Fuse relevant lexical/vector candidates; recency only breaks ties.
+
+    Events come back in ``results``. With ``include_notes``, indexed notes
+    (FR-10) come back in ``notes``, best section per note: they have no task
+    or domain, and in a project scope, global notes follow the project's.
 
     RRF scores are ranking signals, not confidence. A cosine floor (the active
     embedding profile's, or CHRONICLE_VECTOR_MIN_SIMILARITY) rejects weak
@@ -54,7 +62,7 @@ def query_memory(
     says ``no_confident_match`` unless a result holds every query term or
     reaches the profile's confident similarity (FR-2).
     """
-    from .embeddings import active_profile, cosine, embed_query, unpack_vector
+    from .embeddings import active_profile, embed_query, similarity_scorer, unpack_vector
     from .memory import event_provenance
 
     if not isinstance(query, str) or not query.strip():
@@ -98,6 +106,7 @@ def query_memory(
     compatible = [r for r in pool if r["vector"] is not None and len(r["vector"]) == r["dim"] * 4]
     similarities: dict[str, float] = {}
     vector_available = False
+    usable_query_vec: list[float] | None = None
     try:
         query_vec = embed_query(query)
         if query_vec is None:
@@ -105,6 +114,7 @@ def query_memory(
         elif not all(math.isfinite(x) for x in query_vec) or not any(query_vec):
             errors["vector"] = "invalid_query_embedding"
         else:
+            usable_query_vec = query_vec
             # A vector of another dimension (the model behind the key changed)
             # is incompatible: coverage counts it and embed-backfill replaces it.
             compatible = [r for r in compatible if r["dim"] == len(query_vec)]
@@ -113,12 +123,13 @@ def query_memory(
                 # still ranks what it holds, and coverage discloses the rest.
                 errors["vector"] = "embedding_index_empty"
             vector_available = bool(compatible)
+            score = similarity_scorer(query_vec)
             for row in compatible:
                 try:
                     vec = unpack_vector(row["vector"])
                     if not any(vec):
                         raise ValueError("zero vector")
-                    similarities[row["id"]] = cosine(query_vec, vec)
+                    similarities[row["id"]] = score(vec)
                 except (ValueError, TypeError) as exc:
                     errors["vector"] = f"invalid_stored_embedding: {exc}"
     except Exception as exc:
@@ -208,10 +219,28 @@ def query_memory(
         )
         for hit in results
     )
+    notes: list[dict[str, Any]] = []
+    if include_notes:
+        try:
+            found = recall_notes(config, query=query, project=project, query_vector=usable_query_vec,
+                                 threshold=threshold, limit=min(limit, NOTE_LIMIT))
+            notes = found["notes"]
+            relaxed = relaxed or found["relaxed"]
+            channels = channels + found["channels"]
+            # A note holding every query term, or close enough, is confident evidence too.
+            confident = confident or any(
+                note["chunk_id"] in found["strict"]
+                or (confident_floor is not None and note["channels"]["vector_similarity"] is not None
+                    and note["channels"]["vector_similarity"] >= confident_floor)
+                for note in notes
+            )
+        except (sqlite3.Error, ValueError, struct.error) as exc:  # the notes channel never breaks event recall
+            errors["notes"] = f"{type(exc).__name__}: {exc}"
     response = {
         "query": query,
         **scope,
         "results": results,
+        **({"notes": notes} if include_notes else {}),
         "relaxed": relaxed,
         "no_confident_match": not confident,
         "channels_used": channels,

@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import functools
 import hashlib
 import json
 import math
@@ -131,7 +132,10 @@ def run_eval(
 ) -> list[dict[str, Any]]:
     """Ask every case through recall and score the ranking it returns."""
     if recall is None:
-        from .recall import query_memory as recall
+        from .recall import query_memory
+
+        # The golden set scores event recall; indexed notes are ranked apart.
+        recall = functools.partial(query_memory, include_notes=False)
     details = []
     for case in cases:
         started = clock()

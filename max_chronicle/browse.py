@@ -6,8 +6,9 @@ fallback is used. No heavy dependencies are added — rich is optional.
 """
 from __future__ import annotations
 
-import textwrap
+from collections.abc import Iterator
 from pathlib import Path
+import textwrap
 from typing import Any
 
 try:
@@ -69,13 +70,28 @@ def render_search_results(payload: dict[str, Any]) -> None:
     """Print hybrid-recall results from query_memory in a ranked, scannable list."""
     query = payload.get("query") or ""
     results = payload.get("results") or []
+    notes = payload.get("notes") or []
     degraded = bool(payload.get("degraded"))
     channels = ", ".join(payload.get("channels_used") or [])
 
+    none = "no matching events." if notes else "no matches."
     if _RICH:
-        _render_search_rich(query, results, degraded, channels)
+        _render_search_rich(query, results, degraded, channels, none)
     else:
-        _render_search_plain(query, results, degraded, channels)
+        _render_search_plain(query, results, degraded, channels, none)
+    for line in _note_lines(notes):
+        print(line)
+
+
+def _note_lines(notes: list[dict[str, Any]]) -> Iterator[str]:
+    """Notes (FR-10) after the events: the best section of each, with the file it came from."""
+    if notes:
+        yield ""
+        yield "Notes:"
+    for rank, note in enumerate(notes, 1):
+        name = (note.get("path") or "").rsplit("/", 1)[-1]
+        yield f"n{rank:<3} {note.get('heading') or note.get('title') or '—'}  ({name})"
+        yield f"     {_trunc(note.get('text'), _TEXT_LIMIT)} | id: {note.get('document_id') or '—'}"
 
 
 def _render_search_plain(
@@ -83,13 +99,14 @@ def _render_search_plain(
     results: list[dict[str, Any]],
     degraded: bool,
     channels: str,
+    none: str = "no matches.",
 ) -> None:
     print(f"Search: {query!r}  channels: {channels or 'none'}")
     if degraded:
         print("  [degraded: vector channel skipped — Ollama may be down]")
     print()
     if not results:
-        print("  no matches.")
+        print(f"  {none}")
         return
     for rank, hit in enumerate(results, 1):
         date = _date_prefix(hit.get("occurred_at_local") or hit.get("occurred_at_utc"))
@@ -108,6 +125,7 @@ def _render_search_rich(
     results: list[dict[str, Any]],
     degraded: bool,
     channels: str,
+    none: str = "no matches.",
 ) -> None:
     console = Console()
     console.print(f"[bold]Search:[/bold] {query!r}  [dim]channels: {channels or 'none'}[/dim]")
@@ -115,7 +133,7 @@ def _render_search_rich(
         console.print("[yellow]  degraded: vector channel skipped — Ollama may be down[/yellow]")
     console.print()
     if not results:
-        console.print("[dim]  no matches.[/dim]")
+        console.print(f"[dim]  {none}[/dim]")
         return
     table = Table(
         box=rich_box.SIMPLE,
