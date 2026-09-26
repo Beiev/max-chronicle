@@ -188,3 +188,20 @@ def test_the_activation_prompt_leaves_mem0_out(without_mem0, loaded_manifest) ->
                                          capture=False)["prompt"]
 
     assert "Mem0" not in prompt and "replay later" in with_mem0
+
+
+def test_a_replayed_ledger_keeps_skipped_rows_out_of_mem0(chronicle_sandbox) -> None:
+    from max_chronicle import bootstrap
+
+    manifest = _with_mem0(load_manifest(chronicle_sandbox.manifest_path))
+    config = config_from_manifest(manifest)
+    config.ledger_path.write_text("".join(json.dumps(row) + "\n" for row in (
+        {"id": "kept-out", "text": "Local-only note", "domain": "global", "category": "note", "mem0_status": "skipped"},
+        {"id": "queued", "text": "Shared decision", "domain": "global", "category": "decision", "mem0_status": "queued"},
+    )), encoding="utf-8")
+
+    with open_connection(config) as connection, connection:
+        bootstrap.import_legacy_ledger(connection, config, queue_mem0=True)
+        rows = connection.execute("SELECT event_id FROM mem0_outbox ORDER BY event_id").fetchall()
+
+    assert [row[0] for row in rows] == ["queued"]

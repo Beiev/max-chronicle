@@ -177,7 +177,8 @@ def import_legacy_ledger(
                 ),
             )
 
-            if queue_mem0 and row.get("category"):
+            # A row Chronicle kept out of Mem0 (skipped or off) stays out on a replay.
+            if queue_mem0 and row.get("category") and row.get("mem0_status") not in {"off", "skipped"}:
                 outbox_status = "synced" if row.get("mem0_status") == "stored" else "pending"
                 payload = {
                     "text": row.get("text") or "",
