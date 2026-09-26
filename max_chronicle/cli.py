@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -41,7 +42,7 @@ from .native_automation import (
     run_git_commit_hook,
     sync_mem0_outbox,
 )
-from .runtime_context import load_manifest
+from .runtime_context import expand_path, load_manifest, read_toml
 from .service import (
     backfill_mem0_queue,
     build_activation,
@@ -119,11 +120,17 @@ def _with_db(manifest: dict[str, Any], db: Path | None) -> dict[str, Any]:
 
 
 def _config_from_args(args: argparse.Namespace) -> ChronicleConfig:
-    return default_config(
+    """The workspace config; without --db, the database the manifest names, as the server opens it."""
+    config = default_config(
         args.db,
         manifest_path=getattr(args, "manifest", None),
         automation_path=getattr(args, "automation_config", None),
     )
+    if args.db is None and config.manifest_path.is_file():
+        named = (read_toml(config.manifest_path).get("paths") or {}).get("chronicle_db")
+        if named:
+            config = replace(config, db_path=expand_path(str(named)))
+    return config
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
