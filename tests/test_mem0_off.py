@@ -70,8 +70,11 @@ def test_writes_queue_nothing_for_mem0(without_mem0) -> None:
     before = _record(_with_mem0(without_mem0), "Decided to move the gateway to port 9000 after the load test")
     after = _record(without_mem0, "Decided to keep the gateway on port 9000 for the next release")
 
+    with open_connection(config_from_manifest(without_mem0)) as connection:
+        rows = connection.execute("SELECT event_id, status FROM mem0_outbox").fetchall()
+
     assert (before["mem0_status"], after["mem0_status"]) == ("queued", "skipped")
-    assert count_mem0_outbox(config_from_manifest(without_mem0), status="pending") == 1  # the earlier row stays
+    assert [tuple(row) for row in rows] == [(before["id"], "pending")]  # none for the later event; the earlier stays
 
 
 def test_sync_and_dump_never_call_the_bridge(without_mem0, loaded_automation, bridge_calls) -> None:
@@ -144,3 +147,44 @@ def test_the_mcp_server_offers_no_mem0(without_mem0, chronicle_sandbox) -> None:
     assert "search_mem0_live" not in asyncio.run(tools())
     assert "Mem0" not in server.instructions and "mem0" not in server.instructions
     assert service.search_mem0_live_service(without_mem0, query="anything")["status"] == "disabled"
+
+
+def test_the_cli_queues_nothing_and_its_ledger_says_so(without_mem0, chronicle_sandbox, monkeypatch, capsys) -> None:
+    import sys
+
+    from max_chronicle import cli
+
+    monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path), "record",
+                                      "Decided to keep the gateway on port 9000", "--category", "decision"])
+    assert cli.main() == 0
+    receipt = json.loads(capsys.readouterr().out)
+    ledger = [json.loads(line) for line in config_from_manifest(without_mem0).ledger_path.read_text().splitlines()]
+
+    with open_connection(config_from_manifest(without_mem0)) as connection:
+        assert connection.execute("SELECT count(*) FROM mem0_outbox").fetchone()[0] == 0
+    assert [row["mem0_status"] for row in ledger if row["id"] == receipt["id"]] == ["skipped"]
+
+
+def test_a_legacy_import_will_not_queue_for_mem0(without_mem0, chronicle_sandbox, monkeypatch, capsys) -> None:
+    import sys
+
+    from max_chronicle import cli
+
+    config = config_from_manifest(without_mem0)
+    config.ledger_path.write_text(json.dumps({"id": "legacy-1", "text": "Imported decision", "domain": "global",
+                                              "category": "decision"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
+                                      "import-legacy", "--queue-mem0"])
+
+    assert cli.main() == 2
+    assert "[mem0] enabled = false" in capsys.readouterr().out
+    with open_connection(config) as connection:
+        assert connection.execute("SELECT count(*) FROM events WHERE id = 'legacy-1'").fetchone()[0] == 0
+
+
+def test_the_activation_prompt_leaves_mem0_out(without_mem0, loaded_manifest) -> None:
+    prompt = service.build_activation(without_mem0, domain_id="global", agent="pytest", capture=False)["prompt"]
+    with_mem0 = service.build_activation(_with_mem0(without_mem0), domain_id="global", agent="pytest",
+                                         capture=False)["prompt"]
+
+    assert "Mem0" not in prompt and "replay later" in with_mem0

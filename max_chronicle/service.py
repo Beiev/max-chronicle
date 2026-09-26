@@ -2259,7 +2259,8 @@ def record_event(
             if existing_row is not None:
                 existing = fetch_event(config, event_id=existing_row["id"], connection=connection)
         stored = existing or store_event(config, normalized_entry, source_kind=source_kind,
-                                        imported_from=imported_from, connection=connection)
+                                        imported_from=imported_from, connection=connection,
+                                        mem0=mem0_enabled(manifest))
         if existing:
             stored["dedupe_status"] = "exact_duplicate" if dedupe else "content_hash_match"
             stored["dedupe_window_hours"] = dedupe_window_hours if dedupe else hash_dedup_window
@@ -2307,7 +2308,8 @@ def record_event(
     if append_compat and not existing and (manifest.get("paths") or {}).get("ledger_file"):
         ledger_row = dict(stored)
         ledger_row["source_files"] = entry.get("source_files") or []
-        ledger_row["mem0_status"] = entry.get("mem0_status")
+        # ledger_row keeps the state the event was stored in, not the caller's
+        # request: a replay of the ledger must not queue what Chronicle kept out of Mem0.
         ledger_row["mem0_error"] = normalized_entry.get("mem0_error")
         ledger_row["mem0_raw"] = normalized_entry.get("mem0_raw")
         try:

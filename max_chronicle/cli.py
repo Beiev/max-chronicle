@@ -26,6 +26,7 @@ from .config import (
     default_manifest_path,
     ensure_runtime_dirs,
     feature_enabled,
+    mem0_enabled,
     resolve_status_root,
 )
 from .db import MigrationError, connect, database_summary, ensure_schema, read_schema_state
@@ -152,6 +153,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 def cmd_import_legacy(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
+    if args.queue_mem0 and not mem0_enabled(load_manifest(args.manifest)):
+        return _print_error(ValueError("--queue-mem0 needs Mem0: the manifest says [mem0] enabled = false"),
+                            exit_code=EXIT_CONFIG_ERROR)
     with _connection(config) as connection:
         ensure_schema(
             connection,

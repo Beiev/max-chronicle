@@ -530,6 +530,7 @@ def build_runtime_snapshot(
 
 
 def render_activation_prompt(snapshot: dict[str, Any]) -> str:
+    mem0 = (snapshot.get("mem0_dump") or {}).get("enabled") is not False  # a snapshot says when Mem0 is off
     portfolio = snapshot["portfolio_assets"]
     recent_ledger = snapshot["recent_ledger"][:5]
 
@@ -559,7 +560,8 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "Operating contract:",
         "- Treat `chronicle.db` as canonical truth.",
         "- Treat `status/` as the authoritative readable structure and operator-facing view.",
-        "- Treat `Mem0` and `mem0-dump.json` as derived semantic recall layers, not as truth.",
+        *(["- Treat `Mem0` and `mem0-dump.json` as derived semantic recall layers, not as truth."]
+          if mem0 else []),
         "- Treat `ssot-ledger.jsonl` and `chronicle-snapshots.jsonl` as compatibility logs; write through tools, not by hand.",
         "- Communicate in Russian. Write code and commits in English.",
         "- Prefer incremental shipping over rebuilding systems.",
@@ -570,7 +572,8 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "- At session start, load the activation context before making assumptions.",
         "- During work, record durable decisions, blockers, state changes, and rationale with `why`.",
         "- Before context switches, handoff, or thread end, capture a timestamped snapshot.",
-        "- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later.",
+        *(["- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later."]
+          if mem0 else []),
         "",
         "Current task:",
         f"- Focus: {snapshot.get('focus') or 'Read current project context before choosing work.'}",

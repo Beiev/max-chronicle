@@ -1450,7 +1450,9 @@ def store_event(
     source_kind: str = "agent_command",
     imported_from: str = "chronicle.record",
     connection: sqlite3.Connection | None = None,
+    mem0: bool = True,
 ) -> dict[str, Any]:
+    """Store one event; *mem0* False (an installation without Mem0) writes no mem0_outbox row."""
     payload = _event_payload(entry)
     event_id = payload.get("id") or str(uuid.uuid4())
     recorded_at_utc = payload.get("recorded_at") or utc_now()
@@ -1530,15 +1532,16 @@ def store_event(
         }
         if payload.get("memory_guard") is not None:
             outbox_payload["memory_guard"] = payload["memory_guard"]
-        _upsert_mem0_outbox(
-            active_connection,
-            event_id,
-            outbox_payload,
-            recorded_at_utc,
-            payload.get("mem0_status"),
-            payload.get("mem0_error"),
-            collection_name=config.mem0_collection,
-        )
+        if mem0:
+            _upsert_mem0_outbox(
+                active_connection,
+                event_id,
+                outbox_payload,
+                recorded_at_utc,
+                payload.get("mem0_status"),
+                payload.get("mem0_error"),
+                collection_name=config.mem0_collection,
+            )
 
     if connection is not None:
         _store(connection)
