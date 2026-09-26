@@ -3094,13 +3094,15 @@ def query_context(
         "ranking_basis": ["text_score", "freshness", "trust", "source_priority"],
         "freshness_audit": build_freshness_audit(manifest, domain_id=domain or "global"),
         "chronicle_hits": chronicle_hits,
-        "status_hits": status_hits,
-        "normalized_entity_hits": normalized_entity_hits,
+        # Status files and the Mem0 dump are read as they are on disk; stored
+        # events already passed the secret filter, these pass it here (FR-11).
+        "status_hits": redact_value(status_hits)[0],
+        "normalized_entity_hits": redact_value(normalized_entity_hits)[0],
         "interpretation_hits": interpretation_hits[:limit],
         "scenario_hits": [],
         "forecast_review_hits": [],
         "briefing_hits": [],
-        "mem0_dump_hits": mem0_hits,
+        "mem0_dump_hits": redact_value(mem0_hits)[0],
     }
 
 
@@ -3365,6 +3367,10 @@ def search_mem0_live_service(
 
     payload.setdefault("status", "ok")
     payload.setdefault("results", [])
+    # Mem0 holds memories written before the secret filter existed (FR-11).
+    payload, redactions = redact_value(payload)
+    if redactions:
+        payload["redactions"] = dict(redactions)
     return payload
 
 

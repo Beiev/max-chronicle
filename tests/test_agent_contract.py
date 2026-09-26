@@ -1816,3 +1816,42 @@ def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sand
     assert "Mem0" not in recall_query and "status" not in recall_query
     window = tools["state_at"].inputSchema["properties"]["window_hours"]
     assert (window["minimum"], window["maximum"]) == (1, 720)
+
+
+def _mem0_key() -> str:
+    import secrets
+
+    return "sk-" + "proj-" + secrets.token_urlsafe(36)
+
+
+def test_query_context_filters_the_mem0_dump_and_status_files(chronicle_sandbox, loaded_manifest) -> None:
+    key, other = _mem0_key(), _mem0_key()
+    (chronicle_sandbox.status_root / "mem0-dump.json").write_text(json.dumps({"memories": [
+        {"id": "m-1", "memory": f"Marmoset gateway credentials: {key}", "metadata": {}}]}), encoding="utf-8")
+    status = chronicle_sandbox.status_root / "status.md"
+    status.write_text(status.read_text(encoding="utf-8") + f"\n## Marmoset gateway\nThe marmoset key is {other}\n",
+                      encoding="utf-8")
+
+    payload = query_context(loaded_manifest, query="marmoset gateway", domain="global", limit=5,
+                            mode="truth_plus_interpretation")
+
+    text = json.dumps(payload)
+    assert payload["mem0_dump_hits"] and payload["status_hits"]
+    assert key not in text and other not in text and "[REDACTED:" in text
+
+
+def test_live_mem0_results_pass_the_secret_filter(loaded_manifest, monkeypatch) -> None:
+    import max_chronicle.service as service_module
+
+    key = _mem0_key()
+
+    class _Bridge:
+        returncode, stderr = 0, ""
+        stdout = json.dumps({"results": [{"id": "m-1", "memory": f"API key {key}", "metadata": {}}], "count": 1})
+
+    monkeypatch.setattr(service_module.subprocess, "run", lambda *args, **kwargs: _Bridge())
+    monkeypatch.setenv("CHRONICLE_FEATURE_SEARCH_MEM0_LIVE", "1")
+
+    out = service_module.search_mem0_live_service(loaded_manifest, query="api key", timeout_s=5)
+
+    assert key not in json.dumps(out) and out["redactions"]
