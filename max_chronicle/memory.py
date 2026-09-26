@@ -126,6 +126,12 @@ def _request_input(entry: dict[str, Any]) -> dict[str, Any]:
     return material
 
 
+# Part of every request hash since 0.13.0, so hashes 0.12.0 stored and hashes
+# stored now never coincide: the compatibility rules for 0.12.0's requests can
+# only ever match a request 0.12.0 wrote.
+REQUEST_HASH_FORMAT = 2
+
+
 def request_hash(entry: dict[str, Any]) -> str:
     # A retry resends the same input. A transport reconnect may assign a new
     # session ID to it; the original observation keeps its originating session.
@@ -133,7 +139,7 @@ def request_hash(entry: dict[str, Any]) -> str:
     # changes nothing. An agent taken from the session or the MCP client rather
     # than named by the caller can change on a reconnect, so only a named agent
     # is part of the input (W6).
-    material = _request_input(entry)
+    material = _request_input(entry) | {"hash_format": REQUEST_HASH_FORMAT}
     if entry.get("agent_source", "explicit") == "explicit":
         material["agent"] = entry.get("actor_raw", entry.get("agent"))
     return _hash(material)
@@ -156,7 +162,7 @@ def _agent_0_12(name: str | None) -> str:
 
 
 def _earlier_request_hashes(entry: dict[str, Any]) -> set[str]:
-    """The hashes 0.12.0 stored for the same input.
+    """The hashes 0.12.0 stored for the same input, which carry no hash format.
 
     Its MCP server hashed the agent it normalised, and "mcp" when the caller
     named none; its CLI and Python API hashed the agent as given, or none. A
