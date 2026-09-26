@@ -364,6 +364,11 @@ def test_prose_between_two_mentions_of_a_key_stays() -> None:
         "a." * 500_000,
         "a+" * 500_000,
         "-----BEGIN " + "PRIVATE KEY-----\n" * 40_000,
+        " " * 1_000_000,
+        "-----BEGIN " + "PRIVATE KEY-----" + " " * 1_000_000 + "x",
+        ("BEGIN " + " " * 50 + "A" + " " * 50) * 9_000,
+        "&nbsp;" * 170_000,
+        ("\\/" + "Ab1" * 5) * 50_000 + "-----END " + "PRIVATE KEY-----",
         "api_key=" * 130_000,
         "https://a:" * 100_000,
         "ey" + "J" + "a" * 1_000_000,
@@ -381,6 +386,11 @@ def test_prose_between_two_mentions_of_a_key_stays() -> None:
         "dots",
         "pluses",
         "open-key-blocks",
+        "spaces",
+        "key-then-spaces",
+        "spaced-markers",
+        "html-spaces",
+        "escaped-runs",
         "assignments",
         "url-schemes",
         "jwt-head",
@@ -576,3 +586,68 @@ def test_words_and_digests_in_a_key_region_stay() -> None:
     result = redact(text).text
 
     assert digest in result and "## Deployment\nRun the deploy script" in result and "troubleshooting" in result
+
+
+# Fifth review of #14: a text bearing a key loses the key however the key is spelled or encoded.
+
+_PKCS1 = bytes.fromhex("308204a40201000282010100")
+_PKCS8 = bytes.fromhex("30820276020100300d06092a864886f70d0101010500048202")
+
+
+def _pem(label: str = "RSA ", prefix: bytes = _PKCS1, size: int = 1190) -> tuple[str, list[str]]:
+    body = base64.b64encode(prefix + random.randbytes(size - len(prefix))).decode()
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    begin, end = "-----BEGIN " + label + "PRIVATE" + " KEY-----", "-----END " + label + "PRIVATE" + " KEY-----"
+    return "\n".join([begin, *lines, end]) + "\n", lines
+
+
+def _spelled(pem: str) -> dict[str, str]:
+    marker = "PRIVATE" + " KEY"
+    return {
+        "nine_spaces": pem.replace("BEGIN ", "BEGIN" + " " * 9).replace("RSA " + marker, "RSA" + " " * 9 + marker),
+        "lower_case": pem.replace("BEGIN RSA " + marker, "begin rsa private key").replace("END RSA " + marker, "end rsa private key"),
+        "split_marker": pem.replace(marker, "PRIVATE\nKEY"),
+        "split_marker_crlf": pem.replace(marker, "PRIVATE\r\nKEY"),
+        "json_slashes": json.dumps({"data": pem}).replace("/", "\\/"),
+        "json_unicode_spaces": json.dumps({"data": pem}).replace(" ", "\\u0020"),
+        "html": pem.replace("/", "&#47;").replace(" ", "&nbsp;"),
+        "url_encoded": __import__("urllib.parse").parse.quote(pem, safe=""),
+        "base64url": pem.replace("+", "-").replace("/", "_"),
+        "early_quoted_end": pem.split("\n")[0] + "\nThe terminator is `" + pem.rstrip("\n").split("\n")[-1] + "`.\n\n"
+                            + "\n".join(pem.split("\n")[1:4]),
+        "no_markers": "\n".join(pem.split("\n")[1:-2]),
+    }
+
+
+@pytest.mark.parametrize("shape", list(_spelled(_pem()[0])))
+def test_a_key_goes_however_it_is_spelled_or_encoded(shape: str) -> None:
+    pem, lines = _pem()
+    text = "Keys:\n" + _spelled(pem)[shape] + "\nRotate them.\n"
+
+    result = redact(text).text
+    readable = __import__("urllib.parse").parse.unquote(result.replace("\\/", "/").replace("&#47;", "/"))
+
+    assert not any(line[i:i + 12] in readable for line in lines[:12] for i in range(len(line) - 11))
+    assert result.startswith("Keys:") and result.endswith("Rotate them.\n")
+
+
+@pytest.mark.parametrize("tail", [16, 12])
+def test_the_short_last_line_of_a_key_goes_with_it(tail: int) -> None:
+    size = {16: 634, 12: 631}[tail]  # base64 of these sizes ends in a line of `tail` characters with == padding
+    pem, lines = _pem("", _PKCS8, size)
+
+    result = redact("Export:\n" + pem).text
+
+    assert len(lines[-1]) == tail and lines[-1].endswith("==")
+    assert lines[-1] not in result and result == "Export:\n[REDACTED:private_key]\n"
+
+
+def test_a_mention_of_a_key_keeps_paths_links_names_and_images() -> None:
+    image = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + random.randbytes(600)).decode()
+    kept = ["/usr/local/bin/python3", "https://github.com/example/tool/commit/" + hashlib.sha1(b"c").hexdigest(),
+            "https://example.org/api/v1/conversations", "release20260926candidate1", image]
+    text = "A key file starts with " + "-----BEGIN " + "RSA PRIVATE" + " KEY-----" + ".\n\n" + "\n".join(kept) + "\n"
+
+    result = redact(text).text
+
+    assert all(item in result for item in kept)

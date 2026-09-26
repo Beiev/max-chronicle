@@ -1061,10 +1061,36 @@ def test_both_builds_of_0013_upgrade(chronicle_sandbox, loaded_manifest, tmp_pat
     assert columns.count("index_version") == 1
 
 
+
+@pytest.mark.parametrize("header", ['"name" : Real title', '"na\\"me": x\nname: Real title', "'it''s': x\nname: Real title"],
+                         ids=["space_before_colon", "escaped_double_quote", "doubled_single_quote"])
+def test_quoted_frontmatter_keys_in_any_valid_form(notes, header) -> None:
+    manifest, files = notes
+    path = files["global"].with_name("quoted-forms.md")
+    path.write_text(f"---\n{header}\n---\n# Body\nText.\n", encoding="utf-8")
+
+    sync_notes(manifest)
+
+    assert _documents(manifest)[str(path)]["title"] == "Real title"
+    assert not any(header.splitlines()[0] in text for _, text in _chunks(manifest, path))
+
+
+def test_a_note_indexed_by_an_older_version_is_indexed_again_unchanged(notes) -> None:
+    manifest, files = notes
+    sync_notes(manifest, embed=False)
+    with open_connection(config_from_manifest(manifest)) as connection, connection:
+        connection.execute("UPDATE documents SET index_version = ? WHERE path = ?",
+                           (NOTE_INDEX_VERSION - 1, str(files["global"])))
+
+    report = sync_notes(manifest, embed=False)
+
+    assert report["indexed"] == 1 and _documents(manifest)[str(files["global"])]["index_version"] == NOTE_INDEX_VERSION
+
+
 # The parser and the secret filter, as indexed notes were made with them.
 # Changing either changes this digest: bump NOTE_INDEX_VERSION so every note
 # is indexed again, then record the new digest under the new version.
-INDEX_DIGESTS = {1: "f9eeb8b601a0e073ed95266fd734645932df286b7166377725d692a2549ba463"}
+INDEX_DIGESTS = {2: "3d23905492e463755b8c2fac97ab8d00d63202f2a6912575a4cc9fe9ad82ef5c"}
 
 
 def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:
@@ -1074,7 +1100,7 @@ def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:
     from max_chronicle import redaction
 
     parts = [inspect.getsource(redaction)] + [inspect.getsource(getattr(notes_module, name)) for name in (
-        "_frontmatter", "_key_value", "_is_key_line", "_split", "_in_code", "chunk_note", "_decode", "_first_title", "parse_note")]
+        "_frontmatter", "_closing_quote", "_key_value", "_is_key_line", "_split", "_in_code", "chunk_note", "_decode", "_first_title", "parse_note")]
     parts += [repr(getattr(notes_module, name)) for name in ("CHUNK_CHARS", "_HEADING", "_FENCE")]
     parts.append(repr(sorted(notes_module._BLOCK_SCALARS)))  # a set's order changes from run to run
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()

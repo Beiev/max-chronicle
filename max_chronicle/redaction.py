@@ -71,69 +71,95 @@ _PREFIXED = tuple(
         ("telegram_bot_token", r"\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b"),
     )
 )
-# Private keys, whole or cut short. A key's region runs from its BEGIN marker to
-# the END marker of the same kind, or to the end of the text when none follows;
-# an END with no BEGIN before it closes a region that starts where the text (or
-# the previous region) does. Line structure does not matter: the region loses
-# its markers and every piece of key material, however the key was wrapped,
-# quoted, indented, fenced, listed or cut. Key material is a run of base64
-# characters long enough to be key bytes, mixing at least two of lower case,
-# upper case and digits, and not a hexadecimal digest. Words and digests stay,
-# so prose after a mention of a key survives. Pieces with nothing but spaces or
-# punctuation between them become one marker.
-PRIVATE_KEY_MIN_PIECE = 16  # a key body cut into shorter pieces is not recognised
-_KEY_MARKER = re.compile(
-    r"-{0,5}[ \t]?\b(?P<edge>BEGIN|END)[ \t]{1,8}(?P<kind>(?:[A-Z0-9]{1,20}[ \t]{1,8}){0,3}?)"
-    r"PRIVATE[ \t]{1,8}KEY(?P<block>[ \t]{1,8}BLOCK)?(?:[ \t]?-{1,5})?"
+# Private keys, whole or cut short, however they are wrapped, escaped or cut.
+# A text that shows a private key marker (BEGIN or END ... PRIVATE KEY, in any
+# case, spacing or escaping) or the first bytes of a private key body (PKCS#1,
+# PKCS#8, SEC1, encrypted PKCS#8, OpenSSH) bears a key. Such a text loses its
+# markers and every run of 16 or more base64 characters that reads as random
+# bytes, wherever it stands: line breaks, quotes, list markers, fences,
+# headings and the order of the markers do not matter. JSON, HTML and URL
+# escapes of "/", "+" and "=" count as the characters they stand for, and "-"
+# and "_" join a run (base64url). A run is kept when it is a hex digest or a
+# UUID, the data of a data: URI, or reads as words (paths, identifiers); a key
+# body cut into pieces shorter than 16 characters is not recognised. Markers and
+# runs with nothing alphanumeric between them become one marker.
+PRIVATE_KEY_MIN_PIECE = 16  # counted with padding; a shorter last line before an END goes with its key
+PRIVATE_KEY_MAX_WORDINESS = 0.75  # a random base64 line of 64 characters stays under 0.6
+_SEP = r"(?:[ \t\r\n\f\v]|\\[nrt]|\\u0020|&nbsp;|&#0*32;|%20)"
+_DASH = r"(?:-|&#0*45;|%2[dD])"
+# Separators before BEGIN are bounded: a search tries the pattern at every position.
+_KEY_MARKER = (
+    r"(?i:" + _DASH + r"{0,5}+" + _SEP + r"{0,4}+\b(?:BEGIN|END)" + _SEP + r"++(?:[A-Z0-9]{1,20}" + _SEP + r"++){0,3}?"
+    r"PRIVATE" + _SEP + r"++KEY(?:" + _SEP + r"++BLOCK)?+(?:" + _SEP + r"*+" + _DASH + r"{1,5}+)?+)"
 )
-_KEY_REGION_ITEM = re.compile(
-    _KEY_MARKER.pattern + r"|(?P<piece>[A-Za-z0-9+/=]{%d,})" % PRIVATE_KEY_MIN_PIECE
+_KEY_SIGNATURE = (
+    r"MII[A-Za-z0-9+/]{3}IBAAK[BC]|IBADANBgkqhkiG9w0BAQEFAAS|AgEAMBMGByqGSM49AgE|MC4CAQAwBQYDK2Vw"
+    r"|MHcCAQEEI|MIGkAgEBBDA|MIHcAgEBBEI|BgkqhkiG9w0BBQ0w|b3BlbnNzaC1rZXktdjE"
 )
-_HEXADECIMAL = re.compile(r"[0-9a-f]+|[0-9A-F]+")
+_KEY_TRIGGER = re.compile(_KEY_MARKER + "|" + _KEY_SIGNATURE)
+_KEY_RUN_ESCAPE = r"\\/|&#0*4[37];|&#0*61;|&#[xX]0*2[bBfF];|&#[xX]0*3[dD];|%2[bBfF]|%3[dD]"
+_KEY_ITEM = re.compile(
+    # A run never starts right after a backslash: the n of an escaped newline is not key material.
+    r"(?P<marker>" + _KEY_MARKER + r")|(?<!\\)(?P<run>(?:[A-Za-z0-9+/=_-]|" + _KEY_RUN_ESCAPE + r")++)"
+)
+_KEY_UNESCAPE = re.compile(_KEY_RUN_ESCAPE)
+_HEX_OR_UUID = re.compile(r"[0-9a-f-]+|[0-9A-F-]+")
+# What makes a run read as text: words, hex digests and numbers (a commit URL, a release name).
+_WORD = re.compile(r"[0-9a-f]{7,}|[0-9]{4,}|[A-Z]?[a-z]{3,}|[A-Z]{2,}(?=[A-Z][a-z])")
 _LOWER, _UPPER, _DIGIT = re.compile(r"[a-z]"), re.compile(r"[A-Z]"), re.compile(r"[0-9]")
 _MARKER_GAP = re.compile(r"[^A-Za-z0-9]*")
 
 
-def _key_kind(marker: re.Match[str]) -> tuple[str, bool]:
-    return " ".join(marker.group("kind").split()), marker.group("block") is not None
+def _unescaped(escape: str) -> str:
+    """The character a JSON, HTML or URL escape of "/", "+" or "=" stands for."""
+    if escape == "\\/":
+        return "/"
+    code = escape.lower().strip("&#%;x")
+    return chr(int(code, 16) if escape.startswith("%") or "x" in escape.lower() else int(code))
 
 
-def _key_piece(run: str) -> bool:
-    """Whether a base64 run can be a piece of key bytes rather than a word or a digest."""
-    core = run.strip("=")
-    if len(core) < PRIVATE_KEY_MIN_PIECE or _HEXADECIMAL.fullmatch(core):
+def _unescape_run(run: str) -> str:
+    if not any(sign in run for sign in "\\&%"):
+        return run
+    return _KEY_UNESCAPE.sub(lambda match: _unescaped(match.group()), run)
+
+
+def _key_piece(run: str, before: str) -> bool:
+    """Whether a base64 run can be key bytes rather than words, a digest, or a data: URI."""
+    if before.endswith("base64,"):
         return False
-    return sum(bool(pattern.search(core)) for pattern in (_LOWER, _UPPER, _DIGIT)) >= 2
+    decoded = _unescape_run(run)
+    core = decoded.strip("=")
+    if len(decoded) < PRIVATE_KEY_MIN_PIECE or not core or _HEX_OR_UUID.fullmatch(core):  # padding counts
+        return False
+    if sum(bool(pattern.search(core)) for pattern in (_LOWER, _UPPER, _DIGIT)) < 2:
+        return False
+    wordiness = sum(len(word) for word in _WORD.findall(core)) / len(core)
+    return wordiness < PRIVATE_KEY_MAX_WORDINESS
 
 
-def _redact_key_region(text: str, start: int, stop: int, mark: Callable[[str], str]) -> str:
-    """*text[start:stop]* without its key markers and key material; one marker per run of them."""
-    pieces, position, marked = [], start, False
-    for item in _KEY_REGION_ITEM.finditer(text, start, stop):
-        if item.group("piece") is not None and not _key_piece(item.group("piece")):
+def _redact_private_keys(text: str, mark: Callable[[str], str]) -> str:
+    """A text bearing a private key without its markers and key material; linear in *text*."""
+    if not _KEY_TRIGGER.search(text):
+        return text
+    pieces, position, marked = [], 0, False
+    tail = None  # a short run right after key material: the last line of a body if a marker follows
+    for item in _KEY_ITEM.finditer(text):
+        run = item.group("run")
+        if run is not None and (len(run) < PRIVATE_KEY_MIN_PIECE
+                                or not _key_piece(run, text[max(0, item.start() - 7):item.start()])):
+            follows = marked and tail is None and _MARKER_GAP.fullmatch(text[position:item.start()])
+            tail = item if follows and len(run) < PRIVATE_KEY_MIN_PIECE else None
             continue
+        if tail is not None and run is None and _MARKER_GAP.fullmatch(text[tail.end():item.start()]):
+            position = tail.end()
+        tail = None
         gap = text[position:item.start()]
         if not (marked and _MARKER_GAP.fullmatch(gap)):
             pieces += [gap, mark("private_key")]
         marked, position = True, item.end()
-    pieces.append(text[position:stop])
+    pieces.append(text[position:])
     return "".join(pieces)
-
-
-def _redact_private_keys(text: str, mark: Callable[[str], str]) -> str:
-    """Every private key in *text*, whole or cut short, replaced by a marker; linear in *text*."""
-    pieces, position = [], 0
-    while (marker := _KEY_MARKER.search(text, position)) is not None:
-        if marker.group("edge") == "END":
-            start, stop = position, marker.end()  # the body of a key whose BEGIN was cut off
-        else:
-            kind = _key_kind(marker)
-            closing = next((end for end in _KEY_MARKER.finditer(text, marker.end())
-                            if end.group("edge") == "END" and _key_kind(end) == kind), None)
-            start, stop = marker.start(), closing.end() if closing else len(text)
-        pieces += [text[position:start], _redact_key_region(text, start, stop, mark)]
-        position = stop
-    return "".join(pieces) + text[position:]
 
 
 _SECRET_WORD = (

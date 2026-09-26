@@ -46,7 +46,7 @@ from .store import _fts_query, config_from_manifest, open_connection, write_tran
 
 NOTE_SOURCE = "notes"
 # Bump when parsing or the secret filter changes: every note is indexed again.
-NOTE_INDEX_VERSION = 1
+NOTE_INDEX_VERSION = 2
 # Notes that hold keys are skipped by name as well as filtered by content.
 # A note about a key (which file, which host) stays; a pasted key block is redacted by content.
 DEFAULT_DENY = ("*api-key*", "*api_key*", "*apikey*", "*secret*", "*credential*", "*password*", "*keys.md",
@@ -310,14 +310,30 @@ def _frontmatter(text: str) -> tuple[dict[str, str], str]:
     return nested | top, "\n".join(lines[end + 1:])
 
 
+def _closing_quote(line: str) -> int:
+    """Where the quoted key that opens *line* ends: a backslash escapes in double quotes, '' in single ones."""
+    quote, index = line[0], 1
+    while index < len(line):
+        if quote == '"' and line[index] == "\\":
+            index += 2
+            continue
+        if line[index] == quote:
+            if quote == "'" and line.startswith("'", index + 1):
+                index += 2
+                continue
+            return index
+        index += 1
+    return -1
+
+
 def _key_value(line: str) -> tuple[str, str] | None:
     """The key and value of a `key: value` line, the key bare or quoted; None for another line. Linear."""
-    quote = line[:1]
-    if quote in ("\"", "'"):
-        close = line.find(quote, 1)
-        if close < 0 or not line.startswith(":", close + 1):
+    if line[:1] in ("\"", "'"):
+        close = _closing_quote(line)
+        after = line[close + 1:].lstrip(" \t") if close > 0 else ""
+        if not after.startswith(":"):
             return None
-        key, rest = line[1:close], line[close + 2:]
+        key, rest = line[1:close], after[1:]
     else:
         key, sep, rest = line.partition(":")
         if not sep:
