@@ -24,7 +24,7 @@ file that is not UTF-8 text, or whose path holds a likely secret, is not read.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -61,10 +61,8 @@ WALK_BUDGET = 20_000  # directory entries read to find the directory of a file-m
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _GLOB_CHARS = re.compile(r"[*?\[]")
-# Frontmatter: `key: value` or `key:` lines (any key, quoted or not), plus
-# indented continuations, list items and comments.
-_FRONTMATTER_KEY = re.compile(r"""^(?:"[^"]*"|'[^']*'|[^\s:#"'-][^:]*?)\s*:(?:\s|$)""")
-_FRONTMATTER_OTHER = re.compile(r"^(?:\s+\S|-\s|#)")
+# Frontmatter lines besides `key: value`: indented continuations, list items, comments.
+_FRONTMATTER_OTHER = re.compile(r"^(?:[ \t]+\S|-[ \t]|#)")
 _BLOCK_SCALARS = {">", "|", ">-", "|-", ">+", "|+"}
 
 
@@ -129,9 +127,16 @@ def _through_symlink(path: Path, base: Path) -> bool:
 
 
 def _matches(pattern: str) -> Iterator[Path]:
-    """Paths matching *pattern*. `**` never descends through a symlink, which could loop."""
-    if "**" not in pattern:
+    """Paths matching *pattern*. `**` never descends through a symlink, which could loop.
+
+    Only a whole `**` component recurses; inside a name, `**` is `*`. A final
+    `**` matches every file below, as it does for glob.
+    """
+    parts = Path(pattern).parts
+    if "**" not in parts:
         return (Path(name) for name in glob.glob(pattern))
+    if parts[-1] == "**":
+        pattern = str(Path(pattern) / "*")
     base = _glob_base(pattern)
     literal = set(Path(pattern).parts)  # a hidden name the pattern spells out is wanted
     return (path for path in base.glob(str(Path(pattern).relative_to(base)))
@@ -183,14 +188,11 @@ def _slug_directory(slug: str) -> Path | None:
         entries: list[os.DirEntry] = []
         try:
             with os.scandir(directory) as listing:
-                while budget > 0:
-                    entry = next(listing, None)
-                    if entry is None:
-                        break
+                for entry in listing:
+                    if budget <= 0:  # more entries than the budget: stop reading, find nothing
+                        return []
                     budget -= 1
                     entries.append(entry)
-                else:  # out of budget: stop reading, find nothing
-                    return []
         except OSError:
             return []
         # The longer name first: `a-b` is a shallower home than `a/b` for the same folder name.
@@ -286,16 +288,33 @@ def _frontmatter(text: str) -> tuple[dict[str, str], str]:
     except StopIteration:
         return {}, text
     block = [line for line in lines[1:end] if line.strip()]
-    keyed = [bool(_FRONTMATTER_KEY.match(line)) for line in block]
+    keyed = [_is_key_line(line) for line in block]
     if not any(keyed) or not all(key or _FRONTMATTER_OTHER.match(line) for key, line in zip(keyed, block)):
         return {}, text
-    fields: dict[str, str] = {}
-    for line in lines[1:end]:
+    top: dict[str, str] = {}
+    nested: dict[str, str] = {}
+    scalar_indent: int | None = None  # the lines of a block scalar are its text, not keys
+    for line in block:
+        indent = len(line) - len(line.lstrip(" \t"))
+        if scalar_indent is not None and indent > scalar_indent:
+            continue
+        scalar_indent = None
         key, sep, value = line.strip().partition(":")
         value = value.strip()
-        if sep and key and value and value not in _BLOCK_SCALARS:  # a folded value is not read
-            fields.setdefault(key.strip().strip("\"'"), value.strip("\"'"))
-    return fields, "\n".join(lines[end + 1:])
+        if not sep or not key.strip():
+            continue
+        if value in _BLOCK_SCALARS:
+            scalar_indent = indent
+        elif value:
+            (top if indent == 0 else nested).setdefault(key.strip().strip("\"'"), value.strip("\"'"))
+    return nested | top, "\n".join(lines[end + 1:])
+
+
+def _is_key_line(line: str) -> bool:
+    """Whether *line* is a top-level `key: value` or `key:` line of frontmatter; linear in its length."""
+    key, sep, rest = line.partition(":")
+    return (bool(sep) and bool(key.strip()) and not key[:1].isspace() and key[:1] not in "-#"
+            and (not rest or rest[:1] in " \t"))
 
 
 def _split(text: str, limit: int = CHUNK_CHARS) -> list[str]:
@@ -339,12 +358,8 @@ def _in_code(lines: list[str]) -> list[bool]:
     return marks
 
 
-def chunk_note(title: str, body: str, clean: Callable[[str], str] = str) -> list[tuple[str, str]]:
-    """(heading, text) sections of a note; a heading is ``Title › Section``.
-
-    *clean* runs on each section and heading before a long section is cut, so
-    a secret pattern never spans two sections and a key is never cut in two.
-    """
+def chunk_note(title: str, body: str) -> list[tuple[str, str]]:
+    """(heading, text) sections of a note; a heading is ``Title › Section``."""
     lines = body.splitlines()
     sections: list[tuple[str | None, list[str]]] = [(None, [])]
     for line, code in zip(lines, _in_code(lines)):
@@ -355,9 +370,9 @@ def chunk_note(title: str, body: str, clean: Callable[[str], str] = str) -> list
             sections[-1][1].append(line)
     chunks = []
     for heading, section in sections:
-        text = clean("\n".join(section).strip()).strip()
+        text = "\n".join(section).strip()
         if text:
-            name = title if heading is None else f"{title} › {clean(heading)}"
+            name = title if heading is None else f"{title} › {heading}"
             chunks.extend((name, piece) for piece in _split(text))
     return chunks
 
@@ -405,10 +420,9 @@ def _first_title(body: str) -> str | None:
 def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
     """A note's fields and chunks, with likely secrets redacted in every stored string (FR-11).
 
-    Each section is filtered whole, before a long one is cut: filtering the
-    pieces would leave a key longer than a piece, or across a cut, partly in
-    clear text, and filtering the whole note would let a pattern swallow the
-    sections between two mentions of a key.
+    The whole body is filtered before it is split: a key block can hold a
+    pasted heading or be one, and a key cut into sections or pieces would pass
+    the filter in parts. The filter keeps a key pattern within the key.
     """
     text = _decode(data)
     if text is None:
@@ -424,7 +438,8 @@ def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
         redactions += result.count
         return result.text
 
-    title = clean(fields.get("name")) or clean(_first_title(body)) or clean(path.stem) or path.stem
+    body = clean(body) or ""
+    title = clean(fields.get("name")) or _first_title(body) or clean(path.stem) or path.stem
     return ParsedNote(
         path=path,
         sha256=hashlib.sha256(data).hexdigest(),
@@ -434,7 +449,7 @@ def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
         title=title,
         description=clean(fields.get("description")),
         kind=clean(fields.get("type")),
-        chunks=chunk_note(title, body, lambda value: clean(value) or ""),
+        chunks=chunk_note(title, body),
         redactions=redactions,
     )
 
@@ -535,8 +550,7 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         if changed or report["removed"]:
             # Deleted rows stay in older full-text segments until they merge.
             connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
-    if changed or report["removed"]:
-        _checkpoint(config)
+    _checkpoint(config)  # also retries one that a reader blocked last time
     if embed:
         report["embedding"] = embed_chunks(manifest, limit=embed_limit)
     return report
@@ -553,7 +567,7 @@ def _checkpoint(config) -> None:
         try:
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
         except sqlite3.OperationalError:  # busy: the next sync tries again
-            pass
+            return
 
 
 def embed_chunks(manifest: dict[str, Any], *, limit: int | None = None) -> dict[str, Any]:
@@ -649,36 +663,42 @@ def recall_notes(
     with open_connection(config) as connection:
         if not _has_documents(connection):
             return nothing
-        pool = {row["id"]: dict(row) for row in connection.execute(
-            """SELECT c.id, c.document_id, c.heading, c.text, d.path, d.title, d.project, d.kind, d.modified_at_utc,
-                      v.dim, v.vector
-               FROM document_chunks c JOIN documents d ON d.id = c.document_id AND d.deleted_at_utc IS NULL
-               LEFT JOIN chunk_vectors v ON v.chunk_id = c.id AND v.model_key = ?
-               WHERE """ + where, (profile.key, *params))}
-        if not pool:
-            return nothing
-        terms = query_terms(query)
-        # The scope applies before the cap, and in a project scope the project's own
-        # notes come first, or other notes crowd them out of the capped list.
-        own = "(d.project IS NULL), " if scope.project is not None else ""
-        scoped = ("SELECT document_chunks_fts.chunk_id FROM document_chunks_fts "
-                  "JOIN document_chunks c ON c.id = document_chunks_fts.chunk_id "
-                  "JOIN documents d ON d.id = c.document_id AND d.deleted_at_utc IS NULL "
-                  "WHERE document_chunks_fts MATCH ? AND " + where + " ORDER BY " + own + "bm25(document_chunks_fts)")
-        # A sync may commit between the reads: only chunks of the pool read above count.
-        ranked = [chunk_id for chunk_id, in connection.execute(scoped, (_fts_query(query), *params))
-                  if chunk_id in pool] if terms else []
-        strict = set(ranked)
-        relaxed = bool(terms) and not strict
-        fts = ranked[:cap]
-        if relaxed:  # a relaxed candidate must still cover the terms; read past those that do not
-            rows = connection.execute(scoped, (_fts_query(query, relaxed=True), *params))
-            for chunk_id, in itertools.islice(rows, RELAXED_SCAN_PAGES * cap):
-                chunk = pool.get(chunk_id)
-                if chunk and covers(terms, f"{chunk['heading']} {chunk['text']}"):
-                    fts.append(chunk_id)
-                    if len(fts) == cap:
-                        break
+        # The pool and the full-text matches come from one snapshot: a sync between
+        # the reads could reuse a chunk id for other text.
+        connection.execute("BEGIN")
+        try:
+            pool = {row["id"]: dict(row) for row in connection.execute(
+                """SELECT c.id, c.document_id, c.heading, c.text, d.path, d.title, d.project, d.kind, d.modified_at_utc,
+                          v.dim, v.vector
+                   FROM document_chunks c JOIN documents d ON d.id = c.document_id AND d.deleted_at_utc IS NULL
+                   LEFT JOIN chunk_vectors v ON v.chunk_id = c.id AND v.model_key = ?
+                   WHERE """ + where, (profile.key, *params))}
+            if not pool:
+                return nothing
+            terms = query_terms(query)
+            # The scope applies before the cap, and in a project scope the project's own
+            # notes come first, or other notes crowd them out of the capped list.
+            own = "(d.project IS NULL), " if scope.project is not None else ""
+            scoped = ("SELECT document_chunks_fts.chunk_id FROM document_chunks_fts "
+                      "JOIN document_chunks c ON c.id = document_chunks_fts.chunk_id "
+                      "JOIN documents d ON d.id = c.document_id AND d.deleted_at_utc IS NULL "
+                      "WHERE document_chunks_fts MATCH ? AND " + where + " ORDER BY " + own + "bm25(document_chunks_fts)")
+            # A sync may commit between the reads: only chunks of the pool read above count.
+            ranked = [chunk_id for chunk_id, in connection.execute(scoped, (_fts_query(query), *params))
+                      if chunk_id in pool] if terms else []
+            strict = set(ranked)
+            relaxed = bool(terms) and not strict
+            fts = ranked[:cap]
+            if relaxed:  # a relaxed candidate must still cover the terms; read past those that do not
+                rows = connection.execute(scoped, (_fts_query(query, relaxed=True), *params))
+                for chunk_id, in itertools.islice(rows, RELAXED_SCAN_PAGES * cap):
+                    chunk = pool.get(chunk_id)
+                    if chunk and covers(terms, f"{chunk['heading']} {chunk['text']}"):
+                        fts.append(chunk_id)
+                        if len(fts) == cap:
+                            break
+        finally:
+            connection.rollback()
     fts_ranks = {chunk_id: rank for rank, chunk_id in enumerate(fts)}
     similarities: dict[str, float] = {}
     vector_available = False

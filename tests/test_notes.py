@@ -820,7 +820,8 @@ def test_the_folder_walk_prefers_the_shallower_directory_and_stays_in_budget(tmp
     monkeypatch.setattr(notes_module, "WALK_BUDGET", 50)
     monkeypatch.setattr(notes_module.os, "scandir", counting)
 
-    assert _slug_directory(_directory_slug(wide / "missing" / "sub")) is None and len(read) <= 50
+    # A listing is read to its end or one entry past the budget, which tells the two apart.
+    assert _slug_directory(_directory_slug(wide / "missing" / "sub")) is None and len(read) <= 51
 
 
 def test_browse_search_shows_notes(notes, capsys) -> None:
@@ -861,3 +862,167 @@ def test_a_parent_step_after_a_symlink_follows_the_filesystem(tmp_path) -> None:
     plain, linked = discover(note_settings({"notes": {"paths": [str(tmp_path / "link" / ".." / "notes" / "*.md")]}}))
 
     assert [path.name for path in plain] == ["physical.md"] and linked == []
+
+
+# Third review of #14: every test below failed before its fix, except the guards marked as such.
+
+
+def test_a_key_block_split_by_a_heading_is_still_removed(notes) -> None:
+    manifest, files = notes
+    memory = files["global"].parent
+    body = [base64.b64encode(secrets.token_bytes(48)).decode() for _ in range(8)]
+    _note(memory / "heading-begin.md", "# Box\n\n## " + _OPENSSH_BEGIN + "\n" + "\n".join(body[:4]) + "\n" + _OPENSSH_END
+          + "\n\n## After\nUse the bastion.\n")
+    _note(memory / "interrupted.md", "# Box two\n\n" + _OPENSSH_BEGIN + "\n" + "\n".join(body[4:6])
+          + "\n## Pasted in the middle\n" + "\n".join(body[6:]) + "\n" + _OPENSSH_END + "\n")
+
+    sync_notes(manifest, embed=False)
+
+    stored = _raw_strings(manifest)
+    assert not any(line[8:40] in stored for line in body)
+
+
+def test_frontmatter_parsing_stays_linear(notes) -> None:
+    manifest, files = notes
+    note = _note(files["global"].with_name("spaces.md"), "---\na" + " " * 60_000 + "\n---\n\n## Body\nText.\n")
+
+    started = time.perf_counter()
+    sync_notes(manifest, embed=False)
+
+    assert time.perf_counter() - started < 1.0 and "Text." in _chunks(manifest, note)[-1][1]
+
+
+def test_a_block_scalar_does_not_lend_its_lines_to_the_metadata(notes) -> None:
+    manifest, files = notes
+    note = _note(files["global"].with_name("scalar.md"), "---\ndescription: |\n  name: an example in prose\n"
+                 "  type: some text\nname: Real title\ntype: reference\n---\n\n## Body\nText.\n")
+
+    sync_notes(manifest, embed=False)
+
+    row = _documents(manifest)[str(note)]
+    assert (row["title"], row["kind"], row["description"]) == ("Real title", "reference", None)
+
+
+class _FakeEntry:
+    def __init__(self, parent: str, name: str):
+        self.name, self.path = name, f"{parent.rstrip('/')}/{name}"
+
+    def is_dir(self) -> bool:
+        return True
+
+
+def test_a_folder_found_with_the_last_of_the_budget_counts(monkeypatch) -> None:
+    tree = {"/": ["project"], "/project": ["target"], "/project/target": []}
+
+    @contextlib.contextmanager
+    def listing(path):
+        yield iter(_FakeEntry(str(path), name) for name in tree[str(path)])
+
+    monkeypatch.setattr(notes_module, "WALK_BUDGET", 2)
+    monkeypatch.setattr(notes_module.os, "scandir", listing)
+
+    assert _slug_directory("-project-target") == Path("/project/target")
+
+
+def test_a_checkpoint_blocked_by_a_reader_is_retried_by_the_next_sync(notes) -> None:
+    manifest, files = notes
+    sync_notes(manifest, embed=False)
+    db = config_from_manifest(manifest).db_path
+    reader = sqlite3.connect(db)
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM documents").fetchone()  # holds a snapshot: the log cannot be emptied
+        note = _note(files["global"].with_name("walrus.md"), "## W\nThe walrusmarker plan.\n", name="Walrus")
+        sync_notes(manifest, embed=False)
+        sync_notes({**manifest, "notes": {**manifest["notes"], "deny": ["walrus*"]}}, embed=False)
+        reader.commit()
+
+        sync_notes({**manifest, "notes": {**manifest["notes"], "deny": ["walrus*"]}}, embed=False)  # nothing changes
+
+        assert read_note(manifest, document_id(note)) is None
+        for path in (db, Path(f"{db}-wal")):
+            assert not path.exists() or b"walrusmarker" not in path.read_bytes()
+    finally:
+        reader.close()
+
+
+class _PoolThenReindex(_PoolThenSync):
+    """Re-index a note under the same chunk ids right after recall reads its pool."""
+
+
+def test_recall_reads_its_pool_and_matches_from_one_snapshot(notes, monkeypatch) -> None:
+    manifest, files = notes
+    sync_notes(manifest)
+    real = notes_module.open_connection
+
+    def reindex():
+        _note(files["orbit"], "## Launch\nNew quasar deployment instructions.\n", name="Orbit launch")
+        monkeypatch.setattr(notes_module, "open_connection", real)
+        sync_notes(manifest, embed=False)
+
+    hooks = [reindex]
+
+    @contextlib.contextmanager
+    def racing(config):
+        with real(config) as connection:
+            yield _PoolThenReindex(connection, hooks)
+
+    monkeypatch.setattr(notes_module, "open_connection", racing)
+
+    found = query_memory(manifest, query="quasar deployment")
+
+    assert not hooks and all("quasar" in note["text"].lower() for note in found["notes"])
+
+
+def test_a_database_from_the_first_note_index_gains_the_version_column(chronicle_sandbox, loaded_manifest,
+                                                                        tmp_path) -> None:
+    from max_chronicle.config import MIGRATIONS_DIR
+    from max_chronicle.store import prepare_database
+
+    early = tmp_path / "migrations"
+    early.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:4]) <= 13:
+            (early / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(replace(config, migrations_dir=early)):
+        pass  # a database at schema 13, as the first note index built it
+
+    prepare_database(config, allow_upgrade=True)
+    with open_connection(config) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
+
+    assert "index_version" in columns
+
+
+def test_record_with_the_db_flag_and_no_paths_table_does_not_fail_after_writing(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / "manifest.toml"
+    manifest.write_text("version = 1\n", encoding="utf-8")
+    monkeypatch.setenv("CHRONICLE_ROOT", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(manifest), "--db", str(tmp_path / "x.db"),
+                                      "record", "Written once", "--agent", "a", "--domain", "global"])
+
+    assert cli.main() == 0
+    capsys.readouterr()
+
+
+# The parser and the secret filter, as indexed notes were made with them.
+# Changing either changes this digest: bump NOTE_INDEX_VERSION so every note
+# is indexed again, then record the new digest under the new version.
+INDEX_DIGESTS = {1: "5377d9f91bca60c960e5165678c9395fc538d8a311712b4038e72b101258ddd4"}
+
+
+def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:
+    import hashlib
+    import inspect
+
+    from max_chronicle import redaction
+
+    parts = [inspect.getsource(redaction)] + [inspect.getsource(getattr(notes_module, name)) for name in (
+        "_frontmatter", "_is_key_line", "_split", "_in_code", "chunk_note", "_decode", "_first_title", "parse_note")]
+    parts += [repr(getattr(notes_module, name)) for name in ("CHUNK_CHARS", "_HEADING", "_FENCE")]
+    parts.append(repr(sorted(notes_module._BLOCK_SCALARS)))  # a set's order changes from run to run
+    digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+    assert INDEX_DIGESTS.get(NOTE_INDEX_VERSION) == digest, (
+        f"the parser or the filter changed: bump NOTE_INDEX_VERSION and record {digest}")

@@ -73,24 +73,40 @@ _PREFIXED = tuple(
         ("telegram_bot_token", r"\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b"),
     )
 )
-# A whole block, its body never crossing another BEGIN; then a block cut short.
-_PRIVATE_KEY_BLOCK = re.compile(
-    r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----"
-    r"(?:(?!-----BEGIN )[\s\S]){0,%d}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----" % PRIVATE_KEY_MAX_LENGTH
+# Private keys, whole or cut short. A BEGIN line starts a key; the block runs to
+# its END when real key material (a long base64 run) lies between, whatever
+# else does (JSON "\\n" escapes, code quotes, a heading pasted into it). With
+# no END, or only prose before it, the key is the BEGIN line and the lines a key
+# body holds after it: base64 of any length, PEM headers such as Proc-Type, and
+# blank lines, indented or ">"-quoted. The body stops at the first other line,
+# so prose after a mention of a key stays.
+_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
+_KEY_END = re.compile(r"-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
+_KEY_MATERIAL = re.compile(r"[A-Za-z0-9+/]{40}")
+_KEY_BODY = re.compile(
+    r"(?>[ \t]*[A-Za-z0-9+/=]+[ \t]*(?=\r?\n|\Z))?"  # base64 right after BEGIN, on its line
+    r"(?:\r?\n(?>[ \t>]*)(?>[A-Za-z][A-Za-z0-9-]*:[ \t]*[A-Za-z0-9+/=,.:-]*|[A-Za-z0-9+/=]*)(?>[ \t]*)"
+    r"(?=\r?\n|\Z)){0,%d}" % PRIVATE_KEY_MAX_LINES
 )
-# A block cut short takes its BEGIN line and then only lines a key body holds,
-# each possibly quoted with ">": headers such as Proc-Type or DEK-Info, base64,
-# and blank lines. It stops at the first other line, before its line break, so
-# the text after a truncated key stays.
-_KEY_BODY_LINE = (
-    r"(?:[ \t]{0,8}>){0,8}[ \t]{0,8}"
-    r"(?:[A-Za-z][A-Za-z0-9-]{0,40}:[ \t]{0,8}[A-Za-z0-9+/=,.:\- \t]{0,200}|[A-Za-z0-9+/=]{0,200})"
-    r"[ \t]{0,8}(?=\r?\n|\Z)"
-)
-_PRIVATE_KEY_OPEN = re.compile(
-    r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[ \t]{0,8}(?:\r?\n" + _KEY_BODY_LINE + r"){0,%d}"
-    % PRIVATE_KEY_MAX_LINES
-)
+
+
+def _redact_private_keys(text: str, mark: Callable[[str], str]) -> str:
+    """Every private key in *text*, whole or cut short, replaced by a marker; linear in *text*."""
+    pieces, position = [], 0
+    while (begin := _KEY_BEGIN.search(text, position)) is not None:
+        limit = min(len(text), begin.end() + PRIVATE_KEY_MAX_LENGTH)
+        following = _KEY_BEGIN.search(text, begin.end(), limit)
+        limit = following.start() if following else limit
+        end = _KEY_END.search(text, begin.end(), limit)
+        if end is not None and _KEY_MATERIAL.search(text, begin.end(), end.start()):
+            stop = end.end()
+        else:
+            stop = _KEY_BODY.match(text, begin.end()).end()
+        pieces += [text[position:begin.start()], mark("private_key")]
+        position = stop
+    return "".join(pieces) + text[position:]
+
+
 _SECRET_WORD = (
     r"(?:api[_\-]?key|access[_\-]?key|secret(?:[_\-]?key)?|token|passw(?:or)?d|pwd|private[_\-]?key|credentials?)"
 )
@@ -180,8 +196,7 @@ def redact(text: str) -> Redaction:
         counts[kind] += 1
         return MARKER.format(kind=kind)
 
-    text = _PRIVATE_KEY_BLOCK.sub(lambda match: mark("private_key"), text)
-    text = _PRIVATE_KEY_OPEN.sub(lambda match: mark("private_key"), text)
+    text = _redact_private_keys(text, mark)
     for kind, pattern in _PREFIXED:
         text = pattern.sub(lambda match, kind=kind: mark(kind), text)
     text = _replace_group(_QUERY_PARAM, text, "assigned_secret", mark, check=_plausible_assigned_value)

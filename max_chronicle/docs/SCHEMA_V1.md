@@ -16,8 +16,8 @@ The core storage model:
 
 Current operational database version:
 
-- `PRAGMA user_version = 13`
-- latest applied migration: `0013_documents.sql`
+- `PRAGMA user_version = 14`
+- latest applied migration: `0014_documents_index_version.sql`
 - next migration number: `0014`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
@@ -25,7 +25,7 @@ Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`f
 Migration `0009` adds `event_embeddings` (float32 BLOB vectors) backing the hybrid `query_memory` recall.
 Migration `0011` rebuilds `events_fts` (event text and why only; no longer the project and domain slugs in `title` and `circumstances`) and `facts_fts` (now contentful) with ё folded into е, because FTS5's unicode61 tokenizer keeps the two apart.
 Migration `0012` replaces `event_embeddings` with `event_vectors`, keyed by (event, embedding model key), so the index of a new model is backfilled beside the old one; existing vectors keep their model name as key.
-Migration `0013` adds the note index (FR-10): `documents`, `document_chunks`, `document_chunks_fts` and `chunk_vectors`.
+Migration `0013` adds the note index (FR-10): `documents`, `document_chunks`, `document_chunks_fts` and `chunk_vectors`; `0014` adds `documents.index_version`.
 
 ## Core Tables
 
@@ -182,7 +182,7 @@ This is bootstrap only.
 
 Long-term writes should target Chronicle directly, not JSONL first.
 
-## Note index (migration 0013)
+## Note index (migrations 0013, 0014)
 
 `documents` holds one row per indexed note file, keyed by a hash of its path:
 source, canonical project (NULL for a global note), title, description, kind,

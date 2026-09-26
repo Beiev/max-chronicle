@@ -302,6 +302,61 @@ def test_a_private_key_cut_before_its_end_line_is_redacted(encrypted: bool, pref
     assert result.startswith("The key as pasted:\n") and result.endswith("\nThen rotate it.\n")
 
 
+def _key_body(lines: int = 8) -> list[str]:
+    return [_random(64, ALNUM + "+/") for _ in range(lines)]
+
+
+_BEGIN = "-----BEGIN " + "RSA PRIVATE" + " KEY-----"
+_END = "-----END " + "RSA PRIVATE" + " KEY-----"
+
+
+@pytest.mark.parametrize("shape", ["long_line", "indented", "tabs", "on_begin_line"])
+def test_a_cut_private_key_is_redacted_in_any_layout(shape: str) -> None:
+    body = _key_body()
+    if shape == "long_line":
+        text = _BEGIN + "\n" + "".join(body) + "\n"
+    elif shape == "on_begin_line":
+        text = _BEGIN + "".join(body) + "\n"
+    else:
+        indent = " " * 12 if shape == "indented" else "\t" * 9
+        text = "\n".join([indent + _BEGIN, *(indent + line for line in body)]) + "\n"
+
+    result = redact("Pasted:\n" + text + "Then rotate it.\n").text
+
+    assert not any(line[8:40] in result for line in body)
+    assert result.endswith("Then rotate it.\n")
+
+
+@pytest.mark.parametrize("shape", ["heading_begin", "heading_inside", "json_escaped", "code_string", "pgp"])
+def test_a_whole_private_key_goes_whatever_surrounds_it(shape: str) -> None:
+    body = _key_body()
+    if shape == "heading_begin":
+        text = "## " + _BEGIN + "\n" + "\n".join(body) + "\n" + _END
+    elif shape == "heading_inside":
+        text = _BEGIN + "\n" + "\n".join(body[:4]) + "\n## Pasted in the middle\n" + "\n".join(body[4:]) + "\n" + _END
+    elif shape == "json_escaped":
+        text = '{"private_key": "' + _BEGIN + "\\n" + "\\n".join(body) + "\\n" + _END + '\\n"}'
+    elif shape == "code_string":
+        text = 'key = ("' + _BEGIN + '\\n"\n' + "\n".join(f'       "{line}\\n"' for line in body) + '\n       "' + _END + '")'
+    else:
+        begin, end = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----", "-----END PGP " + "PRIVATE KEY BLOCK-----"
+        text = begin + "\n\n" + "\n".join(body) + "\n" + end
+
+    result = redact("Before.\n" + text + "\nAfter.\n").text
+
+    assert not any(line[8:40] in result for line in body)
+    assert result.startswith("Before.") and result.endswith("After.\n")
+
+
+def test_prose_between_two_mentions_of_a_key_stays() -> None:
+    text = ("A key file starts with " + _BEGIN + " on its own.\n\n## Where it lives\n"
+            "The deploy key lives in the password manager entry farm.\n\nIt ends with " + _END + ".\n")
+
+    result = redact(text).text
+
+    assert "password manager entry farm" in result and "## Where it lives" in result
+
+
 @pytest.mark.parametrize(
     "text",
     [
