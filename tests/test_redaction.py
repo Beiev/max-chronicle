@@ -853,3 +853,79 @@ def test_code_and_links_after_a_key_stay() -> None:
     result = redact(pem + "\n" + "\n".join(kept) + "\n").text
 
     assert all(item in result for item in kept)
+
+
+def test_a_secret_name_covers_the_strings_of_its_list() -> None:
+    value, counts = redact_value({"password": ["Correct-Horse-9", "Battery-Staple-7"], "tags": ["Release-Notes-2"]})
+
+    assert value == {"password": ["[REDACTED:assigned_secret]"] * 2, "tags": ["Release-Notes-2"]}
+    assert counts["assigned_secret"] == 2
+
+
+def test_json_held_in_a_string_is_filtered_at_any_depth_of_encoding() -> None:
+    inner = {"password": "Correct-Horse-9", "note": "rotate monthly"}
+    once = json.dumps(inner)
+    twice = json.dumps({"nested": once})
+
+    value, _ = redact_value({"twice": twice, "plain": "{not json", "list": "[1, 2]"})
+
+    assert "Correct-Horse-9" not in json.dumps(value)
+    assert json.loads(json.loads(value["twice"])["nested"]) == {"password": "[REDACTED:assigned_secret]",
+                                                                "note": "rotate monthly"}
+    assert (value["plain"], value["list"]) == ("{not json", "[1, 2]")  # unchanged, byte for byte
+
+
+def test_json_nested_too_deep_stays_text() -> None:
+    deep = "[" * 1100 + "0" + "]" * 1100  # walking it as a value would exhaust the stack
+
+    value, counts = redact_value({"text": deep})
+
+    assert value == {"text": deep} and not counts
+
+
+@pytest.mark.parametrize("depth", [2, 33, 100])
+def test_a_deep_branch_does_not_hide_a_shallow_secret(depth) -> None:
+    trace: object = 0
+    for _ in range(depth):
+        trace = {"child": trace}
+    text = json.dumps({"password": ["Correct-Horse-9"], "encoded": json.dumps({"password": "Battery-Staple-7"}),
+                       "trace": trace})
+
+    value, counts = redact_value(text)
+
+    assert "Correct-Horse-9" not in value and "Battery-Staple-7" not in value and counts["assigned_secret"] == 2
+
+
+@pytest.mark.parametrize("depth", [31, 1100])
+def test_json_encoded_twice_is_filtered_at_any_depth(depth) -> None:
+    text = "[" * depth + json.dumps(json.dumps({"password": ["Correct-Horse-9"]})) + "]" * depth
+
+    value, counts = redact_value(text)
+
+    assert "Correct-Horse-9" not in value and counts["assigned_secret"] == 1
+
+
+def test_a_deep_value_is_walked_without_exhausting_the_stack() -> None:
+    key = "sk-" + "proj-" + "Zq8" * 12
+    deep: object = {"note": f"the key {key}"}
+    for _ in range(5000):
+        deep = [deep]
+
+    value, counts = redact_value(deep)
+
+    for _ in range(5000):  # json.dumps and repr would recurse as deep
+        value = value[0]
+    assert key not in value["note"] and "[REDACTED:" in value["note"] and counts
+
+
+def test_json_too_deep_to_parse_goes_whole_when_it_names_a_secret(monkeypatch) -> None:
+    import max_chronicle.redaction as redaction_module
+
+    def too_deep(text):
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    monkeypatch.setattr(redaction_module.json, "loads", too_deep)  # as Python 3.11 does past ~1,000 levels
+    named, counts = redact_value('[[{"password": ["Correct-Horse-9"]}]]')
+    plain, _ = redact_value("[[0]]")
+
+    assert (named, counts["assigned_secret"]) == ("[REDACTED:assigned_secret]", 1) and plain == "[[0]]"

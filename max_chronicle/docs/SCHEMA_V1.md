@@ -16,9 +16,9 @@ The core storage model:
 
 Current operational database version:
 
-- `PRAGMA user_version = 14`
-- latest applied migration: `0014_documents_index_version.sql`
-- next migration number: `0015`
+- `PRAGMA user_version = 15`
+- latest applied migration: `0015_one_active_fact.sql`
+- next migration number: `0016`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
@@ -26,6 +26,7 @@ Migration `0009` adds `event_embeddings` (float32 BLOB vectors) backing the hybr
 Migration `0011` rebuilds `events_fts` (event text and why only; no longer the project and domain slugs in `title` and `circumstances`) and `facts_fts` (now contentful) with ё folded into е, because FTS5's unicode61 tokenizer keeps the two apart.
 Migration `0012` replaces `event_embeddings` with `event_vectors`, keyed by (event, embedding model key), so the index of a new model is backfilled beside the old one; existing vectors keep their model name as key.
 Migration `0013` adds the note index (FR-10): `documents`, `document_chunks`, `document_chunks_fts` and `chunk_vectors`; `0014` adds `documents.index_version`.
+Migration `0015` adds a unique index that holds each fact slot to one active value (W8); a database that already held several keeps the newest and retires the rest, with a transaction and a mutation log entry.
 
 ## Core Tables
 
@@ -213,7 +214,9 @@ transport session while replaying the same committed request.
 Explicit assertions use the existing `episodes`, `facts`, `fact_observations`,
 `fact_transactions`, `fact_supersessions`, and `fact_mutation_log` tables. A fact
 slot belongs to domain/project/task scope. Replacements require the current ID;
-the old row is retired and linked to its replacement. `current_facts` is a view,
+the old row is retired before its replacement is inserted, and linked to it; a
+unique index (0015) allows one active value per slot, a missing project or task
+counting as one scope. `current_facts` is a view,
 not a separately rewritten truth store. `attributes_json.kind` distinguishes
 observations, decisions, and assumptions.
 

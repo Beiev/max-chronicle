@@ -46,7 +46,7 @@ from .store import _fts_query, config_from_manifest, open_connection, write_tran
 
 NOTE_SOURCE = "notes"
 # Bump when parsing or the secret filter changes: every note is indexed again.
-NOTE_INDEX_VERSION = 3
+NOTE_INDEX_VERSION = 4
 # Notes that hold keys are skipped by name as well as filtered by content.
 # A note about a key (which file, which host) stays; a pasted key block is redacted by content.
 DEFAULT_DENY = ("*api-key*", "*api_key*", "*apikey*", "*secret*", "*credential*", "*password*", "*keys.md",
@@ -448,6 +448,26 @@ def _first_title(body: str) -> str | None:
     return None
 
 
+_INLINE_COMMENT = re.compile(r"\s#")
+
+
+def _named_project(data: bytes, identities: Registry) -> str | None:
+    """The project a note names in its frontmatter (`project: ...`), resolved through the registry.
+
+    A note that says which project it belongs to is taken at its word, wherever
+    it lies; read before the unchanged check, so such a note is not indexed
+    again on every sync.
+    """
+    text = _decode(data)
+    if text is None:
+        return None
+    fields, _ = _frontmatter(text.replace("\r\n", "\n").replace("\r", "\n"))
+    # A name never holds " #", so there it starts a YAML comment, as in `project: atlas # archived`.
+    named = _INLINE_COMMENT.split(fields.get("project") or "", maxsplit=1)[0].strip().strip("\"'")
+    named = redact(named).text.strip() if named else ""
+    return identities.project(named) if named else None
+
+
 def parse_note(path: Path, data: bytes, project: str | None) -> ParsedNote:
     """A note's fields and chunks, with likely secrets redacted in every stored string (FR-11).
 
@@ -546,7 +566,7 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         except OSError as exc:
             report["skipped"].append({"path": str(path), "reason": type(exc).__name__})
             continue
-        project = note_project(path, manifest, identities, directories)
+        project = _named_project(data, identities) or note_project(path, manifest, identities, directories)
         digest = hashlib.sha256(data).hexdigest()
         if known.get(str(path)) == (digest, project, None, NOTE_INDEX_VERSION):
             live.add(str(path))

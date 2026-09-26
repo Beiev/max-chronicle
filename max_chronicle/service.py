@@ -58,8 +58,6 @@ from .store import (
     fetch_event_ids_without_embedding,
     fetch_latest_projection_run,
     fetch_latest_snapshot,
-    fetch_latest_situation_model,
-    fetch_lens_runs,
     fetch_normalized_entities,
     fetch_project_events,
     fetch_recent_events,
@@ -2087,7 +2085,10 @@ def reconstruct_timeline(
     window_hours: int = 6,
     limit: int = 3,
     detail: str = "digest",
+    as_of: bool = False,
+    visibility: str = "raw",
 ) -> dict[str, Any]:
+    """The timeline around *timestamp*; *visibility* "default" leaves quarantined (raw_only) events out."""
     config = _config(manifest)
     payload = timeline_state(
         config,
@@ -2095,8 +2096,9 @@ def reconstruct_timeline(
         domain=domain,
         window_hours=window_hours,
         limit=limit,
-        visibility="raw",
+        visibility=visibility,
         detail=detail,
+        as_of=as_of,
     )
     payload["contract_name"] = ACTIVATION_CONTRACT_NAME
     payload["contract_version"] = ACTIVATION_CONTRACT_VERSION
@@ -2715,7 +2717,8 @@ def persist_snapshot(
     stored["chronicle_error"] = None
 
     side_effect_errors: dict[str, str] = {}
-    if append_compat:
+    # The JSONL copy is optional: a manifest without paths.snapshot_file keeps none.
+    if append_compat and (manifest.get("paths") or {}).get("snapshot_file"):
         try:
             append_jsonl(_compat_path(manifest, "snapshot_file"), stored)
         except OSError as exc:
@@ -3066,6 +3069,9 @@ def query_context(
 
     normalized_entities = fetch_normalized_entities(config, limit=200)
     normalized_entity_hits: list[dict[str, Any]] = []
+    # Nothing writes situation models or lens runs any more; the last ones
+    # are months old, so they are history, not the current interpretation (W11).
+    # The key stays for clients of the contract, like scenario_hits.
     interpretation_hits: list[dict[str, Any]] = []
 
     if mode != "truth_only":
@@ -3083,34 +3089,6 @@ def query_context(
             limit=limit,
         )
 
-        situation = fetch_latest_situation_model(config, domain=domain or "global")
-        if situation is not None:
-            interpretation_hits.extend(
-                _search_derived_hits(
-                    query,
-                    [situation],
-                    record_kind="situation_model",
-                    text_builder=lambda item: json.dumps(item, ensure_ascii=False),
-                    limit=1,
-                )
-            )
-            lens_runs = fetch_lens_runs(config, situation_id=situation["situation_id"], limit=20)
-            interpretation_hits.extend(
-                _search_derived_hits(
-                    query,
-                    lens_runs,
-                    record_kind="lens_run",
-                    text_builder=lambda item: " ".join(
-                        [
-                            item.get("lens") or "",
-                            item.get("summary_text") or "",
-                            json.dumps(item.get("findings") or [], ensure_ascii=False),
-                        ]
-                    ),
-                    limit=limit,
-                )
-            )
-
     return {
         "contract_name": ACTIVATION_CONTRACT_NAME,
         "contract_version": ACTIVATION_CONTRACT_VERSION,
@@ -3120,13 +3098,15 @@ def query_context(
         "ranking_basis": ["text_score", "freshness", "trust", "source_priority"],
         "freshness_audit": build_freshness_audit(manifest, domain_id=domain or "global"),
         "chronicle_hits": chronicle_hits,
-        "status_hits": status_hits,
-        "normalized_entity_hits": normalized_entity_hits,
+        # Status files and the Mem0 dump are read as they are on disk; stored
+        # events already passed the secret filter, these pass it here (FR-11).
+        "status_hits": redact_value(status_hits)[0],
+        "normalized_entity_hits": redact_value(normalized_entity_hits)[0],
         "interpretation_hits": interpretation_hits[:limit],
         "scenario_hits": [],
         "forecast_review_hits": [],
         "briefing_hits": [],
-        "mem0_dump_hits": mem0_hits,
+        "mem0_dump_hits": redact_value(mem0_hits)[0],
     }
 
 
@@ -3391,6 +3371,10 @@ def search_mem0_live_service(
 
     payload.setdefault("status", "ok")
     payload.setdefault("results", [])
+    # Mem0 holds memories written before the secret filter existed (FR-11).
+    payload, redactions = redact_value(payload)
+    if redactions:
+        payload["redactions"] = dict(redactions)
     return payload
 
 

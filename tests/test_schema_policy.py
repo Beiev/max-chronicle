@@ -458,3 +458,24 @@ def test_the_test_run_cannot_reach_a_real_workspace(tmp_path_factory) -> None:
     root = resolve_status_root()
 
     assert root == tmp_path_factory.getbasetemp() / "max-chronicle-home"
+
+
+@pytest.mark.parametrize("given", ["flag", "environment"])
+def test_migrate_and_status_open_the_database_the_manifest_names(tmp_path, monkeypatch, capsys, given) -> None:
+    named = _older_database(tmp_path, tmp_path / "named.db")
+    manifest = tmp_path / "SSOT_MANIFEST.toml"
+    manifest.write_text(f'version = 1\n\n[paths]\nchronicle_db = "{named}"\n', encoding="utf-8")
+    monkeypatch.setenv("CHRONICLE_ROOT", str(tmp_path))
+    if given == "flag":
+        argv: tuple[str, ...] = ("--manifest", str(manifest))
+    else:
+        monkeypatch.setenv("CHRONICLE_MANIFEST", str(manifest))
+        argv = ()
+
+    status_code, status = _run_cli(monkeypatch, capsys, *argv, "status")
+    migrate_code, migrated = _run_cli(monkeypatch, capsys, *argv, "migrate")
+
+    assert (status_code, status["db_path"]) == (cli.EXIT_SCHEMA_ACTION, str(named))
+    assert (migrate_code, migrated["db_path"]) == (0, str(named))
+    assert _schema_version(named) == LATEST_VERSION
+    assert not (tmp_path / "chronicle.db").exists()
