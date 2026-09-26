@@ -25,6 +25,7 @@ from .config import (
     feature_enabled,
 )
 from .db import database_summary
+from .identity import fold
 from .recall import query_memory
 from .redaction import redact_value
 from .projections import render_job_search_status, render_status_generated_block, update_status_file
@@ -517,7 +518,7 @@ _UNREDACTED_ENTRY_KEYS = frozenset(
         "id", "request_id", "session_id", "agent", "domain", "category", "project",
         "task_id", "recorded_at", "occurred_at", "entity_id", "entity_type",
         "source_files", "slot", "kind", "supersedes", "mem0_status", "memory_guard",
-        "content_hash", "skip_generic_source_archives",
+        "content_hash", "skip_generic_source_archives", "agent_source",
     }
 )
 
@@ -579,10 +580,12 @@ def _find_recent_exact_duplicate(
         if delta_hours > window_hours:
             continue
         if (
-            (existing.get("domain") or "global") == entry["domain"]
+            # Older events keep the spelling they were written with (FR-14).
+            config.identities.domain(existing.get("domain") or "global") == entry["domain"]
             and (existing.get("category") or "note") == entry["category"]
-            and (existing.get("project") or "") == (entry.get("project") or "")
-            and existing.get("task_id") == entry.get("task_id")
+            and (config.identities.project(existing.get("project")) or "") == (entry.get("project") or "")
+            # One task under any spelling of its id (FR-14).
+            and fold(existing.get("task_id") or "") == fold(entry.get("task_id") or "")
             and existing.get("checkpoint") == entry.get("checkpoint")
             and existing.get("fact") == entry.get("fact")
             and (existing.get("text") or "").strip() == entry["text"]
@@ -886,11 +889,18 @@ def _runtime_source_catalog(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _domain_id(manifest: dict[str, Any], domain_id: str | None) -> str | None:
+    """A domain's canonical id for any of its spellings (FR-14); an unknown one as given."""
+    entry = manifest["domain_map"].get(domain_id) if domain_id else None
+    return entry["id"] if entry else domain_id
+
+
 def build_sources_audit(
     manifest: dict[str, Any],
     *,
     domain_id: str = "global",
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     attach_catalog = _source_catalog(manifest, domain_id)
     runtime_catalog = _runtime_source_catalog(manifest)
     mem0_dump_path = _compat_path(manifest, "mem0_dump")
@@ -1137,6 +1147,7 @@ def build_freshness_audit(
     *,
     domain_id: str = "global",
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     domain = manifest["domain_map"][domain_id]
     config = _config(manifest)
     attach_sources: list[dict[str, Any]] = []
@@ -1623,6 +1634,9 @@ def build_startup_bundle(
         Startup bundle dict targeting ~50K full / ~30K compact.
     """
     from .memory import task_context as read_task_context
+    identities = _config(manifest).identities
+    domain_id = identities.domain(domain_id) or "global"
+    project = identities.project(project)
     if domain_id not in manifest["domain_map"]:
         raise ValueError(f"Unknown domain {domain_id!r}; use a manifest domain and project/task_id for task scope")
     context = read_task_context(manifest, domain=domain_id, project=project,
@@ -2112,11 +2126,20 @@ def record_event(
     normalized_entry, redactions = _redact_entry(_normalize_record_entry(entry))
     from .memory import validate_entry, request_receipt, record_observation
     validate_entry(normalized_entry)
+    config = _config(manifest)
+    # Canonical names for the agent, project and domain; the given spellings
+    # stay beside them (FR-14). A name is caller text, and an undeclared one is
+    # kept as given, so every name passes the secret filter like any text.
+    config.identities.canonical_entry(normalized_entry)
+    for name_key in ("agent", "project", "domain", "task_id", "actor_raw", "project_raw", "domain_raw"):
+        if isinstance(normalized_entry.get(name_key), str):
+            normalized_entry[name_key], found = redact_value(normalized_entry[name_key])
+            for kind, count in found.items():
+                redactions[kind] = redactions.get(kind, 0) + count
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
     resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind)
     if resolved_mem0_status is not None:
         normalized_entry["mem0_status"] = resolved_mem0_status
-    config = _config(manifest)
 
     if source_kind == "chronicle_mcp" and not (normalized_entry.get("checkpoint") or normalized_entry.get("fact")):
         memory_guard = evaluate_memory_guard(config, normalized_entry, source_kind=source_kind)
@@ -2137,8 +2160,8 @@ def record_event(
         project=normalized_entry.get("project"),
         why=normalized_entry.get("why"),
     )
-    if normalized_entry.get("task_id"):
-        content_hash = _sha256_text(content_hash + ":" + normalized_entry["task_id"])
+    if normalized_entry.get("task_id"):  # one task under any spelling of its id (FR-14)
+        content_hash = _sha256_text(content_hash + ":" + fold(normalized_entry["task_id"]))
     if normalized_entry.get("checkpoint") or normalized_entry.get("fact"):
         content_hash = _sha256_text(content_hash + json.dumps(
             [normalized_entry.get("checkpoint"), normalized_entry.get("fact")],
@@ -2245,7 +2268,7 @@ def record_event(
                 connection=connection,
             )
             artifacts_written += 1
-        observation = record_observation(connection, normalized_entry, stored["id"], evidence)
+        observation = record_observation(connection, normalized_entry, stored["id"], evidence, config.identities)
     if embedding_vec is not None and embed_model is not None and embed_dim is not None:
         # A vector is an index entry, not part of the record. Written in its own
         # transaction, no failure of it can lose the event, not even one that
@@ -2780,6 +2803,7 @@ def capture_runtime_snapshot(
     append_compat: bool = True,
     render_generated: bool = True,
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     config = _config(manifest)
     recent_events = fetch_recent_events(config, limit=8, domain=domain_id)
     if not recent_events:
@@ -2813,6 +2837,7 @@ def build_activation(
     focus: str | None = None,
     capture: bool = True,
 ) -> dict[str, Any]:
+    domain_id = _domain_id(manifest, domain_id)
     attach_bundle = build_attach_bundle(
         manifest,
         domain_id=domain_id,
@@ -2940,6 +2965,7 @@ def project_state(
     event_limit: int = 10,
 ) -> dict[str, Any]:
     config = _config(manifest)
+    project = config.identities.project(project) or project
     entity_id = _project_entity_id(project)
     events = fetch_project_events(config, project=project, limit=event_limit)
     relations = fetch_relations_for_entity(config, entity_id=entity_id)
@@ -2963,6 +2989,7 @@ def query_context(
 ) -> dict[str, Any]:
     if mode not in QUERY_MODES:
         raise ValueError(f"Unsupported query mode: {mode}")
+    domain = _domain_id(manifest, domain)
     config = _config(manifest)
     chronicle_hits = search_events(config, query=query, limit=limit, domain=domain)
     for hit in chronicle_hits:

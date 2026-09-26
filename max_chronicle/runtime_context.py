@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION
 from .db import utc_now  # re-exported: one timestamp format for the whole package
+from .identity import DomainMap, Names
 from .lexical import fold, query_terms
 
 
@@ -105,7 +106,11 @@ def shorten(text: str, max_chars: int = 3000) -> str:
 def load_manifest(path: Path) -> dict[str, Any]:
     raw = read_toml(path)
     raw["source_map"] = {source["id"]: source for source in raw.get("sources", [])}
-    raw["domain_map"] = {domain["id"]: domain for domain in raw.get("domains", [])}
+    # A domain's other spellings name it too (FR-14).
+    raw["domain_map"] = DomainMap(
+        {domain["id"]: domain for domain in raw.get("domains", [])},
+        Names.build(raw.get("domains", []), "domains"),
+    )
     return raw
 
 

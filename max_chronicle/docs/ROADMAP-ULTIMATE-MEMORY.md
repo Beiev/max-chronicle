@@ -268,4 +268,4 @@ interface Receipt {
 | FR-11 | Events, evidence files, generated text artifacts: 0.11.0. Snapshots, imports, Mem0 responses, notes: planned |
 | FR-10 | Planned: note index |
 | FR-12, NFR-4 | Brief (`GET /brief`, `chronicle brief`, `startup_bundle(mode="brief")`, `chronicle://brief/{project}`): 0.12.0; p95 12 ms on a live-size database. Session hooks are operator configuration. |
-| FR-14 | Planned: identity registry |
+| FR-14 | 0.13.0: registry in the manifest (`[[projects]]`, `[[domains]]`, `[[agents]]` with aliases); one scope function for events, observations, facts, open tasks, the brief and cursors |

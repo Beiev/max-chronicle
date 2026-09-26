@@ -173,6 +173,39 @@ session context; Claude Code keeps up to 10,000 characters, above the brief's
 maximum. Without HTTP, `chronicle brief --cwd DIR` prints the same text. An MCP client can call `startup_bundle(mode="brief")`, which also unlocks
 writes, or read the resource `chronicle://brief/{project}`.
 
+### One name per project, domain and agent
+
+One project often gets written several ways (`status`, `chronicle`,
+`max-chronicle`), and so do tasks (`Launch_plan`, `launch_plan`) and agents
+(`Codex`, `codex-mcp-client`). Names match whatever their case, spaces and
+underscores, and the manifest lists the other spellings of a project, domain
+or agent:
+
+```toml
+[[projects]]
+id = "atlas"
+roots = ["~/code/atlas"]
+aliases = ["atlas-app", "old-atlas"]
+
+[[domains]]
+id = "memory"
+aliases = ["mem"]  # next to the domain's label and source_ids
+
+[[agents]]
+id = "claude"
+aliases = ["assistant"]  # exact spellings
+prefixes = ["claude"]    # claude-mac, claude-code, ...
+```
+
+A filter by any spelling finds what was written under every one of them
+(FR-14): recall, task context, open tasks, current facts, the brief and
+cursors. History is not rewritten: a write stores the canonical name and keeps
+the given one as `actor_raw`, `project_raw` or `domain_raw`. The common agents
+(claude, codex, glm, deepseek, gemini, opencode, transcript-analyst) are
+built in; an `[[agents]]` entry with the same id replaces a built-in one. A
+session that never names its agent is attributed to its MCP client, such as
+`claude-code`.
+
 | Tool | Purpose |
 | --- | --- |
 | `startup_bundle` | Task context, checkpoint, current facts, change cursor; unlock writes. `mode="brief"`: only the brief. |

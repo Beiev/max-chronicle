@@ -61,6 +61,7 @@ from .store import (
     set_read_only_process,
     target_schema_version,
 )
+from .identity import UNKNOWN_AGENT, Registry
 from .memory import Checkpoint, FactInput
 
 READ_ONLY_PROFILE = "readonly"
@@ -79,9 +80,10 @@ OPTIONAL_DOMAIN_ARG = Annotated[str | None, Field(description="Optional Chronicl
 AGENT_ARG = Annotated[str, Field(description=(
     "Agent name recorded in the output. Canonical names: claude, codex, glm, "
     "deepseek, opencode, memory-librarian, transcript-analyst, or a stable "
-    "pipeline id. Session-flavored variants (claude-<session>, Codex, "
-    "opencode-glm*) are normalized to the canonical actor; put session "
-    "context in why/text instead."
+    "pipeline id. The registry maps other spellings (claude-<session>, Codex, "
+    "opencode-glm*) to the canonical actor and keeps the given one as actor_raw; "
+    "put session context in why/text instead. Omitted, the session's agent or "
+    "the MCP client's name is used."
 ))]
 OPTIONAL_TITLE_ARG = Annotated[str | None, Field(description="Optional snapshot title.")]
 OPTIONAL_FOCUS_ARG = Annotated[str | None, Field(description="Optional focus string.")]
@@ -98,7 +100,7 @@ CAPTURE_ARG = Annotated[
     Field(description="Capture a fresh runtime snapshot before building the bundle."),
 ]
 LIMIT_ARG = Annotated[int, Field(ge=1, le=100, description="Maximum number of recent items or hits (1–100).")]
-TASK_ARG = Annotated[str | None, Field(description="Stable task ID within project. Requires project; reuse it across agents and sessions.")]
+TASK_ARG = Annotated[str | None, Field(description="Stable task ID within project. Requires project; reuse it across agents and sessions. Case, spaces and underscores do not matter.")]
 SESSION_ARG = Annotated[str | None, Field(description="Originating session ID; defaults to the current MCP session identity.")]
 REQUEST_ARG = Annotated[str | None, Field(description="Unique write request ID. Reuse unchanged on retries; changed input requires a new ID.")]
 CURSOR_ARG = Annotated[str | None, Field(description="Cursor from task_context.cursor to read changes since a previous startup in the same scope.")]
@@ -132,7 +134,7 @@ CATEGORY_ARG = Annotated[
         )
     ),
 ]
-PROJECT_ARG = Annotated[str | None, Field(description="Optional project slug attached to the event.")]
+PROJECT_ARG = Annotated[str | None, Field(description="Optional project slug; any spelling the manifest registers for it finds the same project.")]
 SOURCE_FILES_ARG = Annotated[
     list[str] | None,
     Field(description="Optional source file paths to archive with the event."),
@@ -282,34 +284,18 @@ def _offload_read(fn):
     return wrapper
 
 
-_AGENT_SOLO_ALIASES = {"operator": "claude"}
+def _client_name(ctx: Context | None) -> str | None:
+    """The name the MCP client gave in its initialize request, if any."""
+    session = _gate_session(ctx)
+    try:
+        name = session.client_params.clientInfo.name
+    except AttributeError:
+        return None
+    return name if isinstance(name, str) and name.strip() else None
 
 
-def _normalize_agent(agent: str | None) -> str:
-    """Collapse ad-hoc agent spellings to a canonical actor name.
-
-    Keeps the actor column analyzable: 25+ historical variants (claude-mac,
-    claude-sprint4-night, Codex, opencode-glm5.2, ...) all meant one of a few
-    actors. Session flavor belongs in why/text, not in the actor id.
-    """
-    a = (agent or "mcp").strip().lower()
-    if a in _AGENT_SOLO_ALIASES:
-        return _AGENT_SOLO_ALIASES[a]
-    if a.startswith("claude"):
-        return "claude"
-    if "glm" in a:
-        return "glm"
-    if "deepseek" in a:
-        return "deepseek"
-    if a.startswith("codex"):
-        return "codex"
-    if a.startswith("gemini"):
-        return "gemini"
-    if a.startswith("opencode"):
-        return "opencode"
-    if a.startswith("transcript-analyst"):
-        return "transcript-analyst"
-    return a
+def _public_identity(identity: dict) -> dict:
+    return {"session_id": identity["session_id"], "agent": identity["agent"]}
 
 
 def _startup_required_message(tool_name: str, *, domain: str = "global") -> str:
@@ -349,20 +335,34 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     gate_lock = threading.Lock()
     unlocked_sessions: weakref.WeakSet = weakref.WeakSet()
     identities: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-    fallback_identity = {"session_id": str(uuid.uuid4()), "agent": "mcp"}
+    fallback_identity = {"session_id": str(uuid.uuid4()), "agent": UNKNOWN_AGENT}
     sessionless_unlocked = False
 
-    def session_identity(ctx: Context | None, agent: str = "mcp") -> dict:
+    def registry() -> Registry:
+        return Registry.from_manifest(manifest())
+
+    def session_identity(ctx: Context | None, agent: str = UNKNOWN_AGENT) -> dict:
+        """The session's id and agent; an *agent* named here becomes the session's.
+
+        A session that never names its agent is attributed to its MCP client
+        through the registry (clientInfo.name, such as claude-code), not to an
+        anonymous "mcp" (W5). ``agent_raw`` keeps the spelling given.
+        """
         session = _gate_session(ctx)
+        names = registry()
         with gate_lock:
             if session is None:
                 identity = fallback_identity
             else:
                 if session not in identities:
-                    identities[session] = {"session_id": str(uuid.uuid4()), "agent": "mcp"}
+                    identities[session] = {"session_id": str(uuid.uuid4()), "agent": UNKNOWN_AGENT}
                 identity = identities[session]
-            if agent != "mcp":
-                identity["agent"] = _normalize_agent(agent)
+            if agent != UNKNOWN_AGENT:
+                identity.update(agent=names.agent(agent), agent_raw=agent, named=True)
+            elif not identity.get("named") and "agent_raw" not in identity:
+                client = _client_name(ctx)
+                if client:
+                    identity.update(agent=names.agent(client), agent_raw=client)
             return dict(identity)
 
     def unlock_startup_gate(ctx: Context | None) -> None:
@@ -637,17 +637,18 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         mode: STARTUP_MODE_ARG = "bundle",
         ctx: Context | None = None,
     ) -> dict:
+        identity = session_identity(ctx, agent)
         if mode == "brief":
             brief = build_brief(manifest(), project=project)
             payload = {"brief": brief["text"], "project": brief["project"], "counts": brief["counts"]}
-            payload.update(session_identity(ctx, agent))
+            payload.update(_public_identity(identity))
             unlock_startup_gate(ctx)
             return payload
         effective_capture = capture if profile == CHRONICLER_PROFILE else False
         payload = build_startup_bundle(
             manifest(),
             domain_id=domain,
-            agent=_normalize_agent(agent),
+            agent=identity["agent"],
             title=title,
             focus=focus,
             capture=effective_capture,
@@ -658,7 +659,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             since=since,
             before=before,
         )
-        payload.update(session_identity(ctx, agent))
+        payload.update(_public_identity(identity))
         unlock_startup_gate(ctx)
         return payload
 
@@ -774,7 +775,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             activation = build_activation(
                 manifest(),
                 domain_id=domain,
-                agent=_normalize_agent(agent),
+                agent=session_identity(ctx, agent)["agent"],
                 title=title,
                 focus=focus,
                 capture=capture,
@@ -834,10 +835,16 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         ) -> dict:
             require_startup_gate(ctx, tool_name="record_event", domain=domain)
             identity = session_identity(ctx, agent)
+            named = agent != UNKNOWN_AGENT
             return record_event(
                 manifest(),
                 {
-                    "agent": identity["agent"],
+                    # The spelling given, canonicalised on write (FR-14); where it
+                    # came from decides whether a retry must repeat it (W6).
+                    "agent": agent if named else identity.get("agent_raw", identity["agent"]),
+                    "agent_source": "explicit" if named else (
+                        "session" if identity.get("named") else "client" if "agent_raw" in identity else "default"
+                    ),
                     "task_id": task_id,
                     "session_id": session_id or identity["session_id"],
                     "request_id": request_id,
@@ -883,7 +890,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             captured = capture_runtime_snapshot(
                 manifest(),
                 domain_id=domain,
-                agent=_normalize_agent(agent),
+                agent=session_identity(ctx, agent)["agent"],
                 title=title,
                 focus=focus,
             )
