@@ -21,6 +21,7 @@ from anyio.lowlevel import RunVar
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -108,7 +109,7 @@ CURSOR_ARG = Annotated[str | None, Field(description="Cursor from task_context.c
 BEFORE_ARG = Annotated[str | None, Field(description="Cursor from task_context.before to read the older changes of the same scope; exclusive with since.")]
 COMPACT_ARG = Annotated[bool, Field(description="Return the compact startup bundle variant.")]
 TIMESTAMP_ARG = Annotated[str, Field(description="ISO timestamp to reconstruct around.")]
-WINDOW_HOURS_ARG = Annotated[int, Field(description="Search window in hours around the timestamp.")]
+WINDOW_HOURS_ARG = Annotated[int, Field(ge=1, le=720, description="Search window in hours around the timestamp (1–720).")]
 SNAPSHOT_DETAIL_ARG = Annotated[
     str,
     Field(
@@ -119,10 +120,14 @@ SNAPSHOT_DETAIL_ARG = Annotated[
         )
     ),
 ]
-QUERY_ARG = Annotated[str, Field(description="Search string to match across Chronicle, status sources, and Mem0.")]
+QUERY_ARG = Annotated[str, Field(description="Search string matched across Chronicle events, status markdown sections and the Mem0 dump.")]
+RECALL_QUERY_ARG = Annotated[str, Field(description="What to recall: words or a question, in any language.")]
 QUERY_MODE_ARG = Annotated[
     QUERY_CONTEXT_MODE,
-    Field(description="Retrieval mode that controls whether derived layers and scenario hits are included."),
+    Field(description=(
+        "truth_only: Chronicle events and status sources only. The other modes add the Mem0 dump and "
+        "matching entities; their interpretation and scenario layers are retired and stay empty."
+    )),
 ]
 TEXT_ARG = Annotated[str, Field(description="Durable event text to write into Chronicle.")]
 WHY_ARG = Annotated[str | None, Field(description="Optional reason or rationale for the change.")]
@@ -421,11 +426,24 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         description: str,
         writes: bool | Callable[[dict[str, Any]], bool],
         structured_output: bool | None = None,
+        destructive: bool = False,
+        open_world: bool = False,
     ):
-        """Register a sync tool body wrapped in the thread-offload + envelope layer."""
+        """Register a sync tool body wrapped in the thread-offload + envelope layer.
+
+        The annotations tell clients what a call may change: a tool that may
+        write is not read-only, one that retires or rewrites records is
+        destructive, and one that reaches a service outside Chronicle is open.
+        """
 
         def decorator(fn):
-            tool_kwargs: dict[str, Any] = {"name": name, "description": description}
+            read_only = writes is False
+            annotations = ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=None if read_only else destructive,
+                openWorldHint=open_world,
+            )
+            tool_kwargs: dict[str, Any] = {"name": name, "description": description, "annotations": annotations}
             if structured_output is not None:
                 tool_kwargs["structured_output"] = structured_output
             server.tool(**tool_kwargs)(_offload(fn, tool_name=name, writes=writes))
@@ -746,7 +764,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         ),
     )
     def tool_query_memory(
-        query: QUERY_ARG,
+        query: RECALL_QUERY_ARG,
         domain: OPTIONAL_DOMAIN_ARG = None,
         limit: LIMIT_ARG = 10,
         project: PROJECT_ARG = None,
@@ -922,6 +940,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
 
         @register_tool(
             writes=True,
+            destructive=True,  # merge retires an entity
             name="entity_admin",
             description=(
                 "Entity maintenance multiplexer — one tool for the rare admin operations. "
@@ -1003,19 +1022,20 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
 
         @register_tool(
             writes=False,
+            open_world=True,
             name="search_mem0_live",
             description=(
-                "Live semantic search over Mem0 (Qdrant + Gemini embeddings) via scripts/mem0_bridge.py. "
+                "Live semantic search over the external Mem0 stack through the bridge script the manifest names. "
                 "Fail-closed: timeouts, non-zero exits, or unparseable output return status='degraded' with "
                 "results=[] instead of raising, so Chronicle stays usable when Mem0 is down."
             ),
         )
         def tool_search_mem0_live(
             query: Annotated[str, Field(description="Semantic query text.")],
-            limit: Annotated[int, Field(description="Max results (default 10).")] = 10,
+            limit: Annotated[int, Field(ge=1, le=100, description="Max results (1–100, default 10).")] = 10,
             collection: Annotated[Literal["personal", "digest", "both"], Field(description="Which Mem0 collection to query.")] = "personal",
             category: Annotated[str | None, Field(description="Optional metadata.category filter.")] = None,
-            timeout_s: Annotated[float | None, Field(description="Override bridge timeout (seconds).")] = None,
+            timeout_s: Annotated[float | None, Field(gt=0, le=120, description="Override bridge timeout (seconds, at most 120).")] = None,
         ) -> dict:
             return search_mem0_live_service(
                 manifest(),

@@ -339,10 +339,10 @@ def test_mcp_tool_input_schemas_include_param_descriptions_and_query_mode_enum(c
     assert startup_props["compact"]["description"] == "Return the compact startup bundle variant."
 
     query_props = schemas["query_context"]["properties"]
-    assert query_props["query"]["description"] == "Search string to match across Chronicle, status sources, and Mem0."
-    assert query_props["mode"]["description"] == (
-        "Retrieval mode that controls whether derived layers and scenario hits are included."
+    assert query_props["query"]["description"] == (
+        "Search string matched across Chronicle events, status markdown sections and the Mem0 dump."
     )
+    assert query_props["mode"]["description"].startswith("truth_only: Chronicle events and status sources only.")
     assert query_props["mode"]["enum"] == [
         "truth_only",
         "truth_plus_interpretation",
@@ -1784,3 +1784,35 @@ def test_mcp_capture_snapshot_returns_a_receipt_not_the_whole_snapshot(
     for bulk_key in ("recent_ledger", "mem0_snapshot_hits", "source_excerpts"):
         assert bulk_key not in payload
     assert set(payload["normalized_entities"]) == {"count", "ids"}
+
+
+def test_query_context_leaves_old_situation_models_out(loaded_manifest) -> None:
+    from max_chronicle.store import store_situation_model
+
+    store_situation_model(config_from_manifest(loaded_manifest), {
+        "domain": "global", "status": "active", "summary_text": "Quarantine drill is the current focus",
+        "valid_at_utc": "2026-06-04T00:20:00Z"})
+
+    payload = query_context(loaded_manifest, query="Quarantine drill", domain="global", limit=5)
+
+    assert payload["interpretation_hits"] == []
+
+
+def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sandbox) -> None:
+    async def collect() -> dict[str, Any]:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        return {item.name: item for item in await server.list_tools()}
+
+    tools = asyncio.run(collect())
+    hints = {name: (tool.annotations.readOnlyHint, tool.annotations.destructiveHint, tool.annotations.openWorldHint)
+             for name, tool in tools.items()}
+
+    assert hints["query_memory"] == (True, None, False)
+    assert hints["record_event"] == (False, False, False)
+    assert hints["startup_bundle"] == (False, False, False)  # capture=true writes a snapshot
+    assert hints["entity_admin"] == (False, True, False)
+    assert hints.get("search_mem0_live", (True, None, True)) == (True, None, True)
+    recall_query = tools["query_memory"].inputSchema["properties"]["query"]["description"]
+    assert "Mem0" not in recall_query and "status" not in recall_query
+    window = tools["state_at"].inputSchema["properties"]["window_hours"]
+    assert (window["minimum"], window["maximum"]) == (1, 720)

@@ -1065,6 +1065,36 @@ def test_daily_capture_keeps_mem0_sync_non_blocking(chronicle_sandbox, loaded_ma
     assert result["sync"]["synced"] >= 1
 
 
+def test_daily_capture_with_failed_side_effects_is_not_ok(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    import max_chronicle.service as service_module
+    from max_chronicle.brief import build_brief
+
+    def broken(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("projection renderer broke")
+
+    monkeypatch.setattr(service_module, "render_projections", broken)
+
+    result = run_automation_job(loaded_manifest, loaded_automation, job_name="daily-capture", trigger_source="pytest")
+
+    assert result["status"] == "failed_soft" and result["snapshot_id"]
+    assert "projection renderer broke" in result["side_effect_errors"]["projections"]
+    with open_connection(config_from_manifest(loaded_manifest)) as connection:
+        [(status, details)] = connection.execute(
+            "SELECT status, details_json FROM automation_runs WHERE job_name = 'daily-capture'").fetchall()
+    assert status == "failed_soft" and "projections" in json.loads(details)["side_effect_errors"]
+    assert "Scheduled job daily-capture: failed_soft" in build_brief(loaded_manifest)["text"]
+
+
+def test_a_snapshot_without_a_jsonl_file_in_the_manifest_keeps_none(loaded_manifest) -> None:
+    manifest = {**loaded_manifest, "paths": {key: value for key, value in loaded_manifest["paths"].items()
+                                             if key != "snapshot_file"}}
+
+    stored = capture_runtime_snapshot(manifest, domain_id="global", agent="pytest", append_compat=True,
+                                      render_generated=False)
+
+    assert "compat_snapshot" not in stored["side_effect_errors"]
+
+
 def test_daily_capture_exception_finalizes_failed_automation_run(monkeypatch, loaded_manifest, loaded_automation) -> None:
     def raise_mid_run(*args: object, **kwargs: object) -> dict[str, object]:
         raise RuntimeError("snapshot capture exploded")

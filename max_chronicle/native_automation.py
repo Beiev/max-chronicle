@@ -2473,15 +2473,19 @@ def run_automation_job(
                     embedding_repair = embed_backfill(manifest, limit=10)
                 except Exception as exc:
                     embedding_repair = {"status": "degraded", "error": str(exc)}
+            # The snapshot is stored even when its evidence, projections or
+            # JSONL copy failed; the run says so instead of reporting ok (W2).
+            errors = snapshot.get("side_effect_errors") or {}
+            status = "failed_soft" if errors else "ok"
+            details = {"sync": sync, "embedding_repair": embedding_repair, "side_effect_errors": errors}
             finish_automation_run(
                 config,
                 run_id=run_id,
-                status="ok",
-                details={"sync": sync, "embedding_repair": embedding_repair},
+                status=status,
+                details=details,
                 snapshot_id=snapshot["id"],
             )
-            return {"status": "ok", "run_id": run_id, "snapshot_id": snapshot["id"],
-                    "sync": sync, "embedding_repair": embedding_repair}
+            return {"status": status, "run_id": run_id, "snapshot_id": snapshot["id"], **details}
 
         return _dispatch(daily_key, _daily_capture)
 
