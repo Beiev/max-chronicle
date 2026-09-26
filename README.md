@@ -325,12 +325,16 @@ can separately report `side_effect_errors` for failed evidence/projection output
   token, password, secret, or API key (anywhere on a short line, within 256
   characters on a long one). Hex digests, UUIDs, and pieces of long base64 runs
   (encoded images) never count as high-entropy tokens.
-  A text bears a private key when it shows a BEGIN or END line of one (in any
-  case, spacing or escaping) or the first bytes of a key body. Such a text loses
-  the markers and every run of 16 or more base64 characters that reads as random
-  bytes, however the key was wrapped, quoted, fenced, escaped or cut; words,
-  paths, links, hex digests, UUIDs and data: URIs stay. A key body cut into
-  pieces shorter than 16 characters, other than its last line, is not recognised.
+  Private keys are found by their BEGIN or END line (in any case, spacing or
+  escaping) or by their own bytes: PKCS#1, PKCS#8, SEC1, encrypted PKCS#8 and
+  PKCS#12 bodies, OpenSSH and OpenPGP secret keys, a PEM encoded again in base64
+  (Kubernetes secrets, cloud key downloads), PuTTY key files, and JWK private
+  members. From that line on, the markers go, every line that continues a key
+  goes (however its line breaks are escaped), and so does every run of 16 or
+  more base64 characters that reads as random bytes; words, paths, links,
+  assignments, hex digests, UUIDs and image data stay, and so does everything
+  before the key. A key body cut into pieces shorter than 16 characters and
+  interrupted by other text is not recognised.
   Identifiers such as `request_id` and paths are left as given, the source file is
   never modified, and binary evidence is archived unchanged. Not filtered yet:
   snapshot excerpts, legacy imports, and Mem0 responses. Time is linear in the

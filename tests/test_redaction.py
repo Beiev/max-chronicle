@@ -651,3 +651,122 @@ def test_a_mention_of_a_key_keeps_paths_links_names_and_images() -> None:
     result = redact(text).text
 
     assert all(item in result for item in kept)
+
+
+# Sixth review of #14: key formats known by their content, escaped line breaks, and what stays.
+
+_DER_STARTS = {  # structure only; the private bytes that follow are random
+    "pkcs12": "308209f2020103308209a806092a864886f70d010701a082",
+    "p384_pkcs8": "3081b6020100301006072a8648ce3d020106052b81040022",
+    "p384_sec1": "3081a40201010430",
+    "p384_pbes2": "30820124305f06092a864886f70d01050d3052303106092a",
+    "p521_pkcs8": "3081ee020100301006072a8648ce3d020106052b81040023",
+    "secp256k1_pkcs8": "308184020100301006072a8648ce3d020106052b8104000a",
+    "secp256k1_sec1": "30740201010420",
+    "secp256k1_pbes2": "3081f4305f06092a864886f70d01050d3052303106092a86",
+    "openpgp_secret": "c5c2d8046ab80dd8",
+}
+
+
+def _b64_lines(data: bytes, width: int = 64) -> list[str]:
+    body = base64.b64encode(data).decode()
+    return [body[i:i + width] for i in range(0, len(body), width)]
+
+
+@pytest.mark.parametrize("name", list(_DER_STARTS))
+def test_a_bare_key_body_is_known_by_its_first_bytes(name: str) -> None:
+    lines = _b64_lines(bytes.fromhex(_DER_STARTS[name]) + random.randbytes(300))
+    result = redact("Pasted:\n" + "\n".join(lines) + "\nDone.\n").text
+
+    assert not any(line[i:i + 12] in result for line in lines[1:] for i in range(len(line) - 11))
+    assert result.startswith("Pasted:\n") and result.endswith("Done.\n")
+
+
+def _ppk() -> tuple[str, list[str]]:
+    private = _b64_lines(random.randbytes(640))
+    text = ("PuTTY-User-Key-File-3: ssh-rsa\nEncryption: none\nComment: example\nPublic-Lines: 2\n"
+            + "\n".join(_b64_lines(random.randbytes(90))) + f"\nPrivate-Lines: {len(private)}\n" + "\n".join(private)
+            + "\nPrivate-MAC: " + random.randbytes(32).hex() + "\n")
+    return text, private
+
+
+def _jwk() -> tuple[str, list[str]]:
+    def member() -> str:
+        return base64.urlsafe_b64encode(random.randbytes(256)).decode().rstrip("=")
+
+    values = {name: member() for name in ("n", "d", "p", "q", "dp", "dq", "qi")}
+    return json.dumps({"kty": "RSA", "e": "AQAB", **values}, indent=2), [values[name] for name in ("d", "p", "q")]
+
+
+def _wrapped_pem() -> tuple[str, list[str]]:
+    pem, lines = _pem()
+    return base64.b64encode(pem.encode()).decode(), [base64.b64encode(pem.encode()).decode()[200:600]]
+
+
+@pytest.mark.parametrize("shape", ["ppk", "jwk", "kubernetes", "cloud_key_download", "non_image_data_uri"])
+def test_keys_in_other_formats_go(shape: str) -> None:
+    if shape == "ppk":
+        text, secrets_ = _ppk()
+    elif shape == "jwk":
+        text, secrets_ = _jwk()
+    elif shape == "kubernetes":
+        encoded, secrets_ = _wrapped_pem()
+        text = "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: " + encoded + "\n"
+    elif shape == "cloud_key_download":
+        pem, _ = _pem("", _PKCS8)
+        encoded = base64.b64encode(json.dumps({"type": "service_account", "private_key": pem}).encode()).decode()
+        text, secrets_ = json.dumps({"privateKeyData": encoded}), [encoded[300:700]]
+    else:
+        pem, lines = _pem()
+        text = "-----BEGIN RSA " + "PRIVATE KEY-----\ndata:application/octet-stream;base64," + "".join(lines) + "\n"
+        secrets_ = lines[2:6]
+
+    result = redact(text).text
+
+    assert not any(value[i:i + 16] in result for value in secrets_ for i in range(len(value) - 15))
+
+
+@pytest.mark.parametrize("wrap", ["json", "double_json", "toml", "html_br", "json_unicode", "html_named"])
+def test_every_line_of_a_key_goes_through_escaped_line_breaks(wrap: str) -> None:
+    pem, lines = _pem("", _PKCS8, 631)  # ends in a 12-character line
+    presented = {
+        "json": json.dumps({"key": pem}),
+        "double_json": json.dumps({"payload": json.dumps({"key": pem})}),
+        "toml": 'key = "' + pem.replace("\n", "\\n") + '"',
+        "html_br": pem.replace("\n", "<br>"),
+        "json_unicode": json.dumps({"key": pem}).replace("/", "\\u002f").replace("+", "\\u002b"),
+        "html_named": "<pre>" + pem.replace("/", "&sol;").replace("+", "&plus;").replace("=", "&equals;") + "</pre>",
+    }[wrap]
+
+    result = redact(presented).text
+
+    assert len(lines[-1]) == 12 and lines[-1].rstrip("=") not in result
+    assert not any(line[i:i + 12] in result for line in lines for i in range(len(line) - 11))
+
+
+def test_word_like_and_short_last_lines_go_with_their_key() -> None:
+    body = [line for line in _pem()[1][:-1]] + ["kQymwxFEVEFbtfpW"]
+    wrapped = [piece for line in body for piece in (line[i:i + 16] for i in range(0, len(line), 16))]
+    for lines in (body, wrapped):
+        result = redact("-----BEGIN RSA " + "PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA " + "PRIVATE KEY-----\n")
+        assert result.text == "[REDACTED:private_key]\n"
+
+
+def test_text_before_a_key_and_prose_between_its_parts_stay() -> None:
+    kept = ["/usr/lib/x86_64-linux-gnu", "/api/v1/users/123456", "CHRONICLE_DB=/tmp/demo.db",
+            "AWS_DEFAULT_REGION=us-east-1", "foo_bar_baz_quux_123", "01234567-89aB-cDef-0123-456789abcdef",
+            "A0b1C2d3E4f5A0b1C2d3E4f5A0b1C2d3E4f5A0b1"]
+    pem, lines = _pem()
+    head, tail = pem.split("\n", 5)[:5], pem.split("\n", 5)[5]
+    text = "\n".join(kept) + "\n\n" + "\n".join(head) + "\nЭто ключ продакшена, не трогать до ротации.\n" + tail
+
+    result = redact(text).text
+
+    assert all(item in result for item in kept) and "Это ключ продакшена, не трогать до ротации." in result
+    assert not any(line[i:i + 12] in result for line in lines for i in range(len(line) - 11))
+
+
+def test_a_long_run_of_zeros_in_an_entity_does_not_break_the_filter() -> None:
+    pem, _ = _pem()
+
+    assert "[REDACTED:private_key]" in redact(pem + "&#" + "0" * 5000 + "47;").text
