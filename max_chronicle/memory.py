@@ -174,7 +174,13 @@ def _earlier_request_hashes(entry: dict[str, Any]) -> set[str]:
     agents = {given, _agent_0_12(given)}
     if entry.get("agent_source", "explicit") not in ("explicit", "session"):
         agents |= {None, UNKNOWN_AGENT}
-    return {_hash(material | {"agent": agent}) for agent in agents}
+    hashes = {_hash(material | {"agent": agent}) for agent in agents}
+    if entry.get("agent_source", "explicit") != "explicit":
+        # Pre-release builds of 0.13.0 left an implicit agent out and had no
+        # hash format; 0.12.0 always hashed an agent key, so this matches
+        # neither its requests nor any written now.
+        hashes.add(_hash(material))
+    return hashes
 
 
 def request_receipt(
