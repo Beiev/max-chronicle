@@ -471,6 +471,20 @@ def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset(),
     object or array is decoded and filtered as a value too, however many times it
     was encoded, and written back as JSON when anything in it was redacted.
     """
+    return _redact_value(value, skip_keys, secret, None)
+
+
+JSON_TEXT_MAX_LENGTH = 1 << 20
+JSON_TEXT_MAX_DEPTH = 32
+
+
+def _redact_value(value: Any, skip_keys: frozenset[str], secret: bool,
+                  levels: int | None) -> tuple[Any, Counter[str]]:
+    """redact_value; *levels* is how deep JSON decoded from a string may still be walked, None outside one.
+
+    JSON below that depth, across every level of encoding, keeps what the text
+    filter left: walking it could exhaust the stack.
+    """
     counts: Counter[str] = Counter()
     if isinstance(value, str):
         if secret and _plausible_assigned_value(value):
@@ -479,17 +493,25 @@ def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset(),
         result = redact(value)
         counts.update(result.counts)
         text = result.text
-        decoded = _json_container(text)
+        budget = JSON_TEXT_MAX_DEPTH if levels is None else levels
+        decoded = _json_container(text) if budget else None
         if decoded is not None:
-            redacted, found = redact_value(decoded)
+            redacted, found = _redact_value(decoded, frozenset(), False, budget)
             if found:
+                try:
+                    text = json.dumps(redacted, ensure_ascii=False)
+                except (ValueError, RecursionError):
+                    text = MARKER.format(kind="assigned_secret")
                 counts.update(found)
-                text = json.dumps(redacted, ensure_ascii=False)
         return text, counts
+    if isinstance(value, (list, dict)) and levels is not None:
+        if levels == 0:
+            return value, counts
+        levels -= 1
     if isinstance(value, list):
         items = []
         for item in value:
-            redacted, found = redact_value(item, skip_keys=skip_keys, secret=secret)
+            redacted, found = _redact_value(item, skip_keys, secret, levels)
             items.append(redacted)
             counts.update(found)
         return items, counts
@@ -500,23 +522,15 @@ def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset(),
                 mapping[key] = item
                 continue
             named = isinstance(key, str) and _SECRET_NAME.search(key) is not None
-            redacted, found = redact_value(item, skip_keys=skip_keys,
-                                           secret=named and not isinstance(item, dict))
+            redacted, found = _redact_value(item, skip_keys, named and not isinstance(item, dict), levels)
             mapping[key] = redacted
             counts.update(found)
         return mapping, counts
     return value, counts
 
 
-JSON_TEXT_MAX_LENGTH = 1 << 20
-JSON_TEXT_MAX_DEPTH = 32
-
-
 def _json_container(text: str) -> dict[str, Any] | list[Any] | None:
-    """The object or array that *text* holds as JSON, nested at most JSON_TEXT_MAX_DEPTH deep, or None.
-
-    Deeper JSON stays text, filtered as text: walking it would exhaust the stack.
-    """
+    """The object or array that *text* holds as JSON, or None."""
     stripped = text.strip()
     if stripped[:1] not in ("{", "[") or len(stripped) > JSON_TEXT_MAX_LENGTH:
         return None
@@ -524,13 +538,4 @@ def _json_container(text: str) -> dict[str, Any] | list[Any] | None:
         decoded = json.loads(stripped)
     except (ValueError, RecursionError):
         return None
-    if not isinstance(decoded, (dict, list)):
-        return None
-    pending = [(decoded, 1)]
-    while pending:
-        value, depth = pending.pop()
-        if depth > JSON_TEXT_MAX_DEPTH:
-            return None
-        children = value.values() if isinstance(value, dict) else value
-        pending.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
-    return decoded
+    return decoded if isinstance(decoded, (dict, list)) else None

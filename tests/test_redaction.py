@@ -881,3 +881,16 @@ def test_json_nested_too_deep_stays_text() -> None:
     value, counts = redact_value({"text": deep})
 
     assert value == {"text": deep} and not counts
+
+
+@pytest.mark.parametrize("depth", [2, 33, 100])
+def test_a_deep_branch_does_not_hide_a_shallow_secret(depth) -> None:
+    trace: object = 0
+    for _ in range(depth):
+        trace = {"child": trace}
+    text = json.dumps({"password": ["Correct-Horse-9"], "encoded": json.dumps({"password": "Battery-Staple-7"}),
+                       "trace": trace})
+
+    value, counts = redact_value(text)
+
+    assert "Correct-Horse-9" not in value and "Battery-Staple-7" not in value and counts["assigned_secret"] == 2

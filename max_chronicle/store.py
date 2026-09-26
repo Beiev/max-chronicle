@@ -3370,16 +3370,17 @@ def timeline_state(
         # julianday keeps milliseconds, which unixepoch drops.
         snapshot_sql += " AND julianday(captured_at_utc) <= julianday(?)"
         snapshot_params = (*snapshot_params, target_utc)
-        # Received by then: the first observation, or for a legacy import, which
-        # has none, the commit of its import run, counted from the next second
-        # since the run's time is floored to one.
+        # Received by then: the first observation or, for a legacy import, the
+        # commit of its import run, whichever came first; a run counts from the
+        # next second, since its time is floored to one.
         window_sql = """julianday(e.occurred_at_utc) BETWEEN julianday(?) - ? / 24.0 AND julianday(?)
-              AND COALESCE(
-                  (SELECT MIN(julianday(ob.recorded_at_utc)) FROM event_observations AS ob
-                   WHERE ob.event_id = e.id),
-                  (SELECT MIN(julianday(r.finished_at_utc)) + 1 / 86400.0 FROM ingest_runs AS r
-                   WHERE e.source_kind = 'legacy_jsonl' AND r.adapter = 'legacy_ledger'
-                     AND r.status = 'completed' AND r.source_hash = e.source_hash)
+              AND (SELECT MIN(received) FROM (
+                  SELECT julianday(ob.recorded_at_utc) AS received FROM event_observations AS ob
+                  WHERE ob.event_id = e.id
+                  UNION ALL
+                  SELECT julianday(r.finished_at_utc) + 1 / 86400.0 FROM ingest_runs AS r
+                  WHERE e.source_kind = 'legacy_jsonl' AND r.adapter = 'legacy_ledger'
+                    AND r.status = 'completed' AND r.source_hash = e.source_hash)
               ) <= julianday(?)"""
         window_params: tuple[Any, ...] = (target_utc, window_hours, target_utc, target_utc)
     else:

@@ -138,6 +138,31 @@ def test_as_of_knows_a_legacy_import_from_the_import_on(loaded_manifest, monkeyp
     assert _texts(service.reconstruct_timeline(loaded_manifest, timestamp=early, as_of=True)) == []
 
 
+def test_a_later_confirmation_leaves_what_an_import_made_known(loaded_manifest, monkeypatch) -> None:
+    from max_chronicle import bootstrap, memory
+
+    config = config_from_manifest(loaded_manifest)
+    row = {"id": "legacy-1", "text": "Imported decision", "domain": "global", "category": "note",
+           "recorded_at": "2026-09-10T10:00:00Z"}
+    config.ledger_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "utc_now", lambda: "2026-09-10T11:00:00Z")
+    with open_connection(config) as connection, connection:
+        bootstrap.import_legacy_ledger(connection, config)
+
+    class _Later(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 10, 13, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(memory, "datetime", _Later)
+    confirmed = service.record_event(loaded_manifest, {"text": row["text"], "domain": "global", "category": "note",
+                                                       "agent": "agent-b", "recorded_at": row["recorded_at"]},
+                                     dedupe=True, append_compat=False)
+
+    assert confirmed["id"] == "legacy-1"
+    assert _texts(service.reconstruct_timeline(loaded_manifest, timestamp=T, as_of=True)) == ["Imported decision"]
+
+
 def test_a_legacy_import_leaves_the_current_handoff(loaded_manifest, monkeypatch) -> None:
     from max_chronicle import bootstrap
     from max_chronicle.memory import task_context
