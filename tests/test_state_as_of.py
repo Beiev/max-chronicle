@@ -82,6 +82,62 @@ def test_agents_do_not_see_a_quarantined_event_in_the_timeline(chronicle_sandbox
         "Quarantined import"]
 
 
+def test_agents_do_not_see_the_fact_of_a_quarantined_event(chronicle_sandbox, loaded_manifest) -> None:
+    _record(loaded_manifest, "Quarantined decision", "2026-09-10T11:00:00Z", "2026-09-10T11:00:00Z",
+            memory_guard={"visibility": "raw_only"},
+            fact={"slot": "deploy.target", "value": "quarantined", "kind": "decision"})
+    server = build_server(manifest_path=chronicle_sandbox.manifest_path)
+
+    async def state_at() -> dict:
+        result = await server.call_tool("state_at", {"timestamp": T.isoformat(), "mode": "as_of"})
+        content = result[0] if isinstance(result, tuple) else result
+        return json.loads(content[0].text)
+
+    assert asyncio.run(state_at())["facts"] == []
+    operator = service.reconstruct_timeline(loaded_manifest, timestamp=T, as_of=True)
+    assert [fact["value"] for fact in operator["facts"]] == ["quarantined"]
+
+
+def test_as_of_compares_to_the_millisecond(loaded_manifest) -> None:
+    _record(loaded_manifest, "Received just after", "2026-09-10T12:00:00.900Z", "2026-09-10T12:00:00.900Z",
+            fact={"slot": "deploy.target", "value": "production", "kind": "decision"})
+
+    before = service.reconstruct_timeline(loaded_manifest, timestamp=T.replace(microsecond=100_000), as_of=True)
+    after = service.reconstruct_timeline(loaded_manifest, timestamp=T.replace(microsecond=950_000), as_of=True)
+
+    assert (before["target_utc"], _texts(before), before["facts"]) == ("2026-09-10T12:00:00.100Z", [], [])
+    assert _texts(after) == ["Received just after"] and [f["value"] for f in after["facts"]] == ["production"]
+
+
+def test_as_of_leaves_out_the_mem0_sync_state(loaded_manifest) -> None:
+    from max_chronicle.store import update_event_mem0_state
+
+    stored = _record(loaded_manifest, "Synced the next day", "2026-09-10T11:00:00Z", "2026-09-10T11:00:00Z")
+    update_event_mem0_state(config_from_manifest(loaded_manifest), event_id=stored["id"], mem0_status="stored",
+                            mem0_raw="response of the next day", mem0_synced_at="2026-09-11T15:00:00Z")
+
+    [then] = service.reconstruct_timeline(loaded_manifest, timestamp=T, as_of=True)["events"]
+    [around] = service.reconstruct_timeline(loaded_manifest, timestamp=T)["events"]
+
+    assert not {"mem0_status", "mem0_raw", "mem0_synced_at", "mem0_error"} & set(then)
+    assert around["mem0_raw"] == "response of the next day"
+
+
+def test_as_of_knows_a_legacy_import_from_the_import_on(loaded_manifest, monkeypatch) -> None:
+    from max_chronicle import bootstrap
+
+    config = config_from_manifest(loaded_manifest)
+    config.ledger_path.write_text(json.dumps({"id": "legacy-1", "text": "Imported decision", "domain": "global",
+                                              "recorded_at": "2026-09-10T10:00:00Z"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "utc_now", lambda: "2026-09-10T11:00:00Z")
+    with open_connection(config) as connection, connection:
+        bootstrap.import_legacy_ledger(connection, config)
+
+    assert _texts(service.reconstruct_timeline(loaded_manifest, timestamp=T, as_of=True)) == ["Imported decision"]
+    early = datetime(2026, 9, 10, 10, 30, tzinfo=timezone.utc)
+    assert _texts(service.reconstruct_timeline(loaded_manifest, timestamp=early, as_of=True)) == []
+
+
 def test_the_cli_prints_the_facts_current_then(chronicle_sandbox, loaded_manifest, monkeypatch, capsys) -> None:
     _record(loaded_manifest, "Deploys go to staging", "2026-09-09T09:00:00Z", "2026-09-09T09:00:00Z",
             fact={"slot": "deploy.target", "value": "staging", "kind": "decision"})

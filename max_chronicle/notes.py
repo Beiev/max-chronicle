@@ -46,7 +46,7 @@ from .store import _fts_query, config_from_manifest, open_connection, write_tran
 
 NOTE_SOURCE = "notes"
 # Bump when parsing or the secret filter changes: every note is indexed again.
-NOTE_INDEX_VERSION = 3
+NOTE_INDEX_VERSION = 4
 # Notes that hold keys are skipped by name as well as filtered by content.
 # A note about a key (which file, which host) stays; a pasted key block is redacted by content.
 DEFAULT_DENY = ("*api-key*", "*api_key*", "*apikey*", "*secret*", "*credential*", "*password*", "*keys.md",
@@ -448,6 +448,9 @@ def _first_title(body: str) -> str | None:
     return None
 
 
+_INLINE_COMMENT = re.compile(r"\s#")
+
+
 def _named_project(data: bytes, identities: Registry) -> str | None:
     """The project a note names in its frontmatter (`project: ...`), resolved through the registry.
 
@@ -459,7 +462,9 @@ def _named_project(data: bytes, identities: Registry) -> str | None:
     if text is None:
         return None
     fields, _ = _frontmatter(text.replace("\r\n", "\n").replace("\r", "\n"))
-    named = redact(fields["project"]).text.strip() if fields.get("project") else ""
+    # A name never holds " #", so there it starts a YAML comment, as in `project: atlas # archived`.
+    named = _INLINE_COMMENT.split(fields.get("project") or "", maxsplit=1)[0].strip().strip("\"'")
+    named = redact(named).text.strip() if named else ""
     return identities.project(named) if named else None
 
 

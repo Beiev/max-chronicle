@@ -176,6 +176,29 @@ def import_legacy_ledger(
                     row.get("mem0_error"),
                 ),
             )
+            # Chronicle learned of the event at the import, as state_at(mode="as_of")
+            # reads it; the row mirrors the backfill of migration 0010.
+            connection.execute(
+                """
+                INSERT INTO event_observations(
+                    id, event_id, request_hash, observation_hash, domain, project,
+                    task_id, session_id, actor, recorded_at_utc, payload_json
+                )
+                VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    event_id,
+                    event_id,
+                    row.get("domain") or "global",
+                    row.get("project"),
+                    row.get("task_id"),
+                    row.get("session_id"),
+                    row.get("agent"),
+                    started_at,
+                    _json(row),
+                ),
+            )
 
             if queue_mem0 and row.get("category"):
                 outbox_status = "synced" if row.get("mem0_status") == "stored" else "pending"

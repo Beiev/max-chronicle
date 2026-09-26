@@ -853,3 +853,23 @@ def test_code_and_links_after_a_key_stay() -> None:
     result = redact(pem + "\n" + "\n".join(kept) + "\n").text
 
     assert all(item in result for item in kept)
+
+
+def test_a_secret_name_covers_the_strings_of_its_list() -> None:
+    value, counts = redact_value({"password": ["Correct-Horse-9", "Battery-Staple-7"], "tags": ["Release-Notes-2"]})
+
+    assert value == {"password": ["[REDACTED:assigned_secret]"] * 2, "tags": ["Release-Notes-2"]}
+    assert counts["assigned_secret"] == 2
+
+
+def test_json_held_in_a_string_is_filtered_at_any_depth_of_encoding() -> None:
+    inner = {"password": "Correct-Horse-9", "note": "rotate monthly"}
+    once = json.dumps(inner)
+    twice = json.dumps({"nested": once})
+
+    value, _ = redact_value({"twice": twice, "plain": "{not json", "list": "[1, 2]"})
+
+    assert "Correct-Horse-9" not in json.dumps(value)
+    assert json.loads(json.loads(value["twice"])["nested"]) == {"password": "[REDACTED:assigned_secret]",
+                                                                "note": "rotate monthly"}
+    assert (value["plain"], value["list"]) == ("{not json", "[1, 2]")  # unchanged, byte for byte

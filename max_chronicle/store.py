@@ -3355,22 +3355,25 @@ def timeline_state(
     Around: the nearest snapshots and the events within the window on either
     side. As of: snapshots taken by then, events of the window before it that
     the server had received by then (their first observation), and the facts
-    that were current then, retired since or not.
+    that were current then, retired since or not. As of compares to the
+    millisecond, hides the facts of quarantined events as it hides the events,
+    and leaves out the Mem0 sync state, which is not kept per moment.
     """
     if detail not in ("digest", "full"):
         raise ValueError(f"detail must be 'digest' or 'full', got {detail!r}")
     resolved_visibility = _normalize_event_visibility(visibility)
-    target_utc = target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    target_utc = _utc_stamp(target)
     snapshot_sql, snapshot_params = config.identities.scope(domain=domain).where(
         domain="domain", project="NULL", task="NULL")
     scope_sql, scope_params = _event_scope(config, domain=domain)
     if as_of:
-        snapshot_sql += " AND unixepoch(captured_at_utc) <= unixepoch(?)"
+        # julianday keeps milliseconds, which unixepoch drops.
+        snapshot_sql += " AND julianday(captured_at_utc) <= julianday(?)"
         snapshot_params = (*snapshot_params, target_utc)
-        window_sql = """unixepoch(e.occurred_at_utc) BETWEEN unixepoch(?) - ? AND unixepoch(?)
-              AND (SELECT MIN(unixepoch(ob.recorded_at_utc)) FROM event_observations AS ob
-                   WHERE ob.event_id = e.id) <= unixepoch(?)"""
-        window_params: tuple[Any, ...] = (target_utc, window_hours * 3600, target_utc, target_utc)
+        window_sql = """julianday(e.occurred_at_utc) BETWEEN julianday(?) - ? / 24.0 AND julianday(?)
+              AND (SELECT MIN(julianday(ob.recorded_at_utc)) FROM event_observations AS ob
+                   WHERE ob.event_id = e.id) <= julianday(?)"""
+        window_params: tuple[Any, ...] = (target_utc, window_hours, target_utc, target_utc)
     else:
         window_sql = "ABS(unixepoch(e.occurred_at_utc) - unixepoch(?)) <= ?"
         window_params = (target_utc, window_hours * 3600)
@@ -3417,7 +3420,7 @@ def timeline_state(
             """,
             (resolved_visibility, *window_params, *scope_params),
         ).fetchall()
-        fact_rows = _facts_as_of(connection, config, target_utc, domain) if as_of else []
+        fact_rows = _facts_as_of(connection, config, target_utc, domain, resolved_visibility) if as_of else []
 
     snapshots: list[dict[str, Any]] = []
     for row in snapshot_rows:
@@ -3435,28 +3438,50 @@ def timeline_state(
         "events": [_event_row_to_entry(row) for row in event_rows],
     }
     if as_of:
+        for event in payload["events"]:
+            for key in _MEM0_SYNC_KEYS:
+                event.pop(key, None)
         payload["facts"] = fact_rows
     return payload
+
+
+# Mem0 sync state is overwritten in place, so as_of cannot tell what it was then.
+_MEM0_SYNC_KEYS = ("mem0_status", "mem0_error", "mem0_raw", "mem0_synced_at")
+
+
+def _utc_stamp(moment: datetime) -> str:
+    """*moment* in UTC, to the second, or to the millisecond when it has a fraction (rounded down)."""
+    moment = moment.astimezone(timezone.utc)
+    if moment.microsecond // 1000:
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 FACTS_AS_OF_LIMIT = 50
 
 
 def _facts_as_of(connection: sqlite3.Connection, config: ChronicleConfig, target_utc: str,
-                 domain: str | None) -> list[dict[str, Any]]:
-    """The facts current at *target_utc*: recorded by then and not yet retired, newest first."""
+                 domain: str | None, visibility: str = "default") -> list[dict[str, Any]]:
+    """The facts current at *target_utc*: recorded by then and not yet retired, newest first.
+
+    Outside the raw visibility, the fact of a quarantined event is hidden with it.
+    """
     scope_sql, scope_params = config.identities.scope(domain=domain).where(
         domain="domain", project="json_extract(group_id,'$[0]')", task="json_extract(group_id,'$[1]')")
     rows = connection.execute(
         """SELECT id, domain, group_id, slot_key, value_key, attributes_json, attributed_to,
                   recorded_at_utc, expired_at_utc
-           FROM facts
+           FROM facts AS f
            WHERE status NOT IN ('redacted', 'purged') AND """ + scope_sql + """
-             AND unixepoch(recorded_at_utc) <= unixepoch(?)
-             AND (expired_at_utc IS NULL OR unixepoch(expired_at_utc) > unixepoch(?))
+             AND julianday(recorded_at_utc) <= julianday(?)
+             AND (expired_at_utc IS NULL OR julianday(expired_at_utc) > julianday(?))
+             AND (? = 'raw' OR NOT EXISTS (
+                 SELECT 1 FROM events AS fe
+                 WHERE fe.id = json_extract(f.attributes_json, '$.event_id')
+                   AND json_extract(fe.payload_json, '$.memory_guard.visibility') = 'raw_only'))
            ORDER BY recorded_at_utc DESC, row_id DESC
            LIMIT ?""",
-        (*scope_params, target_utc, target_utc, FACTS_AS_OF_LIMIT),
+        (*scope_params, target_utc, target_utc, visibility, FACTS_AS_OF_LIMIT),
     ).fetchall()
     facts = []
     for row in rows:

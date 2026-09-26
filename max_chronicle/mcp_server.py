@@ -718,7 +718,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "(nearest snapshots + events in a window). Use for 'what was happening on <date>'; "
             "for topic search use query_memory. mode='as_of' answers 'what did we know then': "
             "only snapshots taken by then, events of the window before it that had been recorded "
-            "by then, and the facts current then. Snapshots come back digested — their "
+            "by then (without their Mem0 sync state), and the facts current then. Snapshots come back digested — their "
             "capture-time copies of the ledger and of semantic recall are replaced by a "
             "count, since live recall serves those better; pass detail=\"full\" to get the "
             "stored payload verbatim (tens of KB per snapshot)."

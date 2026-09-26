@@ -23,6 +23,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import functools
+import json
 import math
 import re
 from typing import Any
@@ -460,22 +461,35 @@ def _random_entropy(length: int, alphabet: int) -> float:
     return alphabet * bits
 
 
-def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset()) -> tuple[Any, Counter[str]]:
+def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset(),
+                 secret: bool = False) -> tuple[Any, Counter[str]]:
     """Redact every string inside ``value``, except under ``skip_keys`` of a mapping.
 
     A string under a key named like a secret ("password", "AWS_SECRET_ACCESS_KEY",
-    "accessToken") is redacted whole when it looks like a credential, since its
-    own text would not say so.
+    "accessToken"), directly or in a list, is redacted whole when it looks like a
+    credential, since its own text would not say so. A string that holds a JSON
+    object or array is decoded and filtered as a value too, however many times it
+    was encoded, and written back as JSON when anything in it was redacted.
     """
     counts: Counter[str] = Counter()
     if isinstance(value, str):
+        if secret and _plausible_assigned_value(value):
+            counts["assigned_secret"] += 1
+            return MARKER.format(kind="assigned_secret"), counts
         result = redact(value)
         counts.update(result.counts)
-        return result.text, counts
+        text = result.text
+        decoded = _json_container(text)
+        if decoded is not None:
+            redacted, found = redact_value(decoded)
+            if found:
+                counts.update(found)
+                text = json.dumps(redacted, ensure_ascii=False)
+        return text, counts
     if isinstance(value, list):
         items = []
         for item in value:
-            redacted, found = redact_value(item, skip_keys=skip_keys)
+            redacted, found = redact_value(item, skip_keys=skip_keys, secret=secret)
             items.append(redacted)
             counts.update(found)
         return items, counts
@@ -485,17 +499,25 @@ def redact_value(value: Any, *, skip_keys: frozenset[str] = frozenset()) -> tupl
             if key in skip_keys:
                 mapping[key] = item
                 continue
-            if (
-                isinstance(key, str)
-                and isinstance(item, str)
-                and _SECRET_NAME.search(key)
-                and _plausible_assigned_value(item)
-            ):
-                mapping[key] = MARKER.format(kind="assigned_secret")
-                counts["assigned_secret"] += 1
-                continue
-            redacted, found = redact_value(item, skip_keys=skip_keys)
+            named = isinstance(key, str) and _SECRET_NAME.search(key) is not None
+            redacted, found = redact_value(item, skip_keys=skip_keys,
+                                           secret=named and not isinstance(item, dict))
             mapping[key] = redacted
             counts.update(found)
         return mapping, counts
     return value, counts
+
+
+JSON_TEXT_MAX_LENGTH = 1 << 20
+
+
+def _json_container(text: str) -> dict[str, Any] | list[Any] | None:
+    """The object or array that *text* holds as JSON, or None."""
+    stripped = text.strip()
+    if stripped[:1] not in ("{", "[") or len(stripped) > JSON_TEXT_MAX_LENGTH:
+        return None
+    try:
+        decoded = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return None
+    return decoded if isinstance(decoded, (dict, list)) else None

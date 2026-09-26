@@ -1855,3 +1855,23 @@ def test_live_mem0_results_pass_the_secret_filter(loaded_manifest, monkeypatch) 
     out = service_module.search_mem0_live_service(loaded_manifest, query="api key", timeout_s=5)
 
     assert key not in json.dumps(out) and out["redactions"]
+
+
+def test_mem0_metadata_keeps_a_secret_name_through_lists_and_encoded_json(loaded_manifest, monkeypatch) -> None:
+    import max_chronicle.service as service_module
+
+    password = "Pw-" + _mem0_key()[3:19]
+    metadata = {"password": [password],
+                "twice_encoded": json.dumps({"nested": json.dumps({"password": password})})}
+
+    class _Bridge:
+        returncode, stderr = 0, ""
+        stdout = json.dumps({"results": [{"id": "m-1", "memory": "deployment", "metadata": metadata}], "count": 1})
+
+    monkeypatch.setattr(service_module.subprocess, "run", lambda *args, **kwargs: _Bridge())
+    monkeypatch.setenv("CHRONICLE_FEATURE_SEARCH_MEM0_LIVE", "1")
+
+    out = service_module.search_mem0_live_service(loaded_manifest, query="deployment", timeout_s=5)
+
+    assert password not in json.dumps(out)
+    assert out["results"][0]["metadata"]["password"] == ["[REDACTED:assigned_secret]"]
