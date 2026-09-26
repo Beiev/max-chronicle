@@ -46,7 +46,7 @@ from .store import _fts_query, config_from_manifest, open_connection, write_tran
 
 NOTE_SOURCE = "notes"
 # Bump when parsing or the secret filter changes: every note is indexed again.
-NOTE_INDEX_VERSION = 2
+NOTE_INDEX_VERSION = 3
 # Notes that hold keys are skipped by name as well as filtered by content.
 # A note about a key (which file, which host) stays; a pasted key block is redacted by content.
 DEFAULT_DENY = ("*api-key*", "*api_key*", "*apikey*", "*secret*", "*credential*", "*password*", "*keys.md",

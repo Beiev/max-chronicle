@@ -1090,7 +1090,7 @@ def test_a_note_indexed_by_an_older_version_is_indexed_again_unchanged(notes) ->
 # The parser and the secret filter, as indexed notes were made with them.
 # Changing either changes this digest: bump NOTE_INDEX_VERSION so every note
 # is indexed again, then record the new digest under the new version.
-INDEX_DIGESTS = {2: "e5282047e6ed103512afccb0b0d654f5cc829adbdb83ed9bee5f843d672e587b"}
+INDEX_DIGESTS = {3: "010c55a65bc1442ed17e6333c9da88dfd537cfc1b8a9b4027915d0c37f32fd45"}
 
 
 def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:

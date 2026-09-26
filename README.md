@@ -328,13 +328,17 @@ can separately report `side_effect_errors` for failed evidence/projection output
   Private keys are found by their BEGIN or END line (in any case, spacing or
   escaping) or by their own bytes: PKCS#1, PKCS#8, SEC1, encrypted PKCS#8 and
   PKCS#12 bodies, OpenSSH and OpenPGP secret keys, a PEM encoded again in base64
-  (Kubernetes secrets, cloud key downloads), PuTTY key files, and JWK private
-  members. From that line on, the markers go, every line that continues a key
+  (Kubernetes secrets, cloud key downloads), X25519, Ed448 and X448 keys,
+  PuTTY key files, JWK private members (in any order, quoting or escaping),
+  .NET XML RSA keys, and `openssl ... -text` dumps. From that line on, the
+  markers go, colon-separated hex dumps go, every line that continues a key
   goes (however its line breaks are escaped), and so does every run of 16 or
   more base64 characters that reads as random bytes; words, paths, links,
   assignments, hex digests, UUIDs and image data stay, and so does everything
   before the key. A key body cut into pieces shorter than 16 characters and
-  interrupted by other text is not recognised.
+  interrupted by other text is not recognised, and a random-looking
+  identifier after a key (an SSH fingerprint, a random URL id) may be
+  removed with it.
   Identifiers such as `request_id` and paths are left as given, the source file is
   never modified, and binary evidence is archived unchanged. Not filtered yet:
   snapshot excerpts, legacy imports, and Mem0 responses. Time is linear in the

@@ -368,6 +368,7 @@ def test_prose_between_two_mentions_of_a_key_stays() -> None:
         "-----BEGIN " + "PRIVATE KEY-----" + " " * 1_000_000 + "x",
         ("BEGIN " + " " * 50 + "A" + " " * 50) * 9_000,
         "&nbsp;" * 170_000,
+        "-----BEGIN " + "PRIVATE KEY-----\n" + "\\" * 1_000_000,
         ("\\/" + "Ab1" * 5) * 50_000 + "-----END " + "PRIVATE KEY-----",
         "api_key=" * 130_000,
         "https://a:" * 100_000,
@@ -390,6 +391,7 @@ def test_prose_between_two_mentions_of_a_key_stays() -> None:
         "key-then-spaces",
         "spaced-markers",
         "html-spaces",
+        "backslashes",
         "escaped-runs",
         "assignments",
         "url-schemes",
@@ -770,3 +772,84 @@ def test_a_long_run_of_zeros_in_an_entity_does_not_break_the_filter() -> None:
     pem, _ = _pem()
 
     assert "[REDACTED:private_key]" in redact(pem + "&#" + "0" * 5000 + "47;").text
+
+
+# Seventh review of #14: more real export formats, nested escaping, and text after a key.
+
+_DER_STARTS_7 = {  # structure only
+    "x25519": ("302e020100300506032b656e04220420", 32),
+    "ed448": ("3047020100300506032b6571043b0439", 57),
+    "x448": ("3046020100300506032b656f043a0438", 56),
+}
+
+
+@pytest.mark.parametrize("name", list(_DER_STARTS_7))
+def test_bare_modern_curve_keys_go(name: str) -> None:
+    start, size = _DER_STARTS_7[name]
+    body = base64.b64encode(bytes.fromhex(start) + random.randbytes(size)).decode()
+
+    result = redact("Pasted from the export:\n" + body + "\n").text  # no word that names a key
+
+    assert body[-20:] not in result and result.startswith("Pasted from the export:")
+
+
+def _jwk_members() -> dict[str, str]:
+    return {name: base64.urlsafe_b64encode(random.randbytes(128)).decode().rstrip("=")
+            for name in ("n", "p", "q", "dp", "dq", "qi", "d")}
+
+
+@pytest.mark.parametrize("shape", ["d_last", "double_json", "python_repr"])
+def test_a_jwk_goes_in_any_order_or_serialization(shape: str) -> None:
+    members = _jwk_members()
+    jwk = {"kty": "RSA", "e": "AQAB", **members}  # "d" comes last
+    text = {"d_last": json.dumps(jwk, indent=2), "double_json": json.dumps({"key": json.dumps(jwk)}),
+            "python_repr": repr(jwk)}[shape]
+
+    result = redact(text).text
+
+    assert not any(members[name][i:i + 16] in result for name in ("p", "q", "d") for i in range(0, 150, 16))
+
+
+def test_a_dotnet_xml_key_goes() -> None:
+    parts = {name: base64.b64encode(random.randbytes(128)).decode() for name in ("P", "Q", "DP", "DQ", "InverseQ", "D")}
+    text = ("<RSAKeyValue><Modulus>" + base64.b64encode(random.randbytes(256)).decode() + "</Modulus><Exponent>AQAB"
+            "</Exponent>" + "".join(f"<{name}>{value}</{name}>" for name, value in parts.items()) + "</RSAKeyValue>")
+
+    result = redact(text).text
+
+    assert not any(value[i:i + 16] in result for value in parts.values() for i in range(0, 150, 16))
+
+
+def test_an_openssl_text_dump_goes() -> None:
+    def dump(data: bytes) -> str:
+        pairs = [f"{byte:02x}" for byte in data]
+        return "\n".join("    " + ":".join(pairs[i:i + 15]) + ":" for i in range(0, len(pairs), 15))
+
+    secret = random.randbytes(256)
+    text = ("Private-Key: (2048 bit, 2 primes)\nmodulus:\n" + dump(random.randbytes(257)) + "\npublicExponent: 65537 "
+            "(0x10001)\nprivateExponent:\n" + dump(secret) + "\n")
+
+    result = redact(text).text
+
+    assert not any(f"{secret[i]:02x}:{secret[i + 1]:02x}:{secret[i + 2]:02x}" in result for i in range(0, 250, 5))
+    assert "publicExponent: 65537" in result
+
+
+def test_a_key_in_json_nested_in_json_goes() -> None:
+    pem, lines = _pem("", _PKCS8)
+    inner = json.dumps({"data": pem}).replace("+", "\\u002b").replace("/", "\\u002f")
+
+    result = redact(json.dumps({"message": inner})).text
+
+    assert not any(line[i:i + 12] in result for line in lines for i in range(len(line) - 11))
+
+
+def test_code_and_links_after_a_key_stay() -> None:
+    pem, _ = _pem()
+    kept = ["const client = new AWSKMSClientBuilder();", "class XMLHTTPRequestHandler:",
+            "https://example.invalid/docs/XMLHTTPRequestHandler", "https://api.example.com/v1/users/123456",
+            "git clone https://git.example.com/v1/api/v2/tool", "GET /v1/projects/42/instances/9"]
+
+    result = redact(pem + "\n" + "\n".join(kept) + "\n").text
+
+    assert all(item in result for item in kept)
