@@ -241,7 +241,8 @@ deleted one, and never writes to a note; the server runs the same sync every
 - **Projects.** A note inside a project root, or in the file memory of a
   directory inside that root, belongs to that project. In the file memory of a
   directory under the workspace, it belongs to that workspace child's project.
-  Any other note is global.
+  A note whose frontmatter names a project (`project: atlas`, any registered
+  spelling) belongs to that project wherever it lies. Any other note is global.
 
 `query_memory` returns notes in `notes`, next to events in `results`: the best
 section of each note, with its heading, path and id. In a project scope, the
