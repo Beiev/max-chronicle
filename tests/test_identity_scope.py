@@ -419,3 +419,22 @@ def test_a_retry_under_another_name_is_refused_for_a_request_written_now(loaded_
     # 0.12.0 read "codex-bot" as codex; that reading only ever applies to what 0.12.0 wrote.
     with pytest.raises(ValueError, match="different input"):
         service.record_event(manifest, {**fields, "agent": "codex-bot"})
+
+
+@pytest.mark.parametrize("agent_source", ["client", "session", "default"])
+def test_a_request_of_a_pre_release_build_retries_unchanged(loaded_manifest, agent_source) -> None:
+    from max_chronicle.memory import _hash, _request_input
+
+    fields = {"domain": "global", "text": "Upgrade retry", "project": "atlas", "agent": "codex",
+              "agent_source": agent_source, "request_id": f"pre-release-{agent_source}"}
+    first = service.record_event(loaded_manifest, dict(fields))
+    config = config_from_manifest(loaded_manifest)
+    with open_connection(config) as connection, connection:
+        stored = json.loads(connection.execute("SELECT payload_json FROM event_observations WHERE request_id=?",
+                                               (fields["request_id"],)).fetchone()[0])
+        connection.execute("UPDATE event_observations SET request_hash=? WHERE request_id=?",
+                           (_hash(_request_input(stored)), fields["request_id"]))
+
+    retried = service.record_event(loaded_manifest, dict(fields))
+
+    assert (retried["id"], retried["chronicle_status"]) == (first["id"], "existing")
