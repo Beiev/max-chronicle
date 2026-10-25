@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from .automation import AutomationConfig, ensure_automation_dirs, load_automation_config, load_env_file, repo_by_slug, repo_slug_for_path
 from .config import default_automation_path, feature_enabled, mem0_enabled
 from .runtime_context import expand_path, read_json, utc_now
+from .backup_retention import retention_report
 from .service import backfill_mem0_queue, build_freshness_audit, capture_runtime_snapshot, embed_backfill, record_event, repair_mem0_state, ENV_FEATURE_EVENT_EMBEDDINGS
 from .store import (
     config_from_manifest,
@@ -1367,6 +1368,9 @@ def _rotate_jsonl_if_needed(path: Path, *, cap_bytes: int) -> dict[str, Any]:
     }
 
 
+VACUUM_MIN_FREE_RATIO = 0.2  # share of free pages that makes a full VACUUM worth its lock
+
+
 def _vacuum_db(config) -> dict[str, Any]:
     """Space maintenance on the live DB; never fights the MCP daemon for locks."""
     try:
@@ -1375,9 +1379,17 @@ def _vacuum_db(config) -> dict[str, Any]:
             # daemon — a skipped vacuum simply retries on the next run.
             connection.execute("PRAGMA busy_timeout = 2000")
             auto_vacuum_mode = connection.execute("PRAGMA auto_vacuum").fetchone()[0]
+            free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+            total_pages = int(connection.execute("PRAGMA page_count").fetchone()[0]) or 1
             if auto_vacuum_mode == 2:  # INCREMENTAL
                 connection.execute("PRAGMA incremental_vacuum")
                 mode = "incremental_vacuum"
+            elif free_pages / total_pages < VACUUM_MIN_FREE_RATIO:
+                # A full VACUUM takes the database's exclusive lock and rewrites
+                # the whole file, so every agent's write waits behind it; it ran
+                # on every backup however little was free.
+                return {"status": "skipped", "mode": "vacuum", "reason": "little_free_space",
+                        "free_pages": free_pages, "page_count": total_pages}
             else:
                 # Legacy fallback for DBs not yet flipped to INCREMENTAL: full
                 # VACUUM needs an exclusive lock and rewrites the whole file.
@@ -2080,6 +2092,15 @@ def run_backup(
         entity_name="chronicle",
         link_role="backs_up",
     )
+    # Retention only after a backup that passed its restore check: a failing
+    # run must never be the reason older good copies disappear.
+    if restore_result["ok"]:
+        try:
+            retention = retention_report(target_root, automation.backup_retention)
+        except OSError as exc:
+            retention = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        retention = {"status": "skipped", "reason": "backup_failed"}
     return {
         "status": "ok" if restore_result["ok"] else "failed",
         "run_id": run_id,
@@ -2090,6 +2111,7 @@ def run_backup(
         "target_root": str(target_root),
         "backup_policy": "opportunistic_external",
         "maintenance": maintenance,
+        "retention": retention,
         "artifact_files": artifact_files,
         "artifact_files_copied": artifact_files_copied,
         "artifact_bytes_copied": artifact_bytes_copied,
@@ -2691,7 +2713,10 @@ def install_launchd(
                 hour=schedule.hour,
                 minute=schedule.minute,
                 weekday=schedule.weekday,
-                start_on_mount=key == "backup",
+                # No StartOnMount for the backup: launchd fires it on the mount
+                # of ANY volume, dozens of launches per real backup, and a
+                # missed run is caught up by the schedule anyway.
+                start_on_mount=False,
             )
         )
         installed.append({"label": label, "plist_path": str(plist_path), "wrapper_path": str(wrapper_path)})

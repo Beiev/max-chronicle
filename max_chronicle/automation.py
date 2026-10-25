@@ -6,6 +6,7 @@ from pathlib import Path
 import tomllib
 from typing import Any
 
+from .backup_retention import RetentionPolicy
 from .config import default_automation_path
 
 
@@ -53,6 +54,7 @@ class AutomationConfig:
     guards: GuardSettings
     repos: tuple[RepoConfig, ...]
     jobs: dict[str, JobSchedule]
+    backup_retention: RetentionPolicy = RetentionPolicy()
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -104,6 +106,7 @@ def load_automation_config(path: Path | None = None) -> AutomationConfig:
             )
             for name, job in jobs.items()
         },
+        backup_retention=RetentionPolicy.from_mapping(raw.get("backup_retention")),
     )
 
 

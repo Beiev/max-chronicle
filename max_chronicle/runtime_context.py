@@ -351,24 +351,35 @@ def parse_when(raw_value: str, manifest: dict[str, Any]) -> datetime:
     return dt
 
 
+GIT_TIMEOUT_S = 10.0
+
+
 def git_repo_summary(repo_path: Path) -> dict[str, Any]:
     import subprocess
 
     if not repo_path.exists():
         return {"path": str(repo_path), "exists": False}
 
-    branch_proc = subprocess.run(
-        ["git", "-C", str(repo_path), "branch", "--show-current"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    status_proc = subprocess.run(
-        ["git", "-C", str(repo_path), "status", "--short"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    # Bounded: a git call stuck on a lock or a slow disk used to hold a
+    # snapshot, and with it the shared write slot, for as long as it hung.
+    try:
+        branch_proc = subprocess.run(
+            ["git", "-C", str(repo_path), "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+        )
+        status_proc = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--short"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {"path": str(repo_path), "exists": True, "branch": None, "dirty": None, "changes": {},
+                "change_count": 0, "error": f"git timed out after {GIT_TIMEOUT_S:g} s"}
 
     lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
     counts = Counter()

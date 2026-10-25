@@ -130,6 +130,19 @@ and does not require a separately running HTTP service. For supervised HTTP, use
 `GET /health` checks service and database availability and names the database,
 manifest, schema version and installed code path that answered; `sources_audit` and
 startup source health describe freshness. These are different checks.
+Over HTTP, `/health` also reports the process: event-loop lag (`loop`), the write
+queue (`writes`), the last committed write and the background embedder.
+`GET /health/live` answers from the event loop alone, without the database: a slow
+disk makes `/health` degraded (503), only a stuck loop silences `/health/live`.
+When the loop stops for 10 s the server writes every thread's stack to its log by
+itself, and `SIGUSR1` (advertised as `stack_dump_signal`) does the same on demand,
+so a supervisor can record a hang before it restarts the process.
+
+An HTTP server writes events without waiting for their vectors: a background
+thread embeds them after the commit, keeps the model loaded
+(`CHRONICLE_EMBED_KEEP_ALIVE`, default `30m`) and backs off while Ollama is down.
+The model's context is capped at `CHRONICLE_EMBED_NUM_CTX` (default 8192 tokens),
+which for `qwen3-embedding` halves its memory and leaves shorter texts' vectors unchanged.
 
 ### Session brief
 
@@ -368,6 +381,10 @@ index reads (FR-10).
   integrity checks, and verification after relocation. Legacy backups disclose
   incomplete inventory coverage. Choose a separate backup device for disk failure.
   Explicitly purged artifacts are counted separately; they are not claimed as restorable.
+  Retention keeps the newest backup of each of the last 14 days, 8 weeks and 12
+  months that have one (`[backup_retention]` in the automation config:
+  `daily`, `weekly`, `monthly`). Each backup reports what the policy would remove;
+  removal happens only with `prune = true` or `chronicle backup-prune --apply`.
 
 ### Measuring recall
 
@@ -406,6 +423,7 @@ chronicle eval --golden questions.jsonl --out results/baseline.json
 chronicle timeline --at "2026-09-15T12:00:00Z"
 chronicle timeline --at "2026-09-15T12:00:00Z" --as-of   # what was known then
 chronicle backup --force
+chronicle backup-prune            # what retention would remove; --apply removes it
 ```
 
 `--fact-file` accepts the assertion JSON above. Startup defaults to compact source

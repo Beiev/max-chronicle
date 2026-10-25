@@ -646,6 +646,15 @@ def cmd_backup(args: argparse.Namespace) -> int:
     return _print_json(payload)
 
 
+def cmd_backup_prune(args: argparse.Namespace) -> int:
+    from .backup_retention import retention_report
+
+    automation = load_native_automation(args.automation_config)
+    payload = retention_report(automation.backup_root, automation.backup_retention, apply=args.apply)
+    payload["backup_root"] = str(automation.backup_root)
+    return _print_json(payload)
+
+
 def cmd_launchd_install(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     automation = load_native_automation(args.automation_config)
@@ -1136,6 +1145,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_backup.add_argument("--force", action="store_true", help="Ignore the backup interval guard")
     p_backup.add_argument("--trigger-source", default="manual", help="Trigger source label")
     p_backup.set_defaults(handler=cmd_backup)
+
+    p_backup_prune = sub.add_parser(
+        "backup-prune",
+        help="Show which backups the retention policy would remove; --apply removes them",
+    )
+    p_backup_prune.add_argument(
+        "--apply", action="store_true",
+        help="Remove the backups the policy does not keep (default: only report)",
+    )
+    p_backup_prune.set_defaults(handler=cmd_backup_prune)
 
     p_launchd = sub.add_parser("launchd", help="Install or inspect Chronicle LaunchAgents")
     launchd_sub = p_launchd.add_subparsers(dest="launchd_command", required=True)

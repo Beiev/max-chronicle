@@ -533,6 +533,9 @@ def _shown(path: Path | str) -> str:
     return redact(str(path)).text
 
 
+NOTES_WRITE_BATCH = 100  # notes per write transaction
+
+
 def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int | None = None) -> dict[str, Any]:
     """Bring the index in line with the note files; the files are only read."""
     settings = note_settings(manifest)
@@ -581,14 +584,20 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         changed.append(note)
         report["redactions"] += note.redactions
     now = _utc()
-    with write_transaction(config) as connection:
-        # Text that leaves the index must not stay behind in freed pages.
-        connection.execute("PRAGMA secure_delete = ON")
-        for note in changed:
-            _store(connection, note, now)
-            report["indexed"] += 1
-        for path, (_, _, deleted, _) in known.items():
-            if path not in live and deleted is None:
+    # Short transactions: agents' writes wait for this one's lock. A reindex of
+    # every note (a new parser version) used to be a single transaction.
+    for start in range(0, len(changed), NOTES_WRITE_BATCH):
+        with write_transaction(config) as connection:
+            # Text that leaves the index must not stay behind in freed pages.
+            connection.execute("PRAGMA secure_delete = ON")
+            for note in changed[start:start + NOTES_WRITE_BATCH]:
+                _store(connection, note, now)
+                report["indexed"] += 1
+    gone = [path for path, (_, _, deleted, _) in known.items() if path not in live and deleted is None]
+    if gone:
+        with write_transaction(config) as connection:
+            connection.execute("PRAGMA secure_delete = ON")
+            for path in gone:
                 identifier = document_id(Path(path))
                 connection.execute("DELETE FROM document_chunks WHERE document_id = ?", (identifier,))
                 if redact(path).count:
@@ -599,7 +608,9 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
                         "content_sha256 = '', size_bytes = 0, redactions = 0 WHERE id = ?",
                         (now, Path(path).stem, identifier))
                 report["removed"] += 1
-        if changed or report["removed"]:
+    if changed or report["removed"]:
+        with write_transaction(config) as connection:
+            connection.execute("PRAGMA secure_delete = ON")
             # Deleted rows stay in older full-text segments until they merge.
             connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
     _checkpoint(config)  # also retries one that a reader blocked last time

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
@@ -90,10 +90,13 @@ def test_sync_and_dump_never_call_the_bridge(without_mem0, loaded_automation, br
 
 def test_a_skipped_dump_clears_the_brief_warning(without_mem0, loaded_automation) -> None:
     config = config_from_manifest(without_mem0)
+    now = datetime.now(timezone.utc)
+    # Relative to now: the brief only reports a failure of the last week, and a
+    # fixed date turned this test red once it was a week old.
+    failed_at = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open_connection(config) as connection, connection:
         connection.execute("INSERT INTO automation_runs(id, job_name, started_at_utc, status) "
-                           "VALUES ('run-old', 'mem0-dump', '2026-09-26T05:00:00Z', 'failed')")
-    now = datetime.now(timezone.utc)
+                           "VALUES ('run-old', 'mem0-dump', ?, 'failed')", (failed_at,))
 
     warned = build_brief(without_mem0, now=now)["text"]
     run_automation_job(without_mem0, loaded_automation, job_name="mem0-dump", trigger_source="pytest")

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import functools
 import json
 import logging
 import os
+import signal
 import sqlite3
 import sys
 import threading
@@ -28,12 +30,13 @@ from starlette.responses import JSONResponse, PlainTextResponse
 
 from . import __version__
 
-from .config import EXIT_CONFIG_ERROR, EXIT_SCHEMA_ACTION, ChronicleConfigError, default_manifest_path, mem0_enabled
+from .config import EXIT_CONFIG_ERROR, EXIT_SCHEMA_ACTION, ChronicleConfigError, default_manifest_path, feature_enabled, mem0_enabled
 from .db import MigrationError
 from .runtime_context import load_manifest, load_manifest_cached, parse_when
 from .brief import BRIEF_DEFAULT_CHARS, build_brief
 from .service import (
     DEFAULT_QUERY_MODE,
+    ENV_FEATURE_EVENT_EMBEDDINGS,
     add_entity_alias_service,
     build_attach_bundle,
     build_activation,
@@ -42,6 +45,7 @@ from .service import (
     capture_runtime_snapshot,
     current_state,
     default_mem0_status,
+    embed_backfill,
     entity_resolution_report_service,
     materialize_normalized_entities,
     merge_entities_service,
@@ -63,6 +67,7 @@ from .store import (
     target_schema_version,
 )
 from .identity import UNKNOWN_AGENT, Registry
+from .liveness import BackgroundEmbedder, LoopMonitor
 from .notes import note_settings, read_note, sync_notes
 from .memory import Checkpoint, FactInput
 
@@ -155,6 +160,13 @@ SOURCE_FILES_ARG = Annotated[
 _LOGGER = logging.getLogger("max_chronicle.mcp")
 _PROCESS_STARTED_AT = time.time()
 
+# What a long-running server sets up in _main and its routes and tools read:
+# the loop monitor, the background embedder, the stack-dump signal, and the
+# last committed write. A server built without _main (tests, embedding in
+# another program) has none of them and behaves as before.
+_RUNTIME: dict[str, Any] = {"loop": None, "embedder": None, "dump_signal": None, "last_write": None}
+STACK_DUMP_SIGNAL = "SIGUSR1"
+
 # Writers get a single slot (SQLite is single-writer anyway, and queueing here
 # beats surfacing `database is locked` to agents); readers get 8 so a slow read
 # cannot monopolise the pool. A CapacityLimiter belongs to the event loop that
@@ -235,7 +247,15 @@ def _offload(fn, *, tool_name: str, writes: bool | Callable[[dict[str, Any]], bo
         mutating = writes(kwargs) if callable(writes) else writes
         limiter = _get_limiter("write" if mutating else "read")
         try:
-            return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs), limiter=limiter)
+            started = time.monotonic()
+            result = await anyio.to_thread.run_sync(functools.partial(fn, **kwargs), limiter=limiter)
+            if mutating:
+                _RUNTIME["last_write"] = {
+                    "tool": tool_name,
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "ms": round((time.monotonic() - started) * 1000),
+                }
+            return result
         except ToolError as exc:
             message = str(exc)
             if "startup_required" in message:
@@ -521,7 +541,16 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         }
         if error:
             payload["error"] = error
+        payload.update(_runtime_health())
         return JSONResponse(payload, status_code=200 if db_ok else 503)
+
+    @server.custom_route("/health/live", methods=["GET"])
+    async def route_health_live(_: Request) -> JSONResponse:
+        # Liveness only: answered by the event loop itself, no database, no
+        # thread. A slow disk makes /health degraded; only a stuck loop makes
+        # this one silent.
+        return JSONResponse({"status": "ok", "pid": os.getpid(),
+                             "uptime_s": round(time.time() - _PROCESS_STARTED_AT), **_runtime_health()})
 
     @server.custom_route("/brief", methods=["GET"])
     async def route_brief(request: Request):
@@ -885,7 +914,10 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             require_startup_gate(ctx, tool_name="record_event", domain=domain)
             identity = session_identity(ctx, agent)
             named = agent != UNKNOWN_AGENT
-            return record_event(
+            # With a background embedder the vector comes after the commit,
+            # outside the write slot every agent shares.
+            embedder = _RUNTIME["embedder"]
+            stored = record_event(
                 manifest(),
                 {
                     # The spelling given, canonicalised on write (FR-14); where it
@@ -917,7 +949,11 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                 dedupe=True,
                 source_kind="chronicle_mcp",
                 imported_from="max_chronicle.mcp.record_event",
+                defer_embedding=embedder is not None,
             )
+            if embedder is not None and stored.get("chronicle_status") == "stored":
+                embedder.wake()
+            return stored
 
         @register_tool(
             writes=True,
@@ -1103,6 +1139,90 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     return server
 
 
+def _runtime_health() -> dict[str, Any]:
+    """What /health adds about the process itself: loop, write queue, last write, embedder."""
+    health: dict[str, Any] = {}
+    if _RUNTIME["dump_signal"]:
+        # The watchdog sends this before a kill, so the stacks of a hang reach the log.
+        health["stack_dump_signal"] = _RUNTIME["dump_signal"]
+    if _RUNTIME["loop"] is not None:
+        health["loop"] = _RUNTIME["loop"].snapshot()
+    try:
+        writes = _get_limiter("write").statistics()
+        health["writes"] = {"in_progress": writes.borrowed_tokens, "waiting": writes.tasks_waiting}
+    except RuntimeError:  # no event loop: a direct call outside the server
+        pass
+    if _RUNTIME["last_write"] is not None:
+        health["last_write"] = _RUNTIME["last_write"]
+    if _RUNTIME["embedder"] is not None:
+        health["embedder"] = _RUNTIME["embedder"].snapshot()
+    return health
+
+
+def _configure_logging() -> None:
+    """UTC timestamps with a Z on every line, uvicorn's access log included.
+
+    The server logged naive local time, so the switch to winter time made the
+    log run backwards for an hour, and the access log had no time at all.
+    """
+    logging.Formatter.converter = time.gmtime
+    utc = "%(asctime)s.%(msecs)03dZ"
+    datefmt = "%Y-%m-%dT%H:%M:%S"
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"{utc} %(levelname)s %(name)s: %(message)s",
+        datefmt=datefmt,
+        stream=sys.stderr,
+    )
+    try:
+        from uvicorn.config import LOGGING_CONFIG
+    except ImportError:  # pragma: no cover - uvicorn comes with mcp
+        return
+    formatters = LOGGING_CONFIG.get("formatters", {})
+    if "default" in formatters:
+        formatters["default"].update(fmt=f"{utc} %(levelprefix)s %(message)s", datefmt=datefmt)
+    if "access" in formatters:
+        formatters["access"].update(
+            fmt=f'{utc} %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s', datefmt=datefmt)
+
+
+def _serve(server: FastMCP, transport: str) -> None:
+    """Run the server; over HTTP with the loop monitor and its stall watcher."""
+    if transport == "stdio":
+        server.run(transport="stdio")
+        return
+    monitor = LoopMonitor()
+    _RUNTIME["loop"] = monitor
+    monitor.start_watcher()
+    run = server.run_streamable_http_async if transport == "streamable-http" else server.run_sse_async
+
+    async def serve() -> None:
+        async with anyio.create_task_group() as group:
+            group.start_soon(monitor.run)
+            await run()
+            group.cancel_scope.cancel()
+
+    anyio.run(serve)
+
+
+def _install_stack_dump() -> None:
+    """Dump every thread's stack on SIGUSR1 (and on a fatal error) to stderr, the server log."""
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        faulthandler.register(getattr(signal, STACK_DUMP_SIGNAL), file=sys.stderr, all_threads=True)
+    except (AttributeError, OSError, RuntimeError, ValueError) as exc:  # no usable stderr fd, or no such signal
+        _LOGGER.warning("stack dumps unavailable: %s: %s", type(exc).__name__, exc)
+        return
+    _RUNTIME["dump_signal"] = STACK_DUMP_SIGNAL
+
+
+def _start_embedder(manifest_path: Path) -> BackgroundEmbedder:
+    embedder = BackgroundEmbedder(lambda: load_manifest_cached(manifest_path), embed_backfill)
+    _RUNTIME["embedder"] = embedder
+    embedder.start()
+    return embedder
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve Max Chronicle over MCP.")
     # Resolved in _main: computing it here made `--help` fail whenever the
@@ -1135,11 +1255,7 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
     parser = build_parser()
     parser.set_defaults(profile=default_profile)
     args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    _configure_logging()
     # Prepare the schema before serving. Only a launcher that passes --migrate
     # upgrades an outdated database (after an online backup): a stdio server
     # started by some client from some checkout must not. A read-only server
@@ -1203,9 +1319,13 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         manifest_path,
         Path(__file__).resolve().parent,
     )
+    if args.transport != "stdio":
+        _install_stack_dump()
     if not read_only and args.transport != "stdio":
         _start_notes_sync(manifest_path)
-    server.run(transport=args.transport)
+        if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
+            _start_embedder(manifest_path)
+    _serve(server, args.transport)
     return 0
 
 

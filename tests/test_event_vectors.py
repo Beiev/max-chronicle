@@ -90,7 +90,27 @@ def test_embed_text_asks_ollama_to_truncate_and_returns_the_first_vector(monkeyp
 
     assert vector == [0.0, 3.0, 4.0]
     assert sent["url"].endswith("/api/embed") and sent["timeout"] == 7.0
-    assert sent["payload"] == {"model": QWEN, "input": "Отчёт за июль", "truncate": True}
+    assert sent["payload"] == {"model": QWEN, "input": "Отчёт за июль", "truncate": True,
+                               "keep_alive": embeddings.DEFAULT_KEEP_ALIVE,
+                               "options": {"num_ctx": embeddings.DEFAULT_NUM_CTX}}
+
+
+def test_embed_request_keeps_the_model_warm_and_small_as_configured(monkeypatch):
+    """A cold load (~11 s) must not land on a query; the 32k default held 5.4 GB."""
+    monkeypatch.setenv("CHRONICLE_EMBED_KEEP_ALIVE", "2h")
+    monkeypatch.setenv("CHRONICLE_EMBED_NUM_CTX", "4096")
+    sent = {}
+
+    def urlopen(request, timeout):
+        sent.update(payload=json.loads(request.data))
+        return _Response(json.dumps({"embeddings": [[1.0]]}).encode())
+
+    monkeypatch.setattr(embeddings.urllib.request, "urlopen", urlopen)
+
+    _REAL_EMBED_TEXT("x", timeout=1.0)
+
+    assert sent["payload"]["keep_alive"] == "2h"
+    assert sent["payload"]["options"] == {"num_ctx": 4096}
 
 
 @pytest.mark.parametrize(

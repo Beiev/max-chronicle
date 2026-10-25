@@ -771,8 +771,13 @@ def test_a_server_that_never_syncs_ignores_a_bad_notes_section(chronicle_sandbox
         pass  # a read-only server needs a database to exist
     with chronicle_sandbox.manifest_path.open("a", encoding="utf-8") as handle:
         handle.write('\n[notes]\npaths = ["/nonexistent/*.md"]\nsync_minutes = 0\n')
+    async def served() -> None:
+        return None
+
     monkeypatch.setattr(mcp_server_module, "build_server",
-                        lambda *args, **kwargs: SimpleNamespace(run=lambda transport: None, settings=SimpleNamespace()))
+                        lambda *args, **kwargs: SimpleNamespace(run=lambda transport: None, settings=SimpleNamespace(),
+                                                                run_streamable_http_async=served))
+    monkeypatch.setattr(mcp_server_module, "_RUNTIME", dict(mcp_server_module._RUNTIME))
     monkeypatch.setattr(sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path), *argv])
 
     assert mcp_server_module._main() == 0
@@ -1136,3 +1141,29 @@ def test_the_index_version_moves_with_the_parser_and_the_filter() -> None:
 
     assert INDEX_DIGESTS.get(NOTE_INDEX_VERSION) == digest, (
         f"the parser or the filter changed: bump NOTE_INDEX_VERSION and record {digest}")
+
+
+def test_a_large_reindex_commits_in_short_transactions(notes, monkeypatch) -> None:
+    """Agents' writes wait for the sync's lock: one note batch at a time, not all notes at once."""
+    manifest, _ = notes
+    monkeypatch.setattr(notes_module, "NOTES_WRITE_BATCH", 1)
+    real_transaction, real_store = notes_module.write_transaction, notes_module._store
+    stores_per_transaction: list[int] = []
+
+    @contextlib.contextmanager
+    def counting_transaction(config):
+        stores_per_transaction.append(0)
+        with real_transaction(config) as connection:
+            yield connection
+
+    def counting_store(connection, note, now):
+        stores_per_transaction[-1] += 1
+        return real_store(connection, note, now)
+
+    monkeypatch.setattr(notes_module, "write_transaction", counting_transaction)
+    monkeypatch.setattr(notes_module, "_store", counting_store)
+
+    report = sync_notes(manifest)
+
+    assert report["indexed"] == 4 and len(_documents(manifest)) == 4
+    assert [count for count in stores_per_transaction if count] == [1, 1, 1, 1]

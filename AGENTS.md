@@ -19,6 +19,8 @@ any operator's personal workspace.
 - `redaction.py`: content-based secret filter applied before anything is stored.
 - `mcp_server.py` / `cli.py`: thin, documented client adapters.
 - `native_automation.py`: optional scheduling, backups, restore checks.
+- `backup_retention.py`: which backups to keep (newest per day, week, month).
+- `liveness.py`: the HTTP server's event-loop monitor and background embedder.
 - `scaffold.py`: neutral new-workspace templates.
 
 ## Invariants

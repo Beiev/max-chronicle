@@ -1467,3 +1467,83 @@ def test_backup_reports_intentional_purge_without_claiming_file_is_archived(
     assert result["status"] == "ok"
     assert result["restore_check"]["intentionally_purged_artifacts"] == 1
     assert result["restore_check"]["artifact_hashes_ok"] is True
+
+
+def test_a_backup_reports_retention_and_removes_nothing_by_default(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    first = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+    second = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+
+    assert second["status"] == "ok"
+    assert second["retention"]["applied"] is False
+    assert second["retention"]["backups"] == 2
+    assert Path(first["backup_path"]).exists()
+
+
+def test_a_backup_with_pruning_on_keeps_what_the_policy_keeps(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    from dataclasses import replace
+
+    from max_chronicle.backup_retention import RetentionPolicy
+
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    old = chronicle_sandbox.backup_root / "2025" / "2025-01-01T23-00-00Z"
+    old.mkdir(parents=True)
+    (old / "backup-manifest.json").write_text("{}", encoding="utf-8")
+    automation = replace(loaded_automation, backup_retention=RetentionPolicy(daily=1, weekly=0, monthly=0, prune=True))
+
+    result = run_backup(loaded_manifest, automation, trigger_source="pytest", force=True)
+
+    assert result["retention"]["result"]["removed"] == 1
+    assert not old.exists() and Path(result["backup_path"]).exists()
+
+
+def _legacy_without_auto_vacuum(config) -> None:
+    """The production database predates INCREMENTAL auto-vacuum."""
+    with sqlite3.connect(config.db_path) as connection:
+        connection.execute("PRAGMA auto_vacuum = NONE")
+        connection.execute("VACUUM")
+
+
+def test_the_backup_skips_a_full_vacuum_when_little_is_free(loaded_manifest) -> None:
+    from max_chronicle.native_automation import _vacuum_db
+
+    config = config_from_manifest(loaded_manifest)
+    _legacy_without_auto_vacuum(config)
+
+    result = _vacuum_db(config)
+
+    assert result["status"] == "skipped" and result["reason"] == "little_free_space"
+
+
+def test_the_backup_still_vacuums_a_file_that_is_mostly_free(loaded_manifest) -> None:
+    from max_chronicle.native_automation import _vacuum_db
+
+    config = config_from_manifest(loaded_manifest)
+    _legacy_without_auto_vacuum(config)
+    with sqlite3.connect(config.db_path) as connection:
+        connection.execute("CREATE TABLE scratch_fill(blob BLOB)")
+        connection.executemany("INSERT INTO scratch_fill VALUES (?)", [(os.urandom(4096),) for _ in range(2000)])
+        connection.commit()
+        connection.execute("DROP TABLE scratch_fill")
+        connection.commit()
+
+    result = _vacuum_db(config)
+
+    assert (result["status"], result["mode"]) == ("ok", "vacuum")
+
+
+def test_launchd_backup_job_does_not_start_on_every_mount(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+    from max_chronicle.native_automation import install_launchd
+    import plistlib
+
+    agents = chronicle_sandbox.root / "agents"
+    install_launchd(loaded_manifest, loaded_automation, agent_dir=agents,
+                    runtime_dir=chronicle_sandbox.root / "rt", log_dir=chronicle_sandbox.root / "logs", load_jobs=False)
+
+    plists = {path.name: plistlib.loads(path.read_bytes()) for path in agents.glob("*.plist")}
+    backup = [payload for name, payload in plists.items() if name.endswith("backup.plist")]
+    assert backup and "StartOnMount" not in backup[0]

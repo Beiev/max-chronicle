@@ -2089,12 +2089,8 @@ def stage_artifact_from_path(
 
     observed_at = observed_at_utc or utc_now()
     source_size = source_path.stat().st_size
-    sha256 = _file_sha256(source_path)
-    mime_type = mimetypes.guess_type(source_path.name)[0]
-    artifact_metadata = dict(metadata or {})
-    artifact_metadata.setdefault("source_name", source_path.name)
-    artifact_metadata.setdefault("source_size", source_size)
-
+    # Decide before hashing: reading a file the policy skips (a multi-GB
+    # attachment) only delayed the write it was attached to.
     storage_mode, skip_reason = _artifact_decision(
         config,
         source_path=source_path,
@@ -2102,6 +2098,11 @@ def stage_artifact_from_path(
     )
     if storage_mode == "skip":
         return None
+    sha256 = _file_sha256(source_path)
+    mime_type = mimetypes.guess_type(source_path.name)[0]
+    artifact_metadata = dict(metadata or {})
+    artifact_metadata.setdefault("source_name", source_path.name)
+    artifact_metadata.setdefault("source_size", source_size)
 
     if storage_mode == "copy":
         storage_path, sha256 = _archive_source(
