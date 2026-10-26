@@ -198,6 +198,27 @@ calls `startup_bundle(project=...)`, whose default mode is this brief, or reads 
 resource `chronicle://brief/{project}`. A project's brief shows its own decisions
 only, and its own facts before at most four facts recorded without a project.
 
+### Web view
+
+The HTTP server also serves a read-only view of the memory for people, at
+`http://127.0.0.1:8093/ui`:
+- `/ui`: process health (event-loop lag, last write, unindexed events, last
+  scheduled runs), the last good backup, warnings, open tasks, projects active in
+  the last 30 days, the latest events;
+- `/ui/project/{project}`: its open tasks, current facts and latest events;
+- `/ui/task/{project}/{task_id}`: the latest checkpoint, earlier ones, the task's
+  facts and events;
+- `/ui/facts`: every current fact; `/ui/facts?slot=X`: every value that slot had,
+  newest first, with what replaced it;
+- `/ui/search?q=...&project=...`: recall, with how each hit matched;
+- `/ui/event/{id}`, `/ui/note/{id}`: one record with its evidence and who recorded it.
+
+Pages are rendered on the server with no script. Everything shown is escaped
+text, and a Content-Security-Policy forbids scripts, frames and outside
+requests. Only this machine is answered: the `Host` must be a loopback name, an
+`Origin` must be the server's own, and a cross-site `Sec-Fetch-Site` is refused.
+Quarantined events never appear.
+
 ### One name per project, domain and agent
 
 One project often gets written several ways (`status`, `chronicle`,

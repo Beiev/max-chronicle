@@ -22,6 +22,7 @@ any operator's personal workspace.
 - `backup_retention.py`: which backups to keep (newest per day, week, month).
 - `liveness.py`: the HTTP server's event-loop monitor and background embedder.
 - `scheduler.py`: the HTTP server's job scheduler (due occurrences, run keys, retries).
+- `viewer.py`: the read-only web view under `/ui` (server-rendered, no script).
 - `scaffold.py`: neutral new-workspace templates.
 
 ## Invariants

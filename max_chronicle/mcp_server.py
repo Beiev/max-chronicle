@@ -26,9 +26,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from . import __version__
+from . import __version__, viewer
 
 from .automation import load_automation_config
 from .config import (
@@ -125,6 +125,7 @@ STARTUP_MODE_ARG = Annotated[
     Field(description="brief (default): the compact memory brief, plus task_context for a task_id; bundle: the full startup bundle."),
 ]
 BRIEF_TIMEOUT_S = 2.0  # a session-start hook waits for this, so it must stay short
+VIEW_TIMEOUT_S = 15.0  # a page reads a few queries; recall may wait on the embedding model
 # /brief is for processes on this machine. A browser page must not read it: its
 # fetch always sends Origin, and DNS rebinding arrives with a foreign Host (O4).
 _LOOPBACK_HOST = re.compile(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?")
@@ -586,6 +587,25 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         # this one silent.
         return JSONResponse({"status": "ok", "pid": os.getpid(),
                              "uptime_s": round(time.time() - _PROCESS_STARTED_AT), **_runtime_health()})
+
+    async def route_ui(request: Request):
+        if not viewer.allowed(request.headers):
+            return PlainTextResponse("Forbidden\n", status_code=403)
+        segments = viewer.segments_of(request.scope.get("raw_path") or request.url.path)
+        query = dict(request.query_params)
+        health = _runtime_health()
+        try:
+            with anyio.fail_after(VIEW_TIMEOUT_S):
+                status, page = await anyio.to_thread.run_sync(
+                    lambda: viewer.render(manifest(), segments, query, lambda: health), abandon_on_cancel=True)
+        except ValueError as exc:
+            status, page = 400, viewer.error_page(str(exc))
+        except Exception as exc:  # noqa: BLE001 — a page that failed says so instead of hanging
+            status, page = 503, viewer.error_page(f"Unavailable: {type(exc).__name__}")
+        return HTMLResponse(page, status_code=status, headers=viewer.SECURITY_HEADERS)
+
+    server.custom_route("/ui", methods=["GET"])(route_ui)
+    server.custom_route("/ui/{rest:path}", methods=["GET"])(route_ui)
 
     @server.custom_route("/brief", methods=["GET"])
     async def route_brief(request: Request):
