@@ -2096,7 +2096,7 @@ def run_backup(
     # run must never be the reason older good copies disappear.
     if restore_result["ok"]:
         try:
-            retention = retention_report(target_root, automation.backup_retention)
+            retention = retention_report(target_root, automation.backup_retention, protect=(backup_path,))
         except OSError as exc:
             retention = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     else:
@@ -2713,10 +2713,10 @@ def install_launchd(
                 hour=schedule.hour,
                 minute=schedule.minute,
                 weekday=schedule.weekday,
-                # No StartOnMount for the backup: launchd fires it on the mount
-                # of ANY volume, dozens of launches per real backup, and a
-                # missed run is caught up by the schedule anyway.
-                start_on_mount=False,
+                # StartOnMount fires on the mount of any volume (dozens of quick
+                # interval-guard skips per real backup), but it is also what
+                # backs up a disk that was unplugged at the scheduled time.
+                start_on_mount=key == "backup",
             )
         )
         installed.append({"label": label, "plist_path": str(plist_path), "wrapper_path": str(wrapper_path)})

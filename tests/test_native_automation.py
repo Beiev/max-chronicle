@@ -1536,7 +1536,8 @@ def test_the_backup_still_vacuums_a_file_that_is_mostly_free(loaded_manifest) ->
     assert (result["status"], result["mode"]) == ("ok", "vacuum")
 
 
-def test_launchd_backup_job_does_not_start_on_every_mount(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+def test_launchd_backup_job_still_starts_when_its_disk_is_mounted(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+    """A disk unplugged at the scheduled time is backed up when it comes back."""
     from max_chronicle.native_automation import install_launchd
     import plistlib
 
@@ -1546,4 +1547,27 @@ def test_launchd_backup_job_does_not_start_on_every_mount(chronicle_sandbox, loa
 
     plists = {path.name: plistlib.loads(path.read_bytes()) for path in agents.glob("*.plist")}
     backup = [payload for name, payload in plists.items() if name.endswith("backup.plist")]
-    assert backup and "StartOnMount" not in backup[0]
+    assert backup and backup[0]["StartOnMount"] is True
+
+
+def test_backup_prune_refuses_an_unmounted_backup_disk(loaded_automation, monkeypatch, capsys, tmp_path) -> None:
+    """An unplugged disk leaves a bare folder of its name; pruning there removes the wrong copies."""
+    from max_chronicle import cli
+
+    monkeypatch.setattr("max_chronicle.native_automation._backup_volume_root", lambda root: tmp_path / "Volumes" / "Gone")
+
+    code = cli.cmd_backup_prune(argparse.Namespace(automation_config=loaded_automation.root_path, apply=True))
+
+    assert code == 0 and json.loads(capsys.readouterr().out)["reason"] == "backup_target_not_mounted"
+
+
+def test_embed_backfill_reports_the_whole_backlog_not_the_batch(loaded_manifest, monkeypatch) -> None:
+    from max_chronicle import service as service_module
+
+    for index in range(5):
+        record_event(loaded_manifest, {"agent": "agent-a", "domain": "global", "text": f"Event {index}"})
+    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda *a, **k: [1.0, 0.5])
+
+    report = service_module.embed_backfill(loaded_manifest, limit=2)
+
+    assert (report["embedded"], report["total_without_embedding"]) == (2, 5)

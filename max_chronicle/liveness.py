@@ -69,13 +69,33 @@ class LoopMonitor:
         self._samples: deque[tuple[float, float]] = deque()
         self._stalls = 0
         self._stall_dumped = False
+        self._c_timer = False  # faulthandler's own thread dumps a stall, GIL or not
 
     async def run(self) -> None:
         """Tick forever on the loop it runs on; cancel it to stop."""
-        while True:
-            started = self._clock()
-            await anyio.sleep(self.tick_s)
-            self.tick(self._clock() - started - self.tick_s)
+        self._arm_c_timer()
+        try:
+            while True:
+                started = self._clock()
+                await anyio.sleep(self.tick_s)
+                self.tick(self._clock() - started - self.tick_s)
+                self._arm_c_timer()
+        finally:
+            if self._c_timer:
+                faulthandler.cancel_dump_traceback_later()
+
+    def _arm_c_timer(self) -> None:
+        """(Re)start faulthandler's timer: it fires only if the next tick is stall_s late.
+
+        It runs in a C thread, so it dumps even while a C extension holds the
+        GIL and the Python watcher cannot run. Without a usable file descriptor
+        the watcher dumps instead.
+        """
+        try:
+            faulthandler.dump_traceback_later(self.stall_s, repeat=False, file=self._stream or sys.stderr)
+            self._c_timer = True
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            self._c_timer = False
 
     def tick(self, lag: float) -> None:
         """Record one wake-up that came *lag* seconds late."""
@@ -103,6 +123,9 @@ class LoopMonitor:
             self._stall_dumped = True
             self._stalls += 1
         stream = self._stream or sys.stderr
+        if self._c_timer:
+            _LOGGER.error("event loop silent for %.1f s; the stacks of every thread are in this log", silent)
+            return True
         _LOGGER.error("event loop silent for %.1f s; stacks of every thread follow", silent)
         try:
             stream.flush()

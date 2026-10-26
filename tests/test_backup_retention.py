@@ -112,3 +112,52 @@ def test_a_stamp_that_is_no_real_moment_is_not_a_backup(tmp_path) -> None:
     (fake / "backup-manifest.json").write_text("{}", encoding="utf-8")
 
     assert find_backups(tmp_path) == []
+
+
+
+def _manifest(path: Path, payload: dict) -> None:
+    (path / "backup-manifest.json").write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+
+def test_a_failed_backup_never_pushes_a_good_one_out(tmp_path) -> None:
+    """Codex review: the newest copy of the day was a failed one, and pruning removed the good one."""
+    good = _backup(tmp_path, datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc))
+    failed = _backup(tmp_path, datetime(2026, 10, 1, 11, 0, tzinfo=timezone.utc))
+    _manifest(good, {"status": "ok", "restore_check": {"ok": True}})
+    _manifest(failed, {"status": "failed", "restore_check": {"ok": False}})
+
+    report = retention_report(tmp_path, RetentionPolicy(daily=1, weekly=1, monthly=1), apply=True)
+
+    assert good.exists() and failed.exists()
+    assert (report["keep"], report["failed"]) == (1, 1)
+
+
+def test_a_legacy_manifest_without_a_status_counts_as_good(tmp_path) -> None:
+    old = _backup(tmp_path, datetime(2026, 3, 1, 10, 0, tzinfo=timezone.utc))
+    _manifest(old, {"created_at_utc": "2026-03-01T10:00:00Z"})
+
+    assert find_backups(tmp_path)[0].good is True
+
+
+def test_a_symlinked_year_is_never_followed(tmp_path) -> None:
+    """Codex review: a linked year folder led removal into the link's target."""
+    elsewhere = tmp_path / "elsewhere"
+    _backup(elsewhere, datetime(2025, 1, 1, 10, 0, tzinfo=timezone.utc))
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "2025").symlink_to(elsewhere / "2025")
+    keep = _backup(root, datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc))
+
+    retention_report(root, RetentionPolicy(daily=0, weekly=0, monthly=0), apply=True)
+
+    assert [backup.path for backup in find_backups(root)] == [keep]
+    assert any((elsewhere / "2025").iterdir())
+
+
+def test_a_protected_backup_is_never_removed(tmp_path) -> None:
+    paths = _every_other_day(tmp_path, 20)
+
+    report = retention_report(tmp_path, RetentionPolicy(daily=1, weekly=0, monthly=0),
+                              apply=True, protect=(paths[0],))
+
+    assert paths[0].exists() and paths[-1].exists() and report["result"]["removed"] == len(paths) - 2

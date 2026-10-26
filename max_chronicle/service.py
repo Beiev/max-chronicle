@@ -3444,12 +3444,15 @@ def embed_backfill(
     probe = embed_document(DIMENSION_PROBE_TEXT, timeout=BACKFILL_TIMEOUT_S)
     dim = len(probe) if probe is not None else None
     event_ids = fetch_event_ids_without_embedding(config, model_key=model_key, dim=dim)
+    # The whole backlog, before the limit: a caller that loops while events
+    # remain must see them, not the size of this one batch.
+    backlog = len(event_ids)
     if limit is not None:
         event_ids = event_ids[:limit]
     if probe is None:
         # The backend is down or hung: calling it once per event would only
         # repeat the timeout. Nothing was embedded; the next run retries.
-        return {"model_key": model_key, "dim": None, "total_without_embedding": len(event_ids),
+        return {"model_key": model_key, "dim": None, "total_without_embedding": backlog,
                 "embedded": 0, "skipped": 0, "failed": len(event_ids), "backend_unavailable": True}
 
     embedded = 0
@@ -3478,7 +3481,7 @@ def embed_backfill(
     return {
         "model_key": model_key,
         "dim": dim,
-        "total_without_embedding": len(event_ids),
+        "total_without_embedding": backlog,
         "embedded": embedded,
         "skipped": skipped,
         "failed": failed,

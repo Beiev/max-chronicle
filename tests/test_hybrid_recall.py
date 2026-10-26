@@ -524,7 +524,7 @@ class TestEmbedBackfillCli:
         with patch("max_chronicle.embeddings.embed_text", side_effect=_count_and_return):
             result = service.embed_backfill(manifest, limit=2)
 
-        assert result["total_without_embedding"] == 2
+        assert result["total_without_embedding"] == 5  # the whole backlog, not this batch
         assert result["embedded"] == 2
         assert call_count[0] == 2
 

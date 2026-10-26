@@ -585,15 +585,21 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         report["redactions"] += note.redactions
     now = _utc()
     # Short transactions: agents' writes wait for this one's lock. A reindex of
-    # every note (a new parser version) used to be a single transaction.
-    for start in range(0, len(changed), NOTES_WRITE_BATCH):
+    # every note (a new parser version) used to be a single transaction. The
+    # full-text merge that purges replaced and removed text from old segments
+    # rides in the last one, so it commits with the last change: if that fails,
+    # the change is still pending and the next sync repeats both.
+    batches = [changed[start:start + NOTES_WRITE_BATCH] for start in range(0, len(changed), NOTES_WRITE_BATCH)]
+    gone = [path for path, (_, _, deleted, _) in known.items() if path not in live and deleted is None]
+    for index, batch in enumerate(batches):
         with write_transaction(config) as connection:
             # Text that leaves the index must not stay behind in freed pages.
             connection.execute("PRAGMA secure_delete = ON")
-            for note in changed[start:start + NOTES_WRITE_BATCH]:
+            for note in batch:
                 _store(connection, note, now)
                 report["indexed"] += 1
-    gone = [path for path, (_, _, deleted, _) in known.items() if path not in live and deleted is None]
+            if index == len(batches) - 1 and not gone:
+                connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
     if gone:
         with write_transaction(config) as connection:
             connection.execute("PRAGMA secure_delete = ON")
@@ -608,9 +614,6 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
                         "content_sha256 = '', size_bytes = 0, redactions = 0 WHERE id = ?",
                         (now, Path(path).stem, identifier))
                 report["removed"] += 1
-    if changed or report["removed"]:
-        with write_transaction(config) as connection:
-            connection.execute("PRAGMA secure_delete = ON")
             # Deleted rows stay in older full-text segments until they merge.
             connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
     _checkpoint(config)  # also retries one that a reader blocked last time

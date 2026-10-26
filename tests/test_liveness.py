@@ -151,3 +151,24 @@ def test_a_failing_sweep_is_reported_not_raised(caplog) -> None:
 
     assert "RuntimeError" in report["error"]
     assert embedder.snapshot()["runs"] == 1
+
+
+def test_a_blocked_loop_is_dumped_by_the_c_timer_even_while_the_gil_is_held(tmp_path) -> None:
+    """The Python watcher needs the GIL; faulthandler's timer thread does not."""
+    import time
+
+    dump = (tmp_path / "stacks.txt").open("w+")
+    monitor = LoopMonitor(tick_s=0.05, stall_s=0.3, stream=dump)
+
+    async def main() -> None:
+        async with anyio.create_task_group() as group:
+            group.start_soon(monitor.run)
+            await anyio.sleep(0.1)
+            time.sleep(0.8)  # the loop is stuck well past stall_s
+            await anyio.sleep(0.1)
+            group.cancel_scope.cancel()
+
+    anyio.run(main)
+
+    dump.seek(0)
+    assert "test_a_blocked_loop_is_dumped_by_the_c_timer" in dump.read()

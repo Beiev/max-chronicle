@@ -649,7 +649,15 @@ def cmd_backup(args: argparse.Namespace) -> int:
 def cmd_backup_prune(args: argparse.Namespace) -> int:
     from .backup_retention import retention_report
 
+    from .native_automation import _backup_volume_root
+
     automation = load_native_automation(args.automation_config)
+    volume = _backup_volume_root(automation.backup_root)
+    if volume is not None and not volume.is_mount():
+        # An unmounted backup disk leaves a bare folder of that name behind;
+        # pruning there would remove the wrong copies.
+        return _print_json({"status": "skipped", "reason": "backup_target_not_mounted",
+                            "backup_root": str(automation.backup_root), "volume_root": str(volume)})
     payload = retention_report(automation.backup_root, automation.backup_retention, apply=args.apply)
     payload["backup_root"] = str(automation.backup_root)
     return _print_json(payload)

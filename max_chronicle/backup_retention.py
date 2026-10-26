@@ -9,13 +9,18 @@ for a month still keeps its last good copies.
 
 Removal is opt-in (``prune = true``): until then a backup run only reports
 what the policy would remove. Only directories this package wrote are ever
-candidates: ``<backup_root>/<YYYY>/<stamp>`` with a backup manifest inside.
+candidates: ``<backup_root>/<YYYY>/<stamp>`` with a backup manifest inside,
+reached without a symbolic link. Only a good backup fills a slot: one whose
+manifest says it passed its restore check (older manifests say nothing and
+count as good unless their check failed). A failed or unreadable backup never
+pushes a good one out, and is itself left alone.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import re
 import shutil
@@ -50,6 +55,20 @@ class RetentionPolicy:
 class BackupDir:
     path: Path
     started_at: datetime
+    good: bool | None = True  # None: the manifest could not be read
+
+
+def _good(manifest_path: Path) -> bool | None:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    restore = manifest.get("restore_check") or {}
+    if manifest.get("status") not in (None, "ok") or restore.get("ok") is False:
+        return False
+    return True
 
 
 def find_backups(backup_root: Path) -> list[BackupDir]:
@@ -58,18 +77,25 @@ def find_backups(backup_root: Path) -> list[BackupDir]:
     if not backup_root.is_dir():
         return found
     for year in backup_root.iterdir():
-        if not (year.is_dir() and re.fullmatch(r"\d{4}", year.name)):
-            continue
+        if year.is_symlink() or not (year.is_dir() and re.fullmatch(r"\d{4}", year.name)):
+            continue  # a link could lead removal outside the backup root
         for entry in year.iterdir():
             match = _STAMP.match(entry.name)
-            if not (match and entry.is_dir() and (entry / MANIFEST_NAME).is_file()):
-                continue  # a staging directory, a foreign folder, or an unfinished run
+            if entry.is_symlink() or not (match and entry.is_dir() and (entry / MANIFEST_NAME).is_file()):
+                continue  # a staging directory, a foreign folder, a link, or an unfinished run
             try:
                 started = datetime.strptime(match.group(1), "%Y-%m-%dT%H-%M-%SZ").replace(tzinfo=timezone.utc)
             except ValueError:  # shaped like a stamp, not a real moment (month 13): not ours
                 continue
-            found.append(BackupDir(entry, started))
-    return sorted(found, key=lambda item: (item.started_at, item.path.name), reverse=True)
+            found.append(BackupDir(entry, started, _good(entry / MANIFEST_NAME)))
+    return sorted(found, key=lambda item: (item.started_at, _mtime(item.path), item.path.name), reverse=True)
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _newest_per_period(backups: list[BackupDir], key, count: int) -> set[Path]:
@@ -86,31 +112,42 @@ def _newest_per_period(backups: list[BackupDir], key, count: int) -> set[Path]:
     return kept
 
 
-def plan_retention(backups: list[BackupDir], policy: RetentionPolicy) -> dict[str, Any]:
-    """Split *backups* (newest first) into the ones to keep and the ones to remove."""
-    keep: set[Path] = set()
-    if backups:
-        keep.add(backups[0].path)
-    keep |= _newest_per_period(backups, lambda moment: moment.date(), policy.daily)
-    keep |= _newest_per_period(backups, lambda moment: moment.isocalendar()[:2], policy.weekly)
-    keep |= _newest_per_period(backups, lambda moment: (moment.year, moment.month), policy.monthly)
-    prune = [backup for backup in backups if backup.path not in keep]
+def plan_retention(
+    backups: list[BackupDir], policy: RetentionPolicy, *, protect: tuple[Path, ...] = ()
+) -> dict[str, Any]:
+    """Split *backups* (newest first) into the ones to keep and the ones to remove.
+
+    Slots are filled from good backups only; failed and unreadable ones are
+    neither kept for a slot nor removed. *protect* is never removed (the
+    backup a run just wrote).
+    """
+    good = [backup for backup in backups if backup.good]
+    keep: set[Path] = {Path(path) for path in protect}
+    if good:
+        keep.add(good[0].path)
+    keep |= _newest_per_period(good, lambda moment: moment.date(), policy.daily)
+    keep |= _newest_per_period(good, lambda moment: moment.isocalendar()[:2], policy.weekly)
+    keep |= _newest_per_period(good, lambda moment: (moment.year, moment.month), policy.monthly)
+    prune = [backup for backup in good if backup.path not in keep]
     return {
         "policy": {"daily": policy.daily, "weekly": policy.weekly, "monthly": policy.monthly,
                    "prune": policy.prune},
         "backups": len(backups),
-        "keep": len(backups) - len(prune),
+        "keep": len(good) - len(prune),
+        "failed": sum(1 for backup in backups if backup.good is False),
+        "unreadable": sum(1 for backup in backups if backup.good is None),
         "remove": [str(backup.path) for backup in prune],
-        "oldest_kept": min((b.started_at for b in backups if b.path in keep), default=None),
+        "oldest_kept": min((b.started_at for b in good if b.path in keep), default=None),
     }
 
 
 def apply_retention(backup_root: Path, plan: dict[str, Any]) -> dict[str, Any]:
     """Remove the backups *plan* lists; only directories `find_backups` recognises."""
-    known = {str(backup.path) for backup in find_backups(backup_root)}
+    known = {str(backup.path) for backup in find_backups(backup_root) if backup.good}
+    root = backup_root.resolve()
     removed, refused, errors = [], [], []
     for path in plan["remove"]:
-        if path not in known:
+        if path not in known or root not in Path(path).resolve().parents:
             refused.append(path)
             continue
         try:
@@ -121,9 +158,11 @@ def apply_retention(backup_root: Path, plan: dict[str, Any]) -> dict[str, Any]:
     return {"removed": len(removed), "refused": refused, "errors": errors}
 
 
-def retention_report(backup_root: Path, policy: RetentionPolicy, *, apply: bool | None = None) -> dict[str, Any]:
+def retention_report(
+    backup_root: Path, policy: RetentionPolicy, *, apply: bool | None = None, protect: tuple[Path, ...] = ()
+) -> dict[str, Any]:
     """Plan, and remove when *apply* (default: the policy's ``prune``) says so."""
-    plan = plan_retention(find_backups(backup_root), policy)
+    plan = plan_retention(find_backups(backup_root), policy, protect=protect)
     applying = policy.prune if apply is None else apply
     report = {**plan, "applied": applying}
     if plan["oldest_kept"] is not None:
