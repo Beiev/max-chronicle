@@ -437,8 +437,9 @@ index reads (FR-10).
   runtime directory. A job's due moment is computed in
   the installation's timezone, and its run is keyed by that moment (its date, or
   for the weekly audit its ISO week): a run delayed past midnight fills the day it
-  was due, never the next. A failed or deferred run is retried after 30 minutes,
-  up to six times; one still marked running after six hours is started again;
+  was due, never the next. A failed run is retried after 30 minutes, up to six
+  times; a deferred one (the backup disk not mounted) every 30 minutes until it
+  runs; one still marked running after six hours is started again;
   one due more than three days ago is skipped. `/health` shows
   the last runs under `scheduler`. `chronicle automation run --job X --occurrence
   ISO` runs a job as the occurrence it names.

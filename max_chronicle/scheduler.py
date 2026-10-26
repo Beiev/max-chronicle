@@ -15,8 +15,10 @@ Here the server decides, once a minute:
   run fills the slot it was due for and never takes the next one;
 - the job runs as its own process (``chronicle automation run --occurrence``),
   its work and memory outside the server, one job at a time;
-- a run that failed or was deferred (a backup disk not mounted) is tried
-  again after ``RETRY_AFTER``, at most ``MAX_ATTEMPTS`` times per occurrence;
+- a run that failed is tried again after ``RETRY_AFTER``, at most
+  ``MAX_ATTEMPTS`` times per occurrence; one that was deferred (a backup disk
+  not mounted) is tried every ``RETRY_AFTER`` until it runs, which is what
+  launchd's StartOnMount did: the backup follows the disk within half an hour;
 - a run still marked running after the stale TTL died without a word (a job
   killed at ``JOB_TIMEOUT_S`` writes no final status): it is started again,
   and the job retires the dead row itself;
@@ -174,7 +176,7 @@ class Scheduler:
                 elif status in RETRY_STATUSES:
                     finished = _parse((row or {}).get("finished_at_utc"))
                     attempts = self._attempts.get((job, run_key), 1)
-                    if attempts >= MAX_ATTEMPTS:
+                    if status != "deferred" and attempts >= MAX_ATTEMPTS:
                         decision.action, decision.detail = "gave_up", f"{attempts} attempts"
                     elif finished is not None and self._clock() - finished < RETRY_AFTER:
                         decision.action, decision.detail = "wait", f"retry after {status}"

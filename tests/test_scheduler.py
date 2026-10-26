@@ -113,6 +113,23 @@ def test_a_failed_run_is_retried_after_a_pause_and_given_up_after_its_attempts(s
     assert _actions(scheduler.decide())["daily-capture"] == "gave_up"
 
 
+def test_a_deferred_backup_is_retried_until_its_disk_comes_back(scheduler_env) -> None:
+    """launchd's StartOnMount backed up a disk plugged in late; the scheduler must not give up on it."""
+    scheduler, clock, runs, manifest, _ = scheduler_env
+    zone = ZoneInfo(config_from_manifest(manifest).timezone)
+    key = occurrence_key("daily-capture", due_occurrence(DAILY, clock["now"].astimezone(zone)))
+    with open_connection(config_from_manifest(manifest)) as connection, connection:
+        connection.execute(
+            "INSERT INTO automation_runs(id, job_name, run_key, trigger_source, started_at_utc, finished_at_utc, status) "
+            "VALUES ('r1', 'daily-capture', ?, 'scheduler', '2026-10-20T00:20:00Z', '2026-10-20T00:20:01Z', 'deferred')",
+            (key,))
+
+    for _ in range(MAX_ATTEMPTS + 2):
+        scheduler.tick()
+
+    assert _actions(scheduler.decide())["daily-capture"] == "run"
+
+
 def test_a_run_left_running_past_the_stale_ttl_is_started_again(scheduler_env) -> None:
     """A job killed at its timeout writes no final status; its row must not block the occurrence."""
     scheduler, clock, runs, manifest, _ = scheduler_env
