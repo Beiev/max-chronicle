@@ -1467,3 +1467,124 @@ def test_backup_reports_intentional_purge_without_claiming_file_is_archived(
     assert result["status"] == "ok"
     assert result["restore_check"]["intentionally_purged_artifacts"] == 1
     assert result["restore_check"]["artifact_hashes_ok"] is True
+
+
+def test_a_backup_reports_retention_and_removes_nothing_by_default(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    first = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+    second = run_backup(loaded_manifest, loaded_automation, trigger_source="pytest", force=True)
+
+    assert second["status"] == "ok"
+    assert second["retention"]["applied"] is False
+    assert second["retention"]["backups"] == 2
+    assert Path(first["backup_path"]).exists()
+
+
+def test_a_backup_with_pruning_on_keeps_what_the_policy_keeps(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    from dataclasses import replace
+
+    from max_chronicle.backup_retention import RetentionPolicy
+
+    chronicle_sandbox.backup_root.mkdir(parents=True, exist_ok=True)
+    old = chronicle_sandbox.backup_root / "2025" / "2025-01-01T23-00-00Z"
+    old.mkdir(parents=True)
+    (old / "backup-manifest.json").write_text("{}", encoding="utf-8")
+    automation = replace(loaded_automation, backup_retention=RetentionPolicy(daily=1, weekly=0, monthly=0, prune=True))
+
+    result = run_backup(loaded_manifest, automation, trigger_source="pytest", force=True)
+
+    assert result["retention"]["result"]["removed"] == 1
+    assert not old.exists() and Path(result["backup_path"]).exists()
+
+
+def _legacy_without_auto_vacuum(config) -> None:
+    """The production database predates INCREMENTAL auto-vacuum."""
+    with sqlite3.connect(config.db_path) as connection:
+        connection.execute("PRAGMA auto_vacuum = NONE")
+        connection.execute("VACUUM")
+
+
+def test_the_backup_skips_a_full_vacuum_when_little_is_free(loaded_manifest) -> None:
+    from max_chronicle.native_automation import _vacuum_db
+
+    config = config_from_manifest(loaded_manifest)
+    _legacy_without_auto_vacuum(config)
+
+    result = _vacuum_db(config)
+
+    assert result["status"] == "skipped" and result["reason"] == "little_free_space"
+
+
+def test_the_backup_still_vacuums_a_file_that_is_mostly_free(loaded_manifest) -> None:
+    from max_chronicle.native_automation import _vacuum_db
+
+    config = config_from_manifest(loaded_manifest)
+    _legacy_without_auto_vacuum(config)
+    with sqlite3.connect(config.db_path) as connection:
+        connection.execute("CREATE TABLE scratch_fill(blob BLOB)")
+        connection.executemany("INSERT INTO scratch_fill VALUES (?)", [(os.urandom(4096),) for _ in range(2000)])
+        connection.commit()
+        connection.execute("DROP TABLE scratch_fill")
+        connection.commit()
+
+    result = _vacuum_db(config)
+
+    assert (result["status"], result["mode"]) == ("ok", "vacuum")
+
+
+def test_launchd_backup_job_still_starts_when_its_disk_is_mounted(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:
+    """A disk unplugged at the scheduled time is backed up when it comes back."""
+    from max_chronicle.native_automation import install_launchd
+    import plistlib
+
+    agents = chronicle_sandbox.root / "agents"
+    install_launchd(loaded_manifest, loaded_automation, agent_dir=agents,
+                    runtime_dir=chronicle_sandbox.root / "rt", log_dir=chronicle_sandbox.root / "logs", load_jobs=False)
+
+    plists = {path.name: plistlib.loads(path.read_bytes()) for path in agents.glob("*.plist")}
+    backup = [payload for name, payload in plists.items() if name.endswith("backup.plist")]
+    assert backup and backup[0]["StartOnMount"] is True
+
+
+def test_backup_prune_refuses_an_unmounted_backup_disk(loaded_automation, monkeypatch, capsys, tmp_path) -> None:
+    """An unplugged disk leaves a bare folder of its name; pruning there removes the wrong copies."""
+    from max_chronicle import cli
+
+    monkeypatch.setattr("max_chronicle.native_automation._backup_volume_root", lambda root: tmp_path / "Volumes" / "Gone")
+
+    code = cli.cmd_backup_prune(argparse.Namespace(automation_config=loaded_automation.root_path, apply=True))
+
+    assert code == 0 and json.loads(capsys.readouterr().out)["reason"] == "backup_target_not_mounted"
+
+
+def test_embed_backfill_reports_the_whole_backlog_not_the_batch(loaded_manifest, monkeypatch) -> None:
+    from max_chronicle import service as service_module
+
+    for index in range(5):
+        record_event(loaded_manifest, {"agent": "agent-a", "domain": "global", "text": f"Event {index}"})
+    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda *a, **k: [1.0, 0.5])
+
+    report = service_module.embed_backfill(loaded_manifest, limit=2)
+
+    assert (report["embedded"], report["total_without_embedding"]) == (2, 5)
+
+
+
+def test_a_backup_skipped_for_a_missing_disk_is_deferred_and_retried_the_same_day(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    """Round-2 review: the skip took the day's key, so plugging the disk in later backed up nothing."""
+    import shutil
+
+    shutil.rmtree(chronicle_sandbox.backup_root, ignore_errors=True)
+
+    first = run_automation_job(loaded_manifest, loaded_automation, job_name="backup", trigger_source="pytest")
+    chronicle_sandbox.backup_root.mkdir(parents=True)
+    second = run_automation_job(loaded_manifest, loaded_automation, job_name="backup", trigger_source="pytest")
+
+    assert first["status"] == "deferred"
+    assert second["status"] == "ok"

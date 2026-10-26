@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 from typing import Any
 
 from . import embeddings
@@ -533,6 +534,11 @@ def _shown(path: Path | str) -> str:
     return redact(str(path)).text
 
 
+NOTES_WRITE_BATCH = 100  # notes per write transaction
+MERGE_EVERY_S = 24 * 3600  # an unchanged index still gets a full-text merge this often
+_last_merge: dict[str, float] = {}  # database path -> monotonic time of its last merge
+
+
 def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int | None = None) -> dict[str, Any]:
     """Bring the index in line with the note files; the files are only read."""
     settings = note_settings(manifest)
@@ -581,14 +587,26 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
         changed.append(note)
         report["redactions"] += note.redactions
     now = _utc()
-    with write_transaction(config) as connection:
-        # Text that leaves the index must not stay behind in freed pages.
-        connection.execute("PRAGMA secure_delete = ON")
-        for note in changed:
-            _store(connection, note, now)
-            report["indexed"] += 1
-        for path, (_, _, deleted, _) in known.items():
-            if path not in live and deleted is None:
+    # Short transactions: agents' writes wait for this one's lock. A reindex of
+    # every note (a new parser version) used to be a single transaction. The
+    # full-text merge that purges replaced and removed text from old segments
+    # rides in the last one, so it commits with the last change: if that fails,
+    # the change is still pending and the next sync repeats both.
+    batches = [changed[start:start + NOTES_WRITE_BATCH] for start in range(0, len(changed), NOTES_WRITE_BATCH)]
+    gone = [path for path, (_, _, deleted, _) in known.items() if path not in live and deleted is None]
+    for index, batch in enumerate(batches):
+        with write_transaction(config) as connection:
+            # Text that leaves the index must not stay behind in freed pages.
+            connection.execute("PRAGMA secure_delete = ON")
+            for note in batch:
+                _store(connection, note, now)
+                report["indexed"] += 1
+            if index == len(batches) - 1 and not gone:
+                connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
+    if gone:
+        with write_transaction(config) as connection:
+            connection.execute("PRAGMA secure_delete = ON")
+            for path in gone:
                 identifier = document_id(Path(path))
                 connection.execute("DELETE FROM document_chunks WHERE document_id = ?", (identifier,))
                 if redact(path).count:
@@ -599,9 +617,19 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
                         "content_sha256 = '', size_bytes = 0, redactions = 0 WHERE id = ?",
                         (now, Path(path).stem, identifier))
                 report["removed"] += 1
-        if changed or report["removed"]:
             # Deleted rows stay in older full-text segments until they merge.
             connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
+    merged = bool(batches or gone)
+    if not merged and time.monotonic() - _last_merge.get(str(config.db_path), float("-inf")) > MERGE_EVERY_S:
+        # A merge that rolled back with a failed batch whose change then went
+        # away (the note was deleted again) would never run: one a day, cheap
+        # on an index already merged, purges whatever it left.
+        with write_transaction(config) as connection:
+            connection.execute("PRAGMA secure_delete = ON")
+            connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
+        merged = True
+    if merged:
+        _last_merge[str(config.db_path)] = time.monotonic()
     _checkpoint(config)  # also retries one that a reader blocked last time
     if embed:
         report["embedding"] = embed_chunks(manifest, limit=embed_limit)

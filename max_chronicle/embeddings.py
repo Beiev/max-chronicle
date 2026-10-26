@@ -31,6 +31,18 @@ DOCUMENT_TIMEOUT_S = 3.0  # on the write path, outside the write lock
 BACKFILL_TIMEOUT_S = 30.0  # a long event on a cold model
 FLOAT32_MAX = 3.4028234663852886e38  # vectors are stored as float32
 DIMENSION_PROBE_TEXT = "dimension probe"  # embedded once per backfill to learn the model's dimension
+# How long Ollama keeps the model loaded after a call. Its own default is five
+# minutes; a cold load can take ~10 s on a machine under memory pressure, longer
+# than any query or write wants to wait, so a server that embeds keeps it warm.
+ENV_KEEP_ALIVE = "CHRONICLE_EMBED_KEEP_ALIVE"
+DEFAULT_KEEP_ALIVE = "30m"
+# The context window Ollama allocates for the model. Its default for
+# qwen3-embedding is the model's 32k, about 5.4 GB resident for events and note
+# sections that stay far below that; 8192 needs about half and gives identical
+# vectors for any shorter text (cosine 1.0). Longer text is truncated, as
+# `truncate` already allows.
+ENV_NUM_CTX = "CHRONICLE_EMBED_NUM_CTX"
+DEFAULT_NUM_CTX = 8192
 
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
@@ -85,6 +97,19 @@ def active_profile() -> EmbeddingProfile:
 
 def _ollama_base_url() -> str:
     return os.environ.get("OLLAMA_URL", _DEFAULT_OLLAMA_URL).rstrip("/")
+
+
+def _keep_alive() -> str:
+    return os.environ.get(ENV_KEEP_ALIVE, "").strip() or DEFAULT_KEEP_ALIVE
+
+
+def _num_ctx() -> int:
+    raw = os.environ.get(ENV_NUM_CTX, "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_NUM_CTX
+    except ValueError:
+        return DEFAULT_NUM_CTX
+    return value if value > 0 else DEFAULT_NUM_CTX
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +185,8 @@ def _request_embeddings(inputs: str | list[str], *, timeout: float) -> list[list
     """One Ollama /api/embed call for a text or a list; None unless every vector is usable. NEVER raises."""
     expected = 1 if isinstance(inputs, str) else len(inputs)
     try:
-        payload = {"model": active_profile().model, "input": inputs, "truncate": True}
+        payload = {"model": active_profile().model, "input": inputs, "truncate": True,
+                   "keep_alive": _keep_alive(), "options": {"num_ctx": _num_ctx()}}
         req = urllib.request.Request(
             f"{_ollama_base_url()}/api/embed",
             data=json.dumps(payload).encode("utf-8"),

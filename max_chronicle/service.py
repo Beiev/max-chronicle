@@ -2121,6 +2121,15 @@ def reconstruct_timeline(
     return payload
 
 
+def _request_replay(config, connection, prior_request: dict[str, Any], redactions: dict[str, int]) -> dict[str, Any]:
+    """The answer to a retried request: the committed event and its receipt, nothing new."""
+    previous = fetch_event(config, event_id=prior_request["event_id"], connection=connection)
+    return {**previous, "chronicle_status": "existing", "chronicle_db_path": str(config.db_path),
+            "chronicle_error": None, "artifacts_written": 0, **({"redactions": redactions} if redactions else {}),
+            "observation_id": prior_request["observation_id"], "fact_id": prior_request["fact_id"],
+            "evidence": prior_request["evidence"], "dedupe_status": "request_id_match"}
+
+
 def record_event(
     manifest: dict[str, Any],
     entry: dict[str, Any],
@@ -2130,7 +2139,13 @@ def record_event(
     dedupe_window_hours: int = 12,
     source_kind: str = "agent_command",
     imported_from: str = "chronicle.record",
+    defer_embedding: bool = False,
 ) -> dict[str, Any]:
+    """Store one event; with *defer_embedding* its vector is left to a background indexer.
+
+    A long-running server defers: the embedding call (seconds on a cold
+    model) then never runs inside the write slot that every agent shares.
+    """
     # Pop private test/injection keys before any serialization path sees them.
     _embed_fn_override = entry.pop("_embed_fn", None)
     # Redact before anything derives from the text: hashes, embeddings, the
@@ -2197,10 +2212,19 @@ def record_event(
     # fails, the event stays without one until embed-backfill repairs it.
     # Failure MUST NOT surface to the caller; the flag (default ON) lets tests
     # opt out via the env var.
+    # A retry of a committed request answers from its receipt before any slow
+    # work: no embedding, no attachment copy. The transaction below checks
+    # again, so a race between two retries still ends in one observation.
+    if normalized_entry.get("request_id"):
+        with open_connection(config) as connection:
+            prior_request = request_receipt(connection, normalized_entry)
+            if prior_request is not None:
+                return _request_replay(config, connection, prior_request, redactions)
+
     embedding_vec: list[float] | None = None
     embed_model: str | None = None
     embed_dim: int | None = None
-    if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
+    if not defer_embedding and feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
         try:
             from .embeddings import active_profile, embed_document, event_embedding_text
             # _embed_fn_override is popped from entry before normalization
@@ -2244,11 +2268,7 @@ def record_event(
     with write_transaction(config) as connection:
         prior_request = request_receipt(connection, normalized_entry)
         if prior_request is not None:
-            previous = fetch_event(config, event_id=prior_request["event_id"], connection=connection)
-            return {**previous, "chronicle_status": "existing", "chronicle_db_path": str(config.db_path),
-                    "chronicle_error": None, "artifacts_written": 0, **({"redactions": redactions} if redactions else {}),
-                    "observation_id": prior_request["observation_id"], "fact_id": prior_request["fact_id"],
-                    "evidence": prior_request["evidence"], "dedupe_status": "request_id_match"}
+            return _request_replay(config, connection, prior_request, redactions)
         existing = None
         if dedupe:
             existing = _find_recent_exact_duplicate(config, normalized_entry,
@@ -3424,12 +3444,15 @@ def embed_backfill(
     probe = embed_document(DIMENSION_PROBE_TEXT, timeout=BACKFILL_TIMEOUT_S)
     dim = len(probe) if probe is not None else None
     event_ids = fetch_event_ids_without_embedding(config, model_key=model_key, dim=dim)
+    # The whole backlog, before the limit: a caller that loops while events
+    # remain must see them, not the size of this one batch.
+    backlog = len(event_ids)
     if limit is not None:
         event_ids = event_ids[:limit]
     if probe is None:
         # The backend is down or hung: calling it once per event would only
         # repeat the timeout. Nothing was embedded; the next run retries.
-        return {"model_key": model_key, "dim": None, "total_without_embedding": len(event_ids),
+        return {"model_key": model_key, "dim": None, "total_without_embedding": backlog,
                 "embedded": 0, "skipped": 0, "failed": len(event_ids), "backend_unavailable": True}
 
     embedded = 0
@@ -3458,7 +3481,7 @@ def embed_backfill(
     return {
         "model_key": model_key,
         "dim": dim,
-        "total_without_embedding": len(event_ids),
+        "total_without_embedding": backlog,
         "embedded": embedded,
         "skipped": skipped,
         "failed": failed,

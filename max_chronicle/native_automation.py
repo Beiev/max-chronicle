@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from .automation import AutomationConfig, ensure_automation_dirs, load_automation_config, load_env_file, repo_by_slug, repo_slug_for_path
 from .config import default_automation_path, feature_enabled, mem0_enabled
 from .runtime_context import expand_path, read_json, utc_now
+from .backup_retention import retention_report
 from .service import backfill_mem0_queue, build_freshness_audit, capture_runtime_snapshot, embed_backfill, record_event, repair_mem0_state, ENV_FEATURE_EVENT_EMBEDDINGS
 from .store import (
     config_from_manifest,
@@ -1367,6 +1368,13 @@ def _rotate_jsonl_if_needed(path: Path, *, cap_bytes: int) -> dict[str, Any]:
     }
 
 
+BACKUP_INTERVAL_SLACK = timedelta(hours=1)
+BACKUP_DEFERRED_REASONS = frozenset({
+    "backup_target_not_mounted", "target_unmounted", "insufficient_space", "target_unwritable",
+})
+VACUUM_MIN_FREE_RATIO = 0.2  # share of free pages that makes a full VACUUM worth its lock
+
+
 def _vacuum_db(config) -> dict[str, Any]:
     """Space maintenance on the live DB; never fights the MCP daemon for locks."""
     try:
@@ -1375,9 +1383,17 @@ def _vacuum_db(config) -> dict[str, Any]:
             # daemon — a skipped vacuum simply retries on the next run.
             connection.execute("PRAGMA busy_timeout = 2000")
             auto_vacuum_mode = connection.execute("PRAGMA auto_vacuum").fetchone()[0]
+            free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+            total_pages = int(connection.execute("PRAGMA page_count").fetchone()[0]) or 1
             if auto_vacuum_mode == 2:  # INCREMENTAL
                 connection.execute("PRAGMA incremental_vacuum")
                 mode = "incremental_vacuum"
+            elif free_pages / total_pages < VACUUM_MIN_FREE_RATIO:
+                # A full VACUUM takes the database's exclusive lock and rewrites
+                # the whole file, so every agent's write waits behind it; it ran
+                # on every backup however little was free.
+                return {"status": "skipped", "mode": "vacuum", "reason": "little_free_space",
+                        "free_pages": free_pages, "page_count": total_pages}
             else:
                 # Legacy fallback for DBs not yet flipped to INCREMENTAL: full
                 # VACUUM needs an exclusive lock and rewrites the whole file.
@@ -1808,7 +1824,10 @@ def run_backup(
     latest = fetch_latest_backup_run(config, successful_only=True)
     if latest and not force:
         last_dt = datetime.fromisoformat(latest["started_at_utc"].replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) - last_dt < timedelta(days=automation.guards.backup_interval_days):
+        # An hour of slack: a run at 04:30 two days after one that started at
+        # 04:30:01 is not early, and skipping it stretched the interval to three days.
+        interval = timedelta(days=automation.guards.backup_interval_days) - BACKUP_INTERVAL_SLACK
+        if datetime.now(timezone.utc) - last_dt < interval:
             return {
                 "status": "skipped",
                 "reason": "interval_guard",
@@ -2080,6 +2099,15 @@ def run_backup(
         entity_name="chronicle",
         link_role="backs_up",
     )
+    # Retention only after a backup that passed its restore check: a failing
+    # run must never be the reason older good copies disappear.
+    if restore_result["ok"]:
+        try:
+            retention = retention_report(target_root, automation.backup_retention, protect=(backup_path,))
+        except OSError as exc:
+            retention = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        retention = {"status": "skipped", "reason": "backup_failed"}
     return {
         "status": "ok" if restore_result["ok"] else "failed",
         "run_id": run_id,
@@ -2090,6 +2118,7 @@ def run_backup(
         "target_root": str(target_root),
         "backup_policy": "opportunistic_external",
         "maintenance": maintenance,
+        "retention": retention,
         "artifact_files": artifact_files,
         "artifact_files_copied": artifact_files_copied,
         "artifact_bytes_copied": artifact_bytes_copied,
@@ -2562,10 +2591,16 @@ def run_automation_job(
     if job_name == "backup":
         def _backup(run_id: str) -> dict[str, Any]:
             result = run_backup(manifest, automation, trigger_source=trigger_source)
+            # A skip the disk caused (not plugged in, full, read-only) leaves the
+            # day's backup to do: the run is deferred, and the next launch of the
+            # day (the disk's mount, a catch-up) retries it under the same key.
+            status = "deferred" if result.get("status") == "skipped" and result.get("reason") in BACKUP_DEFERRED_REASONS \
+                else result["status"]
+            result = result | {"status": status} if status == "deferred" else result
             finish_automation_run(
                 config,
                 run_id=run_id,
-                status=result["status"],
+                status=status,
                 details=result,
                 snapshot_id=result.get("snapshot_id"),
             )
@@ -2691,6 +2726,9 @@ def install_launchd(
                 hour=schedule.hour,
                 minute=schedule.minute,
                 weekday=schedule.weekday,
+                # StartOnMount fires on the mount of any volume (dozens of quick
+                # interval-guard skips per real backup), but it is also what
+                # backs up a disk that was unplugged at the scheduled time.
                 start_on_mount=key == "backup",
             )
         )
