@@ -805,13 +805,14 @@ class TestSearchMem0Live:
 
 
 class TestMCPServerRegistration:
-    def test_chronicler_profile_exposes_v8_tools(self, chronicle_sandbox) -> None:
+    def test_admin_profile_exposes_v8_tools(self, chronicle_sandbox) -> None:
         import asyncio
-        from max_chronicle.mcp_server import build_server, CHRONICLER_PROFILE
+        from max_chronicle.mcp_server import build_server, ADMIN_PROFILE
 
+        # Maintenance moved to the admin profile with the six-tool agent surface.
         server = build_server(
             manifest_path=chronicle_sandbox.manifest_path,
-            profile=CHRONICLER_PROFILE,
+            profile=ADMIN_PROFILE,
         )
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}

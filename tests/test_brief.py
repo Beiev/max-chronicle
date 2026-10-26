@@ -74,14 +74,33 @@ def test_the_brief_leaves_out_closed_tasks_old_decisions_and_quarantine(loaded_m
     assert "monthly" not in text and "Hidden" not in text
 
 
-def test_a_project_brief_keeps_global_items_and_drops_other_projects(loaded_manifest) -> None:
-    _record(loaded_manifest, "Global rule", category="decision")
-    _record(loaded_manifest, "Alpha rule", project="alpha", category="decision")
-    _record(loaded_manifest, "Beta rule", project="beta", category="decision")
+def test_a_project_brief_shows_only_its_own_decisions(loaded_manifest) -> None:
+    """A decision without a project (a pipeline's) used to show up in every project's brief."""
+    _record(loaded_manifest, "Global decision", category="decision")
+    _record(loaded_manifest, "Alpha decision", project="alpha", category="decision")
+    _record(loaded_manifest, "Beta decision", project="beta", category="decision")
+
+    alpha = _brief(loaded_manifest, project="alpha")["text"]
+    everything = _brief(loaded_manifest)["text"]
+
+    assert "Alpha decision" in alpha and "Global decision" not in alpha and "Beta decision" not in alpha
+    assert all(name in everything for name in ("Global decision", "Alpha decision", "Beta decision"))
+
+
+def test_a_project_brief_lists_its_facts_first_and_caps_global_ones(loaded_manifest) -> None:
+    from max_chronicle.brief import BRIEF_GLOBAL_FACTS
+
+    for index in range(BRIEF_GLOBAL_FACTS + 3):
+        _record(loaded_manifest, f"Global rule {index}",
+                fact={"slot": f"global.rule{index}", "value": f"g{index}", "kind": "decision"})
+    _record(loaded_manifest, "Alpha rule", project="alpha",
+            fact={"slot": "alpha.rule", "value": "a1", "kind": "decision"})
 
     text = _brief(loaded_manifest, project="alpha")["text"]
+    facts = [line for line in text.splitlines() if line.startswith("- ") and " = " in line]
 
-    assert "Global rule" in text and "Alpha rule" in text and "Beta rule" not in text
+    assert facts[0].startswith("- alpha.rule = a1")
+    assert len(facts) == 1 + BRIEF_GLOBAL_FACTS
 
 
 def test_warnings_cover_a_stale_capture_and_recent_job_failures_only(loaded_manifest) -> None:
