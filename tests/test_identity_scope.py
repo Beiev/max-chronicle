@@ -115,12 +115,12 @@ def test_a_write_stores_canonical_names_with_the_given_ones_beside_them(loaded_m
 
     with open_connection(config_from_manifest(manifest)) as connection:
         rows = {row["id"]: row for row in connection.execute(
-            "SELECT id, actor, title, circumstances, payload_json FROM events WHERE id IN (?, ?)", (aliased, canonical))}
+            "SELECT id, actor, project, domain, payload_json FROM events WHERE id IN (?, ?)", (aliased, canonical))}
     first, second = rows[aliased], rows[canonical]
-    assert (first["actor"], first["title"], first["circumstances"]) == ("codex", "max-chronicle", "memory")
+    assert (first["actor"], first["project"], first["domain"]) == ("codex", "max-chronicle", "memory")
     payload = json.loads(first["payload_json"])
     assert (payload["actor_raw"], payload["project_raw"], payload["domain_raw"]) == ("Codex-CLI", "status", "mem")
-    assert (second["actor"], second["title"]) == ("codex", "max-chronicle")
+    assert (second["actor"], second["project"]) == ("codex", "max-chronicle")
     assert not {"actor_raw", "project_raw", "domain_raw"} & set(json.loads(second["payload_json"]))
 
 

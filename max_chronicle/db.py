@@ -232,9 +232,62 @@ def _prepare_migration_v14(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE documents ADD COLUMN index_version INTEGER NOT NULL DEFAULT 0")
 
 
+SQLITE_DROP_COLUMN = (3, 35, 0)
+
+# What 0016 drops or moves, and the rows that would lose something if it ran.
+_V16_INVARIANTS = (
+    # NULL comes back as [null,null], which every v15 reader takes for the same scope.
+    ("facts whose group_id is not a [project, task] pair",
+     "SELECT COUNT(*) FROM facts WHERE CASE WHEN group_id IS NULL THEN 0 WHEN NOT json_valid(group_id) THEN 1 "
+     "ELSE json_type(group_id) IS NOT 'array' OR json_array_length(group_id) != 2 END"),
+    ("facts whose group_id differs from the project and task in attributes_json",
+     "SELECT COUNT(*) FROM facts WHERE CASE WHEN json_valid(COALESCE(group_id, 'null')) THEN "
+     "json_extract(group_id, '$[0]') IS NOT json_extract(attributes_json, '$.project') "
+     "OR json_extract(group_id, '$[1]') IS NOT json_extract(attributes_json, '$.task_id') ELSE 0 END"),
+    ("facts whose relation differs from slot_key", "SELECT COUNT(*) FROM facts WHERE relation IS NOT slot_key"),
+    ("facts with a confidence other than 1.0", "SELECT COUNT(*) FROM facts WHERE confidence IS NOT 1.0"),
+    ("facts with a reference_time_utc", "SELECT COUNT(*) FROM facts WHERE reference_time_utc IS NOT NULL"),
+    ("facts of a kind other than observed, decision or assumption",
+     "SELECT COUNT(*) FROM facts WHERE json_extract(attributes_json, '$.kind') NOT IN "
+     "('observed', 'decision', 'assumption')"),
+    ("events with a visibility other than default or raw_only",
+     "SELECT COUNT(*) FROM events WHERE json_extract(payload_json, '$.memory_guard.visibility') "
+     "NOT IN ('default', 'raw_only')"),
+    ("observations with a visibility other than default or raw_only",
+     "SELECT COUNT(*) FROM event_observations WHERE json_extract(payload_json, '$.memory_guard.visibility') "
+     "NOT IN ('default', 'raw_only')"),
+)
+
+
+def _prepare_migration_v16(connection: sqlite3.Connection) -> None:
+    """Refuse 0016_schema_v2_columns where the columns it drops hold anything else.
+
+    0016 drops facts.relation, confidence, reference_time_utc and group_id, and
+    builds the one-active-value index on the columns attributes_json fills.
+    That is lossless, and migrations/down/0016 can rebuild them, only while the
+    invariants below hold; they always do for what this package wrote.
+    """
+    if sqlite3.sqlite_version_info < SQLITE_DROP_COLUMN:
+        raise MigrationError(
+            f"migration 0016 needs SQLite {'.'.join(map(str, SQLITE_DROP_COLUMN))} or newer "
+            f"(ALTER TABLE DROP COLUMN); this Python has {sqlite3.sqlite_version}"
+        )
+    broken = [
+        f"{count} {label}"
+        for label, sql in _V16_INVARIANTS
+        if (count := int(connection.execute(sql).fetchone()[0]))
+    ]
+    if broken:
+        raise MigrationError(
+            "migration 0016 refused, the database is unchanged: " + "; ".join(broken)
+            + ". These columns would lose data; fix the rows or report them."
+        )
+
+
 _MIGRATION_PREHOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _prepare_migration_v8,
     14: _prepare_migration_v14,
+    16: _prepare_migration_v16,
 }
 
 
@@ -434,6 +487,7 @@ def ensure_schema(
     concurrent upgraders serialise, and the second one finds nothing to do.
     """
     _begin_immediate_with_retry(connection)
+    backup_path = None
     try:
         state = read_schema_state(connection, config)
         check_schema_policy(state, config, allow_upgrade=allow_upgrade, allow_init=allow_init)
@@ -450,8 +504,53 @@ def ensure_schema(
         connection.commit()
     except BaseException:
         connection.rollback()
+        # The database is as it was, so its copy adds nothing; and a server that
+        # launchd restarts after each failed upgrade would leave one per restart.
+        if backup_path is not None:
+            backup_path.unlink(missing_ok=True)
         raise
     return SchemaPreparation(state_before=state, applied=tuple(applied), backup_path=backup_path)
+
+
+@dataclass(frozen=True)
+class SchemaRevert:
+    """Receipt of revert_migration: the version undone, and where the copy before it is."""
+
+    version: int
+    script: Path
+    schema_version: int
+    backup_path: Path
+
+
+def revert_migration(connection: sqlite3.Connection, config: ChronicleConfig, version: int) -> SchemaRevert:
+    """Undo the newest migration with its down script, after an online backup.
+
+    Only the newest applied migration reverts, and only one that ships a script
+    in migrations/down/. Install the code of the earlier version before anything
+    opens the database with --migrate again: this code would re-apply it.
+    """
+    _begin_immediate_with_retry(connection)
+    try:
+        state = read_schema_state(connection, config)
+        if state.foreign:
+            raise MigrationError(f"{config.db_path} is not a Chronicle database; refusing to modify it.")
+        if state.current_version != version:
+            raise MigrationError(
+                f"only the newest migration reverts: {config.db_path} is at v{state.current_version}, not v{version}"
+            )
+        scripts = sorted((config.migrations_dir / "down").glob(f"{version:04d}_*.sql"))
+        if len(scripts) != 1:
+            raise MigrationError(f"migration {version:04d} has no down script in {config.migrations_dir / 'down'}")
+        backup_path = _backup_database(config.db_path, label=f"prerevert-v{version}")
+        _execute_sql_script_in_transaction(connection, scripts[0].read_text(encoding="utf-8"))
+        connection.execute("DELETE FROM schema_migrations WHERE version = ?", (version,))
+        schema_version = max(state.applied - {version}, default=0)
+        connection.execute(f"PRAGMA user_version = {schema_version}")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return SchemaRevert(version=version, script=scripts[0], schema_version=schema_version, backup_path=backup_path)
 
 
 def schema_target_version(config: ChronicleConfig) -> int:

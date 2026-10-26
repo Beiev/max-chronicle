@@ -71,6 +71,7 @@ from .store import (
     merge_normalized_entities,
     open_connection,
     persist_staged_artifact,
+    quarantined_event_ids,
     search_events,
     stage_artifact_from_path,
     start_ingest_run,
@@ -351,6 +352,19 @@ def _compat_path(manifest: dict[str, Any], key: str) -> Path:
     return expand_path(manifest["paths"][key])
 
 
+def _compat_ledger(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """The rows of the JSONL ledger, less events quarantined since; none without a ledger_file.
+
+    A row is a copy made when its event was written: the guard it carries is
+    the one the event had then.
+    """
+    path = (manifest.get("paths") or {}).get("ledger_file")
+    if not path:
+        return []
+    hidden = quarantined_event_ids(_config(manifest))
+    return [row for row in read_jsonl(expand_path(path)) if row.get("id") not in hidden]
+
+
 def _operator_label(manifest: dict[str, Any]) -> str:
     """Installation owner shown in agent prompts; generic unless the manifest names one."""
     return str(manifest.get("settings", {}).get("operator") or "the operator")
@@ -546,6 +560,8 @@ def _normalize_record_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _memory_guard_visibility(entry: dict[str, Any]) -> str:
+    if entry.get("visibility"):  # an events row: its column decides
+        return str(entry["visibility"])
     memory_guard = entry.get("memory_guard")
     if isinstance(memory_guard, dict):
         return str(memory_guard.get("visibility") or "default")
@@ -1383,7 +1399,7 @@ def _resolve_activation_snapshot(
         recent_events = fetch_recent_events(config, limit=8, domain=domain_id)
         if not recent_events:
             recent_events = _filter_events_by_visibility(sorted(
-                read_jsonl(_compat_path(manifest, "ledger_file")),
+                _compat_ledger(manifest),
                 key=lambda row: row.get("recorded_at", ""),
                 reverse=True,
             )[:8])
@@ -2618,7 +2634,7 @@ def backfill_mem0_queue(
                 e.id,
                 e.recorded_at_utc,
                 e.category,
-                e.title,
+                e.project,
                 e.source_kind,
                 e.mem0_status,
                 e.payload_json,
@@ -2652,7 +2668,7 @@ def backfill_mem0_queue(
                     "id": row["id"],
                     "recorded_at": row["recorded_at_utc"],
                     "category": row["category"],
-                    "project": row["title"],
+                    "project": row["project"],
                     "source_kind": row["source_kind"],
                     "event_mem0_status": current_status,
                     "outbox_status": row["outbox_status"],
@@ -2847,7 +2863,7 @@ def capture_runtime_snapshot(
     recent_events = fetch_recent_events(config, limit=8, domain=domain_id)
     if not recent_events:
         recent_events = _filter_events_by_visibility(sorted(
-            read_jsonl(_compat_path(manifest, "ledger_file")),
+            _compat_ledger(manifest),
             key=lambda row: row.get("recorded_at", ""),
             reverse=True,
         )[:8])

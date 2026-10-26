@@ -350,31 +350,25 @@ def test_record_event_dedupe_is_race_safe_under_concurrency(loaded_manifest) -> 
 def test_query_plan_smoke_uses_stability_indexes(loaded_manifest) -> None:
     config = config_from_manifest(loaded_manifest)
     with open_connection(config) as connection:
-        native_domain = _plan_details(
+        domain = _plan_details(
             connection,
-            "SELECT id FROM events WHERE circumstances = ? ORDER BY occurred_at_utc DESC LIMIT 5",
+            "SELECT id FROM events WHERE domain = ? ORDER BY occurred_at_utc DESC LIMIT 5",
             ("global",),
         )
-        legacy_domain = _plan_details(
+        project = _plan_details(
             connection,
-            "SELECT id FROM events WHERE circumstances IS NULL AND json_extract(payload_json, '$.domain') = ? ORDER BY occurred_at_utc DESC LIMIT 5",
-            ("global",),
-        )
-        title_project = _plan_details(
-            connection,
-            "SELECT id FROM events WHERE title = ? ORDER BY occurred_at_utc DESC LIMIT 5",
+            "SELECT id FROM events WHERE project = ? ORDER BY occurred_at_utc DESC LIMIT 5",
             ("status",),
         )
-        legacy_project = _plan_details(
+        task = _plan_details(
             connection,
-            "SELECT id FROM events WHERE entity_id IS NULL AND title IS NULL AND json_extract(payload_json, '$.project') = ? ORDER BY occurred_at_utc DESC LIMIT 5",
-            ("status",),
+            "SELECT id FROM events WHERE project = ? AND task_id = ? ORDER BY occurred_at_utc",
+            ("status", "review"),
         )
 
-    assert "idx_events_domain_recent" in native_domain
-    assert "idx_events_payload_domain_recent" in legacy_domain
-    assert "idx_events_title_recent" in title_project
-    assert "idx_events_payload_project_recent" in legacy_project
+    assert "idx_events_domain_recent" in domain
+    assert "idx_events_project_recent" in project
+    assert "idx_events_task" in task
 
 
 def test_open_connection_closes_on_exit(loaded_manifest) -> None:

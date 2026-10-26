@@ -1099,7 +1099,10 @@ def fetch_event(
                 e.entity_id,
                 e.text,
                 e.why,
-                e.circumstances,
+                e.domain,
+                e.project,
+                e.task_id,
+                e.visibility,
                 e.mem0_status,
                 e.mem0_error,
                 e.payload_json,
@@ -1198,6 +1201,18 @@ def _normalize_event_visibility(visibility: str | None) -> str:
     if normalized not in {"default", "raw"}:
         raise ValueError(f"Unsupported visibility: {visibility}")
     return normalized
+
+
+def quarantined_event_ids(config: ChronicleConfig) -> set[str]:
+    """The ids of every quarantined event, for copies of events kept outside the database."""
+    with open_connection(config) as connection:
+        return {row[0] for row in connection.execute("SELECT id FROM events WHERE visibility = 'raw_only'")}
+
+
+def guard_visibility(memory_guard: Any) -> str:
+    """The visibility column a memory guard sets: raw_only hides the row outside raw reads."""
+    visibility = memory_guard.get("visibility") if isinstance(memory_guard, dict) else None
+    return "raw_only" if visibility == "raw_only" else "default"
 
 
 def _event_payload(entry: dict[str, Any]) -> dict[str, Any]:
@@ -1437,10 +1452,7 @@ def _upsert_mem0_outbox(
 def _event_scope(config: ChronicleConfig, alias: str = "e", **names: str | None) -> tuple[str, tuple[str, ...]]:
     """SQL keeping events in a scope, whichever spelling each name was written in (FR-14)."""
     return config.identities.scope(**names).where(
-        domain=f"COALESCE({alias}.circumstances, json_extract({alias}.payload_json, '$.domain'))",
-        project=f"COALESCE({alias}.title, json_extract({alias}.payload_json, '$.project'))",
-        task=f"json_extract({alias}.payload_json, '$.task_id')",
-    )
+        domain=f"{alias}.domain", project=f"{alias}.project", task=f"{alias}.task_id")
 
 
 def store_event(
@@ -1483,20 +1495,22 @@ def store_event(
                 category,
                 entity_type,
                 entity_id,
-                title,
+                project,
+                task_id,
                 text,
                 why,
-                circumstances,
+                domain,
+                visibility,
                 source_kind,
                 source_path,
                 source_hash,
                 payload_json,
-                imported_from,
+                written_by,
                 mem0_status,
                 mem0_error,
                 content_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -1510,9 +1524,11 @@ def store_event(
                 entity_type,
                 entity_id,
                 payload.get("project"),
+                payload.get("task_id"),
                 payload.get("text") or "",
                 payload.get("why"),
                 payload.get("domain"),
+                guard_visibility(payload.get("memory_guard")),
                 source_kind,
                 (payload.get("source_files") or [None])[0],
                 None,
@@ -1633,16 +1649,16 @@ def _event_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
 
     return {
         "id": row["id"],
-        "task_id": payload.get("task_id"),
+        "task_id": row["task_id"],
         "session_id": payload.get("session_id"),
         "checkpoint": payload.get("checkpoint"),
         "fact": payload.get("fact"),
         "recorded_at": row["occurred_at_utc"],
         "agent": payload.get("agent") or row["actor"],
         "branch": payload.get("branch"),
-        "domain": payload.get("domain") or row["circumstances"],
+        "domain": row["domain"],
         "category": row["category"],
-        "project": payload.get("project") or _project_from_entity_id(row["entity_id"]),
+        "project": row["project"] or _project_from_entity_id(row["entity_id"]),
         "text": row["text"],
         "why": row["why"],
         "source_files": payload.get("source_files") or [],
@@ -1652,14 +1668,61 @@ def _event_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
         "mem0_synced_at": mem0_synced_at,
         "entity_id": row["entity_id"],
         "memory_guard": payload.get("memory_guard", outbox_payload.get("memory_guard")),
+        "visibility": row["visibility"],
     }
 
 
-def _snapshot_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
+# One event row as _event_row_to_entry reads it; the caller adds WHERE.
+_EVENT_ROW_SQL = """
+    SELECT e.id, e.occurred_at_utc, e.actor, e.category, e.entity_id, e.text, e.why,
+           e.domain, e.project, e.task_id, e.visibility, e.mem0_status, e.mem0_error, e.payload_json,
+           o.status AS outbox_status, o.last_error AS outbox_last_error,
+           o.payload_json AS outbox_payload_json, o.synced_at_utc AS outbox_synced_at
+    FROM events AS e
+    LEFT JOIN mem0_outbox AS o ON o.event_id = e.id AND o.operation = 'add'
+"""
+
+
+def _snapshot_row_to_entry(
+    connection: sqlite3.Connection, row: sqlite3.Row, *, visibility: str = "default"
+) -> dict[str, Any]:
+    """A snapshot as readers get it: its recent_ledger holds only events visible now.
+
+    Every reader of a snapshot payload goes through here. The ledger holds
+    copies of the events, or their ids; an id becomes the event as it is now.
+    An event quarantined after the capture leaves the ledger with it.
+    """
     payload = _load_json(row["payload_json"])
     payload.setdefault("id", row["id"])
     payload.setdefault("captured_at_utc", row["captured_at_utc"])
+    ledger = payload.get("recent_ledger")
+    if isinstance(ledger, list) and visibility != "raw":
+        payload["recent_ledger"] = _visible_ledger(connection, ledger)
     return payload
+
+
+def _visible_ledger(connection: sqlite3.Connection, ledger: list[Any]) -> list[dict[str, Any]]:
+    ids = [entry if isinstance(entry, str) else entry.get("id") for entry in ledger if isinstance(entry, (str, dict))]
+    ids = [event_id for event_id in ids if isinstance(event_id, str)]
+    rows = {
+        row["id"]: row
+        for row in connection.execute(
+            _EVENT_ROW_SQL + " WHERE e.id IN (" + ", ".join("?" for _ in ids) + ")", ids
+        )
+    } if ids else {}
+    visible: list[dict[str, Any]] = []
+    for entry in ledger:
+        if isinstance(entry, str):
+            row = rows.get(entry)
+            if row is not None and row["visibility"] != "raw_only":
+                visible.append(_event_row_to_entry(row))
+        elif isinstance(entry, dict):
+            row = rows.get(entry.get("id"))
+            # A copy of an event this database no longer holds keeps the guard it was captured with.
+            hidden = row["visibility"] if row is not None else guard_visibility(entry.get("memory_guard"))
+            if hidden != "raw_only":
+                visible.append(entry)
+    return visible
 
 
 def fetch_recent_events(
@@ -1683,7 +1746,10 @@ def fetch_recent_events(
                 e.entity_id,
                 e.text,
                 e.why,
-                e.circumstances,
+                e.domain,
+                e.project,
+                e.task_id,
+                e.visibility,
                 e.mem0_status,
                 e.mem0_error,
                 e.payload_json,
@@ -1694,7 +1760,7 @@ def fetch_recent_events(
             FROM events AS e
             LEFT JOIN mem0_outbox AS o
                 ON o.event_id = e.id AND o.operation = 'add'
-            WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
+            WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND """ + scope_sql + """
             ORDER BY e.occurred_at_utc DESC
             LIMIT ?
@@ -1727,9 +1793,7 @@ def fetch_latest_snapshot(
             """,
             scope_params,
         ).fetchone()
-    if not row:
-        return None
-    return _snapshot_row_to_entry(row)
+        return _snapshot_row_to_entry(connection, row) if row else None
 
 
 def fetch_project_events(
@@ -1754,7 +1818,10 @@ def fetch_project_events(
                 e.entity_id,
                 e.text,
                 e.why,
-                e.circumstances,
+                e.domain,
+                e.project,
+                e.task_id,
+                e.visibility,
                 e.mem0_status,
                 e.mem0_error,
                 e.payload_json,
@@ -1765,7 +1832,7 @@ def fetch_project_events(
             FROM events AS e
             LEFT JOIN mem0_outbox AS o
                 ON o.event_id = e.id AND o.operation = 'add'
-            WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
+            WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND (e.entity_id IN (""" + ", ".join("?" for _ in entity_ids) + """) OR """ + project_sql + """)
             ORDER BY e.occurred_at_utc DESC
             LIMIT ?
@@ -1813,7 +1880,10 @@ def search_events(
                     e.entity_id,
                     e.text,
                     e.why,
-                    e.circumstances,
+                    e.domain,
+                    e.project,
+                    e.task_id,
+                    e.visibility,
                     e.mem0_status,
                     e.mem0_error,
                     e.payload_json,
@@ -1827,11 +1897,11 @@ def search_events(
                     ON e.id = events_fts.event_id
                 LEFT JOIN mem0_outbox AS o
                     ON o.event_id = e.id AND o.operation = 'add'
-                WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
+                WHERE (? = 'raw' OR e.visibility != 'raw_only')
                   AND events_fts MATCH ?
                   AND """ + scope_sql + """
                   AND (? = 0 OR NOT EXISTS (SELECT 1 FROM facts f
-                      WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
+                      WHERE f.status != 'active' AND (f.event_id=e.id
                       OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
                           AND json_extract(obs.payload_json,'$.fact_id')=f.id))))
                 ORDER BY rank, e.occurred_at_utc DESC, e.id
@@ -1872,9 +1942,9 @@ def search_fact_events(
         rows = connection.execute(
             """SELECT e.id FROM facts_fts
             JOIN current_facts f ON f.row_id=facts_fts.rowid
-            JOIN events e ON e.id=json_extract(f.attributes_json,'$.event_id')
+            JOIN events e ON e.id=f.event_id
             WHERE facts_fts MATCH ?
-              AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+              AND e.visibility != 'raw_only'
               AND """ + scope_sql + """
             ORDER BY bm25(facts_fts),e.occurred_at_utc DESC,e.id LIMIT ?""",
             (_fts_query(query), *scope_params, limit),
@@ -1900,10 +1970,10 @@ def fetch_recall_pool(
         rows = connection.execute(
             """SELECT e.id, e.occurred_at_utc, ev.model_key, ev.dim, ev.vector
             FROM events e LEFT JOIN event_vectors ev ON ev.event_id = e.id AND ev.model_key = ?
-            WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
+            WHERE e.visibility != 'raw_only'
               AND """ + scope_sql + """
               AND NOT EXISTS (SELECT 1 FROM facts f
-                  WHERE f.status != 'active' AND (json_extract(f.attributes_json,'$.event_id')=e.id
+                  WHERE f.status != 'active' AND (f.event_id=e.id
                   OR EXISTS (SELECT 1 FROM event_observations obs WHERE obs.event_id=e.id
                       AND json_extract(obs.payload_json,'$.fact_id')=f.id)))
             ORDER BY e.occurred_at_utc DESC, e.id
@@ -1938,7 +2008,10 @@ def fetch_events_between(
                 e.entity_id,
                 e.text,
                 e.why,
-                e.circumstances,
+                e.domain,
+                e.project,
+                e.task_id,
+                e.visibility,
                 e.mem0_status,
                 e.mem0_error,
                 e.payload_json,
@@ -1949,7 +2022,7 @@ def fetch_events_between(
             FROM events AS e
             LEFT JOIN mem0_outbox AS o
                 ON o.event_id = e.id AND o.operation = 'add'
-            WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
+            WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?
               AND """ + scope_sql + excluded_sql + """
@@ -1989,7 +2062,7 @@ def fingerprint_events_between(
             """
             SELECT e.id, e.category, e.text, e.why
             FROM events AS e
-            WHERE COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only'
+            WHERE e.visibility != 'raw_only'
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?""" + excluded_sql + """
             ORDER BY e.occurred_at_utc ASC, e.id ASC
@@ -3395,6 +3468,7 @@ def timeline_state(
         snapshot_rows = connection.execute(
             """
             SELECT
+                id,
                 captured_at_utc,
                 payload_json,
                 ABS(unixepoch(captured_at_utc) - unixepoch(?)) AS delta_seconds
@@ -3415,7 +3489,10 @@ def timeline_state(
                 e.entity_id,
                 e.text,
                 e.why,
-                e.circumstances,
+                e.domain,
+                e.project,
+                e.task_id,
+                e.visibility,
                 e.mem0_status,
                 e.mem0_error,
                 e.payload_json,
@@ -3426,7 +3503,7 @@ def timeline_state(
             FROM events AS e
             LEFT JOIN mem0_outbox AS o
                 ON o.event_id = e.id AND o.operation = 'add'
-            WHERE (? = 'raw' OR COALESCE(json_extract(e.payload_json, '$.memory_guard.visibility'), '') != 'raw_only')
+            WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND """ + window_sql + """
               AND """ + scope_sql + """
             ORDER BY e.occurred_at_utc ASC
@@ -3434,11 +3511,12 @@ def timeline_state(
             (resolved_visibility, *window_params, *scope_params),
         ).fetchall()
         fact_rows = _facts_as_of(connection, config, target_utc, domain, resolved_visibility) if as_of else []
+        snapshot_payloads = [
+            _snapshot_row_to_entry(connection, row, visibility=resolved_visibility) for row in snapshot_rows
+        ]
 
     snapshots: list[dict[str, Any]] = []
-    for row in snapshot_rows:
-        payload = _load_json(row["payload_json"])
-        payload.setdefault("captured_at_utc", row["captured_at_utc"])
+    for row, payload in zip(snapshot_rows, snapshot_payloads):
         payload["delta_seconds"] = int(row["delta_seconds"])
         snapshots.append(payload if detail == "full" else digest_snapshot(payload))
 
@@ -3480,9 +3558,9 @@ def _facts_as_of(connection: sqlite3.Connection, config: ChronicleConfig, target
     Outside the raw visibility, the fact of a quarantined event is hidden with it.
     """
     scope_sql, scope_params = config.identities.scope(domain=domain).where(
-        domain="domain", project="json_extract(group_id,'$[0]')", task="json_extract(group_id,'$[1]')")
+        domain="domain", project="project", task="task_id")
     rows = connection.execute(
-        """SELECT id, domain, group_id, slot_key, value_key, attributes_json, attributed_to,
+        """SELECT id, domain, project, task_id, slot_key, value_key, kind, attributed_to,
                   recorded_at_utc, expired_at_utc
            FROM facts AS f
            WHERE status NOT IN ('redacted', 'purged') AND """ + scope_sql + """
@@ -3490,19 +3568,17 @@ def _facts_as_of(connection: sqlite3.Connection, config: ChronicleConfig, target
              AND (expired_at_utc IS NULL OR julianday(expired_at_utc) > julianday(?))
              AND (? = 'raw' OR NOT EXISTS (
                  SELECT 1 FROM events AS fe
-                 WHERE fe.id = json_extract(f.attributes_json, '$.event_id')
-                   AND json_extract(fe.payload_json, '$.memory_guard.visibility') = 'raw_only'))
+                 WHERE fe.id = f.event_id AND fe.visibility = 'raw_only'))
            ORDER BY recorded_at_utc DESC, row_id DESC
            LIMIT ?""",
         (*scope_params, target_utc, target_utc, visibility, FACTS_AS_OF_LIMIT),
     ).fetchall()
     facts = []
     for row in rows:
-        project, task_id = (json.loads(row["group_id"]) + [None, None])[:2] if row["group_id"] else (None, None)
         facts.append({
-            "id": row["id"], "domain": row["domain"], "project": project, "task_id": task_id,
+            "id": row["id"], "domain": row["domain"], "project": row["project"], "task_id": row["task_id"],
             "slot": row["slot_key"], "value": row["value_key"],
-            "kind": (_load_json(row["attributes_json"]) or {}).get("kind"), "agent": row["attributed_to"],
+            "kind": row["kind"], "agent": row["attributed_to"],
             "recorded_at_utc": row["recorded_at_utc"], "retired_at_utc": row["expired_at_utc"],
         })
     return facts
@@ -3536,10 +3612,10 @@ def update_event_memory_guard(
         connection.execute(
             """
             UPDATE events
-            SET payload_json = ?
+            SET payload_json = ?, visibility = ?
             WHERE id = ?
             """,
-            (_json(event_payload), event_id),
+            (_json(event_payload), guard_visibility(memory_guard), event_id),
         )
 
         if row["outbox_payload_json"] is not None:
@@ -4040,7 +4116,7 @@ def find_event_by_content_hash_recent(
     threshold_iso = threshold.strftime("%Y-%m-%dT%H:%M:%SZ")
     sql = """
             SELECT id, occurred_at_utc, recorded_at_utc, event_type, category,
-                   entity_type, entity_id, title, text, actor, content_hash
+                   entity_type, entity_id, project, text, actor, content_hash
             FROM events
             WHERE content_hash = ? AND occurred_at_utc >= ?
             ORDER BY occurred_at_utc DESC

@@ -29,7 +29,7 @@ from .config import (
     mem0_enabled,
     resolve_status_root,
 )
-from .db import MigrationError, connect, database_summary, ensure_schema, read_schema_state
+from .db import MigrationError, connect, database_summary, ensure_schema, read_schema_state, revert_migration
 from .evals import build_report, check_thresholds, format_report, load_golden, run_eval
 from .native_automation import (
     doctor_launchd,
@@ -136,6 +136,16 @@ def _config_from_args(args: argparse.Namespace) -> ChronicleConfig:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
+    if args.revert is not None:
+        with _connection(config) as connection:
+            reverted = revert_migration(connection, config, args.revert)
+        return _print_json({
+            "db_path": str(config.db_path),
+            "reverted": {"version": reverted.version, "script": str(reverted.script)},
+            "schema_version": reverted.schema_version,
+            "backup_path": str(reverted.backup_path),
+            "next": "Install the release for this schema before the server restarts with --migrate.",
+        })
     with _connection(config) as connection:
         prepared = ensure_schema(connection, config, allow_upgrade=True)
         summary = database_summary(connection)
@@ -958,6 +968,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(handler=cmd_init)
 
     p_migrate = sub.add_parser("migrate", help="Create chronicle.db and apply SQL migrations")
+    p_migrate.add_argument(
+        "--revert", type=int, metavar="VERSION",
+        help="Undo the newest migration VERSION with its down script (backs up first)",
+    )
     p_migrate.set_defaults(handler=cmd_migrate)
 
     p_import = sub.add_parser(

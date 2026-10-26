@@ -38,8 +38,9 @@ it and the old one stays inspectable.
   or kept as a pointer when archiving is off. A pointer is not a copy.
 - **Scope.** `domain` is a broad configured area; `project` and `task_id` identify
   the work. Recall, the brief and task context filter by scope.
-- **Quarantine.** An event marked `memory_guard.visibility = raw_only` stays in the
-  history but never reaches recall, briefs, task context, `get_memory` or the web view.
+- **Quarantine.** An event with `visibility = raw_only` (set by a memory guard) stays in
+  the history but never reaches recall, briefs, task context, snapshots, `get_memory` or
+  the web view.
 
 A stored record is an attributed assertion, not a verified fact: its author,
 evidence and kind stay visible so the reader can judge it.

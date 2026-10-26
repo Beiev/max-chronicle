@@ -17,7 +17,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .identity import UNKNOWN_AGENT, Registry, Scope, fold_sql
-from .store import config_from_manifest, open_connection
+from .store import config_from_manifest, guard_visibility, open_connection
 
 Item = Annotated[str, Field(min_length=1, max_length=1000)]
 
@@ -252,8 +252,8 @@ def record_observation(
         )
     connection.execute(
         """INSERT INTO event_observations(id,event_id,request_id,request_hash,observation_hash,
-        domain,project,task_id,session_id,actor,recorded_at_utc,payload_json)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        domain,project,task_id,session_id,actor,recorded_at_utc,payload_json,visibility)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             observation_id,
             event_id,
@@ -267,6 +267,7 @@ def record_observation(
             entry.get("agent"),
             now,
             _json(payload),
+            guard_visibility(entry.get("memory_guard")),
         ),
     )
     return _observation(
@@ -283,7 +284,7 @@ def _active_facts(connection, entry: dict[str, Any], slot: str, identities: Regi
     separate slots when those facts were recorded.
     """
     scope = identities.scope(domain=entry["domain"], project=entry.get("project"), task_id=entry.get("task_id"))
-    project, task = "json_extract(group_id,'$[0]')", "json_extract(group_id,'$[1]')"
+    project, task = "project", "task_id"
     where, params = scope.where(domain="domain", project=project, task=task)
     # A fact without a project or task belongs to that wider scope only.
     if scope.project is None:
@@ -305,7 +306,7 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now, identit
     unchanged = (
         current is not None
         and current["value_key"] == fact["value"]
-        and json.loads(current["attributes_json"])["kind"] == fact["kind"]
+        and current["kind"] == fact["kind"]
     )
     expected = fact.get("supersedes")
     if expected and (current is None or current["id"] != expected):
@@ -357,14 +358,18 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now, identit
         )
     if not unchanged:
         connection.execute(
-            """INSERT INTO facts(id,domain,group_id,relation,fact_text,fact_hash,recorded_at_utc,
-            valid_from_utc,valid_from_precision,created_tx_id,slot_key,value_key,cardinality,attributes_json,attributed_to)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO facts(id,domain,project,task_id,kind,event_id,observation_id,fact_text,fact_hash,
+            recorded_at_utc,valid_from_utc,valid_from_precision,created_tx_id,slot_key,value_key,cardinality,
+            attributes_json,attributed_to)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 fact_id,
                 entry["domain"],
-                group,
-                fact["slot"],
+                entry.get("project"),
+                entry.get("task_id"),
+                fact["kind"],
+                event_id,
+                episode_id,
                 f"{fact['slot']}: {fact['value']}\n{entry['text']}",
                 _hash(fact),
                 now,
@@ -412,6 +417,8 @@ def _record_fact(connection, entry, episode_id, event_id, evidence, now, identit
     return fact_id
 
 
+# The columns that place a fact: its scope, kind and the event it came from.
+FACT_SCOPE = ("event_id", "kind", "observation_id", "project", "task_id")
 OPEN_TASK_LIMIT = 5
 OPEN_TASK_NEXT_STEPS = 3  # enough to choose a task; its own scope returns the full checkpoint
 CLOSED_TASK_STATUSES = ("completed", "cancelled")
@@ -442,9 +449,7 @@ def _decode_cursor(value: str, scope: Scope, identities: Registry) -> int:
 def _scope_filter(scope: Scope) -> tuple[str, tuple]:
     """Observations in scope under any spelling of its names, without quarantined ones (FR-1, FR-14)."""
     where, params = scope.where(domain="o.domain", project="o.project", task="o.task_id")
-    return where + """
-        AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
-        AND COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'""", params
+    return where + " AND e.visibility != 'raw_only' AND o.visibility != 'raw_only'", params
 
 
 def open_tasks(
@@ -464,7 +469,7 @@ def _open_tasks(connection, identities: Registry, scope: Scope, limit: int) -> l
     """
     where, params = _scope_filter(scope)
     project_sql, project_params = identities.project_sql("o.project")
-    fact_project_sql, fact_project_params = identities.project_sql("json_extract(f.attributes_json,'$.project')")
+    fact_project_sql, fact_project_params = identities.project_sql("f.project")
     closed = ",".join("?" for _ in CLOSED_TASK_STATUSES)
     rows = connection.execute(
         """SELECT * FROM (
@@ -477,11 +482,11 @@ def _open_tasks(connection, identities: Registry, scope: Scope, limit: int) -> l
             ) AS s
         ) AS c WHERE latest = 1 AND COALESCE((
             SELECT lower(trim(f.value_key)) FROM current_facts f
-            JOIN events fe ON fe.id=json_extract(f.attributes_json,'$.event_id')
+            JOIN events fe ON fe.id=f.event_id
             WHERE f.slot_key='task.status'
               AND """ + fact_project_sql + """ IS c.task_project
-              AND """ + fold_sql("json_extract(f.attributes_json,'$.task_id')") + """ = c.task_key
-              AND COALESCE(json_extract(fe.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+              AND """ + fold_sql("f.task_id") + """ = c.task_key
+              AND fe.visibility != 'raw_only'
             ORDER BY f.recorded_at_utc DESC, f.id DESC LIMIT 1
         ), '') NOT IN (""" + closed + """)
         ORDER BY seq DESC LIMIT ?""",
@@ -528,8 +533,8 @@ def task_context(
     where, params = _scope_filter(scope)
     fact_where, fact_params = scope.where(
         domain="f.domain",
-        project="json_extract(f.attributes_json,'$.project')",
-        task="json_extract(f.attributes_json,'$.task_id')",
+        project="f.project",
+        task="f.task_id",
         task_or_unset=True,
     )
     with open_connection(config) as connection:
@@ -565,10 +570,9 @@ def task_context(
             ).fetchone()
         open_tasks = None if scope.task_id else _open_tasks(connection, identities, scope, OPEN_TASK_LIMIT)
         facts = connection.execute(
-            """SELECT f.* FROM current_facts f JOIN events e
-            ON e.id=json_extract(f.attributes_json,'$.event_id')
+            """SELECT f.* FROM current_facts f JOIN events e ON e.id=f.event_id
             WHERE """ + fact_where + """
-            AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+            AND e.visibility != 'raw_only'
             ORDER BY f.recorded_at_utc DESC,f.id LIMIT ?""",
             (*fact_params, limit + 1),
         ).fetchall()
@@ -596,7 +600,7 @@ def task_context(
                 "value": f["value_key"],
                 "text": f["fact_text"],
                 "agent": f["attributed_to"],
-                **json.loads(f["attributes_json"]),
+                **{key: f[key] for key in FACT_SCOPE},
             }
             for f in facts[:limit]
         ],
@@ -610,20 +614,18 @@ def event_provenance(config, event_id: str, *, limit: int = 5) -> dict:
     """Bounded evidence for a recall hit, including independent confirmations."""
     with open_connection(config) as connection:
         rows = connection.execute(
-            """SELECT * FROM event_observations WHERE event_id=?
-            AND COALESCE(json_extract(payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+            """SELECT * FROM event_observations WHERE event_id=? AND visibility != 'raw_only'
             ORDER BY seq DESC LIMIT ?""",
             (event_id, limit),
         ).fetchall()
         facts = connection.execute(
-            """SELECT id,slot_key,value_key,status,attributes_json FROM facts
-            WHERE json_extract(attributes_json,'$.event_id')=? ORDER BY recorded_at_utc DESC LIMIT ?""",
+            """SELECT id,slot_key,value_key,status,kind FROM facts
+            WHERE event_id=? ORDER BY recorded_at_utc DESC LIMIT ?""",
             (event_id, limit),
         ).fetchall()
         # Over every visible observation, not only the ones listed: what stands
         # behind the event (agents under their canonical names, archived files).
-        visible = """COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
-            AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'"""
+        visible = "o.visibility != 'raw_only' AND e.visibility != 'raw_only'"
         actors = [row[0] for row in connection.execute(
             "SELECT DISTINCT o.actor FROM event_observations o JOIN events e ON e.id = o.event_id "
             "WHERE o.event_id=? AND " + visible,
@@ -661,7 +663,7 @@ def event_provenance(config, event_id: str, *, limit: int = 5) -> dict:
                 "slot": f["slot_key"],
                 "value": f["value_key"],
                 "status": f["status"],
-                "kind": json.loads(f["attributes_json"])["kind"],
+                "kind": f["kind"],
             }
             for f in facts
         ],

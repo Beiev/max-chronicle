@@ -16,9 +16,9 @@ The core storage model:
 
 Current operational database version:
 
-- `PRAGMA user_version = 15`
-- latest applied migration: `0015_one_active_fact.sql`
-- next migration number: `0016`
+- `PRAGMA user_version = 16`
+- latest applied migration: `0016_schema_v2_columns.sql`
+- next migration number: `0017`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
@@ -27,6 +27,7 @@ Migration `0011` rebuilds `events_fts` (event text and why only; no longer the p
 Migration `0012` replaces `event_embeddings` with `event_vectors`, keyed by (event, embedding model key), so the index of a new model is backfilled beside the old one; existing vectors keep their model name as key.
 Migration `0013` adds the note index (FR-10): `documents`, `document_chunks`, `document_chunks_fts` and `chunk_vectors`; `0014` adds `documents.index_version`.
 Migration `0015` adds a unique index that holds each fact slot to one active value (W8); a database that already held several keeps the newest and retires the rest, with a transaction and a mutation log entry.
+Migration `0016` names columns after what they hold. In `events`, `title` becomes `project`, `circumstances` `domain` and `imported_from` `written_by`; `task_id` and `visibility` (`default` or `raw_only`, the quarantine) become columns. `event_observations` gets `visibility`. `facts` gets `project`, `task_id`, `kind`, `event_id` and `observation_id`, and drops `relation` (it repeated `slot_key`), `confidence`, `reference_time_utc` and `group_id`; `facts_fts` indexes `slot_key`. The unused `v_chronicle_timeline` view goes. A pre-hook refuses a database whose dropped columns hold anything the others cannot give back. `payload_json.memory_guard` and `attributes_json` are still written, so `chronicle migrate --revert 16` (`migrations/down/0016_schema_v2_columns.sql`) returns to schema 15 without losing what was written since (a NULL `group_id` comes back as `[null,null]`, the same scope to every v15 reader).
 
 ## Core Tables
 
@@ -217,7 +218,7 @@ slot belongs to domain/project/task scope. Replacements require the current ID;
 the old row is retired before its replacement is inserted, and linked to it; a
 unique index (0015) allows one active value per slot, a missing project or task
 counting as one scope. `current_facts` is a view,
-not a separately rewritten truth store. `attributes_json.kind` distinguishes
+not a separately rewritten truth store. `facts.kind` distinguishes
 observations, decisions, and assumptions.
 
 Events, observations, fact mutations, and artifact links share one transaction.
