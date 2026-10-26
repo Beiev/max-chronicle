@@ -40,3 +40,24 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/chronicle-wheel/bin/chronicle" init --root "$RUNNER_TEMP/memory"
           "$RUNNER_TEMP/chronicle-wheel/bin/chronicle" --help
+      - name: Round trip through the installed wheel
+        # Record, recall, then serve: the installed package (not the checkout)
+        # answers /health, the brief and the web view over HTTP.
+        env:
+          CHRONICLE_FEATURE_EVENT_EMBEDDINGS: "0"
+        run: |
+          bin="$RUNNER_TEMP/chronicle-wheel/bin"
+          export CHRONICLE_ROOT="$RUNNER_TEMP/memory"
+          cd "$RUNNER_TEMP"
+          "$bin/chronicle" record "Smoke test decision" --project demo --task-id smoke \
+            --agent ci --category decision --why "wheel check" > /dev/null
+          "$bin/chronicle" query-memory "smoke test" --project demo --format json \
+            | "$bin/python" -c "import json, sys; assert json.load(sys.stdin)['results'], 'recall found nothing'"
+          MCP_HOST=127.0.0.1 MCP_PORT=18093 "$bin/chronicle-mcp" --transport streamable-http --migrate \
+            > "$RUNNER_TEMP/server.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; cat "$RUNNER_TEMP/server.log"' EXIT
+          for _ in $(seq 1 60); do curl -fsS -m 2 http://127.0.0.1:18093/health > /dev/null 2>&1 && break; sleep 1; done
+          curl -fsS -m 5 http://127.0.0.1:18093/health
+          curl -fsS -m 5 "http://127.0.0.1:18093/brief?project=demo" | grep -q "Smoke test decision"
+          curl -fsS -m 10 http://127.0.0.1:18093/ui | grep -q "Smoke test decision"

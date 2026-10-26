@@ -31,462 +31,60 @@ Keep the workspace separate from the source checkout. Initialization creates
 neutral configuration and starter documents, with no personal data or invented
 projects. See [installation](INSTALL.md).
 
-## Agent protocol
+## How agents use it
 
-Use the same `project` and `task_id` across agents. Domains are broad configured
-areas; they are not a substitute for project/task identity.
+Agents talk to Chronicle over MCP (or the CLI). The default profile has six tools:
 
-1. **Start:** call `startup_bundle(project=..., task_id=...)` before continuing a
-   task. It returns the project's brief and, for a task, its checkpoint, current
-   facts and changes. Writes do not depend on it: a write by an agent that has not
-   read the project recently is stored with a `notice` and a hint to read first.
-2. **Recall:** call `query_memory(query=..., project=..., task_id=...)`. Each hit is
-   one short line (`event:<id>` or `note:<id>`, when, project, task, agent, a gist,
-   how it matched); `get_memory(ids=[...])` returns the full records, evidence and
-   provenance of the ones you pick (`detail="full"` returns them all). Results
-   without a confident match are leads to verify; a weak or empty result does not
-   prove the memory is absent.
-3. **Record:** use `record_event` for significant decisions, actions, and findings.
-   Supply `why` and `source_files` where available. Reuse `request_id` unchanged
-   if delivery is uncertain; a changed request requires a new ID. Likely secrets
-   (API keys, tokens, passwords) are redacted before anything is stored, in the
-   event and in archived evidence files; the receipt's `redactions` counts them.
-4. **Hand off:** attach a `checkpoint` to `record_event` before a context switch.
-   Record what was actually verified and what remains unknown.
-5. **Resume:** the next agent reads `task_context.checkpoint`, `current_facts`, and
-   `changes`. Save `task_context.cursor`; pass it as `since` on the next startup.
-   If `has_more` is true, continue paging with the returned cursor. For older
-   changes, pass `task_context.before` as `before` while `has_older` is true.
-   Only a named task has a checkpoint; a startup without `task_id` lists
-   `open_tasks` instead (the latest checkpoint of each task in scope whose
-   `task.status` fact is not `completed` or `cancelled`), so pick one and start again
-   with its `project` and `task_id`.
-
-Task startup includes current facts from the project and the selected task.
-Their scope stays explicit; another task's facts are excluded. If `facts_has_more`
-is true, increase `limit` (up to 100) or use scoped recall to find a specific slot.
-
-### Example handoff
-
-MCP `record_event` arguments:
-
-```json
-{
-  "text": "Offline recall implemented; vector evaluation remains",
-  "why": "The next agent can continue from the verified lexical path",
-  "project": "demo",
-  "task_id": "ship",
-  "request_id": "demo-ship-checkpoint-1",
-  "checkpoint": {
-    "goal": "Ship reliable recall",
-    "completed": ["Implemented lexical search"],
-    "verification": ["Offline search test passed"],
-    "open_questions": ["Which vector threshold works for this corpus?"],
-    "next_steps": ["Evaluate vector precision on representative queries"]
-  }
-}
-```
-
-MCP assigns a session identity automatically. Independent confirmations preserve
-both authors and attachments even when the underlying event text is deduplicated.
-`chronicle_status` acknowledges the event; `observation_id` identifies this
-observation. `evidence` reports each attachment as archived, pointer-only, missing,
-or skipped. A pointer is not an archived copy.
-
-### Current knowledge and corrections
-
-Supply an explicit `fact` object on `record_event`:
-
-```json
-{"slot": "project.status", "value": "active", "kind": "observed"}
-```
-
-The receipt includes `fact_id`. To change that scoped slot, include its current
-ID in the next assertion:
-
-```json
-{"slot": "project.status", "value": "paused", "kind": "decision", "supersedes": "<current-fact-id>"}
-```
-
-Chronicle retains the old assertion and its evidence. Stale replacements fail
-with an actionable error. Current recall excludes superseded assertions; historical
-queries retain the event trail. Unstructured prose is never automatically promoted
-into a fact, and assumptions are not silently converted into verified knowledge.
-
-## MCP integration
-
-Start `chronicle-mcp-chronicler` as a direct child process of the client. A typical
-MCP configuration uses an absolute installed command and workspace path:
-
-```json
-{
-  "mcpServers": {
-    "chronicle": {
-      "command": "/absolute/path/to/.venv/bin/chronicle-mcp-chronicler",
-      "env": {"CHRONICLE_ROOT": "/absolute/path/to/chronicle-workspace"}
-    }
-  }
-}
-```
-
-Use your client's equivalent configuration format. Stdio starts with the client
-and does not require a separately running HTTP service. For supervised HTTP, use
-`chronicle-mcp --transport streamable-http --migrate`; `MCP_HOST`/`MCP_PORT` set its address.
-`GET /health` checks service and database availability and names the database,
-manifest, schema version and installed code path that answered; `sources_audit` and
-startup source health describe freshness. These are different checks.
-One HTTP endpoint serves both MCP protocol eras (MCP Python SDK 2). A client
-on `2026-07-28` sends each request on its own, with no session, so a server
-restart does not interrupt it; an older client gets the `initialize` handshake
-and a session, which a restart ends (the client starts a new one) and which
-closes after 30 minutes without traffic.
-Over HTTP, `/health` also reports the process: event-loop lag (`loop`), the write
-queue (`writes`), the last committed write and the background embedder.
-`GET /health/live` answers from the event loop alone, without the database: a slow
-disk makes `/health` degraded (503), only a stuck loop silences `/health/live`.
-When the loop stops for 10 s the server writes every thread's stack to its log by
-itself, and `SIGUSR1` (advertised as `stack_dump_signal`) does the same on demand,
-so a supervisor can record a hang before it restarts the process.
-
-An HTTP server writes events without waiting for their vectors: a background
-thread embeds them after the commit, keeps the model loaded
-(`CHRONICLE_EMBED_KEEP_ALIVE`, default `30m`) and backs off while Ollama is down.
-The model's context is capped at `CHRONICLE_EMBED_NUM_CTX` (default 8192 tokens),
-which for `qwen3-embedding` halves its memory and leaves shorter texts' vectors unchanged.
-
-### Session brief
-
-`GET /brief` returns a compact read-only brief (FR-12) that a new session reads
-first:
-- open tasks with their latest checkpoint;
-- current facts;
-- decisions from the last 14 days, each with its id;
-- freshness and failed-job warnings;
-- a three-line protocol.
-
-It opens by saying it is data, not instructions. The brief reads through a
-`query_only` connection and answers in milliseconds. It refuses any request that
-carries an `Origin` header or a `Host` outside loopback, so a web page cannot
-read it. Parameters:
-- `cwd`: the working directory;
-- `project`: a project slug that overrides `cwd`;
-- `budget`: 1,000 to 8,000 characters, 6,000 by default;
-- `format=json`: return JSON instead of plain text.
-
-The project comes from `project`, from a configured root that holds `cwd`, or
-from the name of `cwd` itself when that name is a known project. Parent
-directories are not searched, so pass a repository's top level:
-
-```toml
-# SSOT_MANIFEST.toml
-[[projects]]
-id = "atlas"
-roots = ["~/code/atlas", "~/code/atlas-worktrees"]
-```
-
-A session-start hook prints the brief and stays silent when the server is down:
-
-```sh
-dir=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-curl -fsS -m 2 --get --data-urlencode "cwd=$dir" http://127.0.0.1:8093/brief 2>/dev/null || true
-```
-
-Claude Code and Codex add a SessionStart hook's plain standard output to the
-session context; Claude Code keeps up to 10,000 characters, above the brief's
-maximum. Without HTTP, `chronicle brief --cwd DIR` prints the same text. An MCP client
-calls `startup_bundle(project=...)`, whose default mode is this brief, or reads the
-resource `chronicle://brief/{project}`. A project's brief shows its own decisions
-only, and its own facts before at most four facts recorded without a project.
-
-### Web view
-
-The HTTP server also serves a read-only view of the memory for people, at
-`http://127.0.0.1:8093/ui`:
-- `/ui`: process health (event-loop lag, last write, unindexed events, last
-  scheduled runs), the last good backup, warnings, open tasks, projects active in
-  the last 30 days, the latest events;
-- `/ui/project/{project}`: its open tasks, current facts and latest events;
-- `/ui/task/{project}/{task_id}`: the latest checkpoint, earlier ones, the task's
-  facts and events;
-- `/ui/facts`: every current fact; `/ui/facts?slot=X`: every value that slot had,
-  newest first, with what replaced it;
-- `/ui/search?q=...&project=...`: recall, with how each hit matched;
-- `/ui/event/{id}`, `/ui/note/{id}`: one record with its evidence and who recorded it.
-
-Pages are rendered on the server with no script. Everything shown is escaped
-text, and a Content-Security-Policy forbids scripts, frames and outside
-requests. Only this machine is answered: the `Host` must be a loopback name, an
-`Origin` must be the server's own, and a cross-site `Sec-Fetch-Site` is refused.
-Quarantined events never appear.
-
-### One name per project, domain and agent
-
-One project often gets written several ways (`status`, `chronicle`,
-`max-chronicle`), and so do tasks (`Launch_plan`, `launch_plan`) and agents
-(`Codex`, `codex-mcp-client`). Names match whatever their case, spaces and
-underscores, and the manifest lists the other spellings of a project, domain
-or agent:
-
-```toml
-[[projects]]
-id = "atlas"
-roots = ["~/code/atlas"]
-aliases = ["atlas-app", "old-atlas"]
-
-[[domains]]
-id = "memory"
-aliases = ["mem"]  # next to the domain's label and source_ids
-
-[[agents]]
-id = "claude"
-aliases = ["assistant"]  # exact spellings
-prefixes = ["claude"]    # claude-mac, claude-code, ...
-```
-
-A filter by any spelling finds what was written under every one of them
-(FR-14): recall, task context, open tasks, current facts, the brief and
-cursors. History is not rewritten: a write stores the canonical name and keeps
-the given one as `actor_raw`, `project_raw` or `domain_raw`. The common agents
-(claude, codex, glm, deepseek, gemini, opencode, transcript-analyst) are
-built in; an `[[agents]]` entry with the same id replaces a built-in one. A
-session that never names its agent is attributed to its MCP client, such as
-`claude-code`.
-
-### Notes written on purpose
-
-Agents often keep durable notes as files, such as Claude's file memory. With a
-`[notes]` section in the manifest, Chronicle indexes them so every agent can
-recall them (FR-10):
-
-```toml
-[notes]
-paths = ["~/.claude/projects/*/memory/*.md"]  # absolute, or from ~
-exclude = ["*.bak-*", "*/_archive/*"]
-deny = ["*api-key*", "*keys.md"]  # never read, whatever they hold
-sync_minutes = 15                  # the long-running server re-syncs this often
-```
-
-`chronicle notes sync` re-indexes the changed notes, keeps a tombstone for a
-deleted one, and never writes to a note; the server runs the same sync every
-`sync_minutes`.
-
-- **Secrets.** The secret filter runs on each section of a note (text under one
-  heading) as a whole, before a long section is cut into pieces: a key is never
-  cut in two, and a pattern never spans two sections. Every other stored string
-  is filtered too. Built-in name patterns such as `*secret*`, `*credential*`,
-  `*private-key*`, `id_rsa*` and `*.pem` apply on top of `deny`. When the parser
-  or the filter changes, every note is indexed again.
-- **Files not read.** A file reached through a symbolic link below the fixed
-  part of a pattern, a file whose path holds a likely secret, and a file that is
-  not UTF-8 text are reported, not read. `**` never descends through a link,
-  and wildcards skip hidden files and folders.
-- **Removal.** A deleted or newly denied note keeps only its path as a
-  tombstone. The sync compacts the full-text index, deletes with
-  `secure_delete`, and empties the write-ahead log when no reader holds it;
-  until then the log may keep an older copy.
-- **Projects.** A note inside a project root, or in the file memory of a
-  directory inside that root, belongs to that project. In the file memory of a
-  directory under the workspace, it belongs to that workspace child's project.
-  A note whose frontmatter names a project (`project: atlas`, any registered
-  spelling) belongs to that project wherever it lies. Any other note is global.
-
-`query_memory` returns notes in `notes`, next to events in `results`: the best
-section of each note, with its heading, path and id. In a project scope, the
-project's own notes come before global ones. `chronicle://note/{document_id}`
-serves a whole note; `chronicle notes status` counts what the index holds.
-
-The default (`chronicler`) profile serves the six tools agents use:
-
-| Tool | Purpose |
+| Tool | What it is for |
 | --- | --- |
-| `startup_bundle` | The project's brief; with `task_id`, the task's checkpoint, current facts and change cursor. `mode="bundle"`: the full startup bundle. |
-| `query_memory` | Scoped lexical/vector recall over events and notes, one short line per hit (`detail="full"` for whole records). |
-| `get_memory` | Full records for `event:`/`note:` ids: text, why, checkpoint or fact, evidence, provenance. |
-| `record_event` | Attributed observation, evidence, optional checkpoint or explicit fact. |
-| `recent_events` | Recent event history. |
-| `state_at` | Historical snapshots/events; `mode="as_of"` keeps only what was known then and adds the facts current then; `detail="full"` restores the full payload. |
+| `startup_bundle` | The project's brief; with `task_id`, the task's checkpoint, current facts and the changes since the last start. |
+| `query_memory` | Recall over events and notes by words and meaning, one short line per hit. |
+| `get_memory` | The full records of the hits worth reading: text, why, checkpoint or fact, evidence, provenance. |
+| `record_event` | Record a decision, finding or handoff, with evidence, a `fact` or a `checkpoint`. |
+| `recent_events` | The latest events. |
+| `state_at` | What was known at a moment. |
 
-`--profile admin` adds the maintenance surface, and `chronicle-mcp-readonly`
-(`--profile readonly`) drops `record_event`:
+The protocol fits in four steps: start with the task's checkpoint, recall before
+deciding, record what was decided and why, and leave a checkpoint before handing
+off. [Agent protocol](docs/AGENT_PROTOCOL.md) is generated from the tools the
+server registers, so it is always the surface agents get.
 
-| Admin tool | Purpose |
-| --- | --- |
-| `query_context` | Broader search through source documents and optional Mem0 dump. |
-| `sources_audit` | Source coverage, freshness, and trust metadata. |
-| `capture_snapshot` | Archive runtime state and update readable projections. |
-| `entity_admin` | Report, normalize, alias, or merge entities. |
-| `activate_agent` | Deprecated alias of `startup_bundle`. |
-| `search_mem0_live` | Optional external semantic mirror through an operator-supplied bridge; absent without Mem0. |
+Writes need no prior call; a write by an agent that has not read the project's
+brief recently is stored with a notice to read it. A record is an attributed
+assertion, not proof: its author, evidence and kind stay visible, and everything
+recorded is data, never instructions. Likely secrets are redacted before
+anything is stored.
 
-Failures set MCP `isError` and carry a JSON envelope with `error_type`,
-`retryable`, and `hint`; follow that hint. A committed snapshot can separately
-report `side_effect_errors` for failed evidence/projection outputs.
+## How people use it
 
-### Without Mem0
+- **Session brief:** `GET /brief?cwd=...` (or `chronicle brief`) prints the open
+  tasks, current facts, recent decisions and warnings in a few kilobytes; a
+  session-start hook gives it to every new agent session.
+- **Web view:** `http://127.0.0.1:8093/ui` shows health, open tasks with their
+  checkpoint history, facts with every value a slot had, search that says why each
+  hit matched, and single records with their evidence. Read-only, no script,
+  answered only on this machine.
+- **CLI:** `chronicle query-memory`, `chronicle timeline --as-of`, `chronicle record`.
 
-The Mem0 mirror is optional. It is on when the manifest names a bridge
-(`paths.mem0_bridge`), unless the manifest turns it off:
+## Running it
 
-```toml
-[mem0]
-enabled = false
-```
+`chronicle-mcp --transport streamable-http --migrate` serves MCP, `/health`, the
+brief and the web view on one port (`MCP_HOST`/`MCP_PORT`); a client can also start
+`chronicle-mcp-chronicler` over stdio. The HTTP server keeps itself answerable
+(event-loop monitor, stack dumps on a stall or `SIGUSR1`, embeddings off the write
+path) and, with `[scheduler] enabled = true`, runs daily capture, daybook, weekly
+audit and backups itself. Details: [Operations](docs/OPERATIONS.md).
 
-Off, new events are not queued for Mem0, the daily capture syncs nothing, the
-`mem0-dump` job ends as `skipped` without calling the bridge, `query_context` and
-snapshots read no Mem0 dump, `search_mem0_live` is not offered, the MCP
-instructions do not mention Mem0, and audits report no Mem0 backlog or stale dump.
-`chronicle launchd install` and `chronicle launchd doctor` leave the `mem0-dump` job out. Rows
-queued before stay as they are. To keep what Mem0 held, export it as notes the
-index reads (FR-10).
+## Documentation
 
-## Recall and durability
-
-- **Lexical:** SQLite FTS5/BM25 over event text and why, and over explicit
-  current fact values. Queries drop function words (English, Russian,
-  Ukrainian) but keep negations, keep every Unicode letter, and fold ё into е on
-  both sides. Evidence must contain every remaining term; when no event or fact
-  does, recall retries with word stems, keeps only events holding two thirds of
-  the terms, and returns `relaxed: true` because that match is weaker.
-- **Vector:** optional local index built through Ollama. The default model is
-  `qwen3-embedding:0.6b` (multilingual; `ollama pull qwen3-embedding:0.6b`).
-  `CHRONICLE_EMBED_MODEL` selects another; `nomic-embed-text` keeps an index
-  built before 0.12 usable. Every vector is stored under its model, so a new
-  model is backfilled beside the old index and recall reads only the active one.
-  Queries carry the model's retrieval instruction, and an event longer than the
-  model's context is embedded from its start instead of failing. Scope and
-  visibility are checked before ranking. `vector_coverage` discloses gaps, and
-  an active model with no index at all degrades the channel
-  (`embedding_index_empty`). `chronicle embed-backfill` fills the active index.
-  If native scheduling is enabled, daily capture also retries up to 10 missing
-  or incompatible embeddings per run. Disabling event embeddings disables this repair.
-- **Recency:** breaks ties between equally relevant candidates; it never supplies
-  or promotes unrelated answers.
-- **Confidence:** `no_confident_match: true`, with a `hint`, when no result holds
-  every query term or reaches the model's confident similarity (`0.6` for
-  `qwen3-embedding:0.6b`; none for `nomic-embed-text`, whose similarity does not
-  tell related from unrelated text). The results are still returned as leads.
-  `CHRONICLE_VECTOR_CONFIDENT_SIMILARITY` overrides the floor.
-- **Threshold:** a candidate found only by the vector channel needs a cosine
-  similarity of at least the model's floor: `0.5` for Qwen3, `0.65` for
-  `nomic-embed-text`. `CHRONICLE_VECTOR_MIN_SIMILARITY` overrides it. Evaluate
-  it on your own corpus with `chronicle eval`; cosine and reciprocal-rank scores
-  are not confidence values.
-- **Writes:** SQLite WAL with full commit synchronization; events, observations,
-  facts, and evidence links commit together.
-- **Schema changes:** an empty database initialises on first use. An existing one is
-  never upgraded as a side effect of connecting: run `chronicle migrate` or start the
-  server with `chronicle-mcp --migrate`; both take an online backup
-  (`chronicle.db.bak-premigrate-…`) under the same write lock as the upgrade. Without
-  `--migrate` a server refuses to start on an outdated schema (exit code 3), and a
-  read-only server never creates or changes a database. A database newer than the installed code, or
-  another application's SQLite file, is refused. After installing a release with new
-  migrations, migrate before scheduled jobs run: until then they exit with code 3.
-  `CHRONICLE_AUTO_MIGRATE=1` restores upgrade-on-connect for the CLI and library;
-  a server upgrades only with `--migrate`. `CHRONICLE_REQUIRE_ROOT=1`
-  makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
-  instead of falling back to `~/.max-chronicle`.
-- **Read-only servers:** SQLite reads a WAL database through its `-wal` and `-shm`
-  files, so even a read-only server creates them when they are missing. Next to a
-  live writer they already exist. To serve a copy from a read-only directory,
-  switch the copy to `PRAGMA journal_mode = DELETE` first.
-- **Secrets:** a content-based filter replaces likely credentials with
-  `[REDACTED:<kind>]` before an event (with its checkpoint and fact), a UTF-8
-  evidence file, or a generated text artifact (daybook, commit summary, audit
-  report) is stored. It catches known key prefixes, values assigned to secret
-  names, labelled keys (`key: <random>`), bearer and basic credentials, URL
-  passwords, private keys, and high-entropy tokens near a word such as
-  token, password, secret, or API key (anywhere on a short line, within 256
-  characters on a long one). Hex digests, UUIDs, and pieces of long base64 runs
-  (encoded images) never count as high-entropy tokens.
-  Private keys are found by their BEGIN or END line (in any case, spacing or
-  escaping) or by their own bytes: PKCS#1, PKCS#8, SEC1, encrypted PKCS#8 and
-  PKCS#12 bodies, OpenSSH and OpenPGP secret keys, a PEM encoded again in base64
-  (Kubernetes secrets, cloud key downloads), X25519, Ed448 and X448 keys,
-  PuTTY key files, JWK private members (in any order, quoting or escaping),
-  .NET XML RSA keys, and `openssl ... -text` dumps. From that line on, the
-  markers go, colon-separated hex dumps go, every line that continues a key
-  goes (however its line breaks are escaped), and so does every run of 16 or
-  more base64 characters that reads as random bytes; words, paths, links,
-  assignments, hex digests, UUIDs and image data stay, and so does everything
-  before the key. A key body cut into pieces shorter than 16 characters and
-  interrupted by other text is not recognised, and a random-looking
-  identifier after a key (an SSH fingerprint, a random URL id) may be
-  removed with it.
-  Identifiers such as `request_id` and paths are left as given, the source file is
-  never modified, and binary evidence is archived unchanged. `query_context`
-  filters what it reads from status files and the Mem0 dump, and
-  `search_mem0_live` what Mem0 returns. Not filtered yet: snapshot excerpts and
-  legacy imports. Time is linear in the
-  input, so a hostile or huge text cannot stall the write path.
-- **Backups:** independent artifact copies, content-hash inventory, database
-  integrity checks, and verification after relocation. Legacy backups disclose
-  incomplete inventory coverage. Choose a separate backup device for disk failure.
-  Explicitly purged artifacts are counted separately; they are not claimed as restorable.
-  Retention keeps the newest backup of each of the last 14 days, 8 weeks and 12
-  months that have one (`[backup_retention]` in the automation config:
-  `daily`, `weekly`, `monthly`). Each backup reports what the policy would remove;
-  removal happens only with `prune = true` or `chronicle backup-prune --apply`.
-  A backup the disk prevented (not mounted, full, read-only) is `deferred` and
-  retried the same day.
-- **Scheduled jobs:** with `[scheduler] enabled = true` in the automation config,
-  the HTTP server runs daily capture, daybook, weekly audit and backup itself,
-  each as its own process, one at a time, and `chronicle launchd install` installs
-  no job agents (launchd keeps only the server); job agents an earlier install left
-  are unloaded (with `--load`) and moved to `retired-job-agents/` in the launchd
-  runtime directory. A job's due moment is computed in
-  the installation's timezone, and its run is keyed by that moment (its date, or
-  for the weekly audit its ISO week): a run delayed past midnight fills the day it
-  was due, never the next. A failed run is retried after 30 minutes, up to six
-  times; a deferred one (the backup disk not mounted) every 30 minutes until it
-  runs; one still marked running after six hours is started again;
-  one due more than three days ago is skipped. `/health` shows
-  the last runs under `scheduler`. `chronicle automation run --job X --occurrence
-  ISO` runs a job as the occurrence it names.
-
-### Measuring recall
-
-`chronicle eval --golden questions.jsonl` asks each question through recall and
-scores the ranking: hit@1/5/10, recall@5 and MRR@10 on answerable questions,
-abstention on questions memory cannot answer, stale-over-current ordering on
-knowledge updates, and latency percentiles, overall and per category and language.
-
-```json
-{"id": "why-sqlite", "query": "why did we pick SQLite", "category": "rationale", "lang": "en", "expected": ["event:<id>"], "scope": {"project": "demo"}}
-{"id": "db-now", "query": "current database", "category": "knowledge_update", "expected": ["event:<new>"], "stale": ["event:<old>"]}
-{"id": "unknown", "query": "office wifi password", "category": "abstention", "expected": []}
-{"id": "backup-rotation", "query": "how often do backups rotate", "category": "fact", "expected": ["note:~/notes/backups.md"]}
-```
-
-A case expects events (`event:<id>`) or indexed notes (`note:<path>`), never both.
-Note cases are scored on the `notes` of the answer and ask recall for notes;
-event cases leave notes out, so their scores stay comparable across versions.
-The report adds a breakdown per surface.
-
-Categories follow LongMemEval: `fact`, `rationale`, `knowledge_update`, `temporal`,
-`handoff`, `abstention`. `--json` prints the full report, `--out` saves it, and
-`--fail-under hit@5=0.6` exits 1 below a floor. The test suite runs a synthetic
-bilingual set (`tests/fixtures/eval/`) and pins which cases lexical recall passes.
-
-## CLI
-
-```bash
-chronicle record "Selected local storage" --project demo --task-id ship \
-  --agent agent-a --request-id decision-1 --category decision --why "Works offline"
-chronicle record "Ready for review" --project demo --task-id ship \
-  --checkpoint-file checkpoint.json --request-id handoff-1
-chronicle startup --project demo --task-id ship --focus "Continue review" --format json
-chronicle query-memory "local storage" --project demo --task-id ship --format json
-chronicle eval --golden questions.jsonl --out results/baseline.json
-chronicle timeline --at "2026-09-15T12:00:00Z"
-chronicle timeline --at "2026-09-15T12:00:00Z" --as-of   # what was known then
-chronicle backup --force
-chronicle backup-prune            # what retention would remove; --apply removes it
-```
-
-`--fact-file` accepts the assertion JSON above. Startup defaults to compact source
-metadata; `--full` includes full source content. Run `chronicle --help` for optional
-automation and maintenance commands.
+- [Concepts](docs/CONCEPTS.md): events, observations, facts, checkpoints, tasks,
+  notes, scope and names, with a handoff example.
+- [Agent protocol](docs/AGENT_PROTOCOL.md): the tools and how to use them.
+- [Operations](docs/OPERATIONS.md): server, brief, web view, notes, durability,
+  scheduled jobs, backups, CLI.
+- [Recall](docs/RECALL.md): ranking, confidence, the secret filter, measuring recall.
+- [Installation](INSTALL.md) · [Agent development guide](AGENTS.md) ·
+  [Schema](max_chronicle/docs/SCHEMA_V1.md) · [Requirements](max_chronicle/docs/ROADMAP-ULTIMATE-MEMORY.md)
 
 ## Architecture and development
 
@@ -502,9 +100,6 @@ Agents / CLI / MCP
         |--- Markdown projections
         |--- optional Mem0 mirror
 ```
-
-[Agent development guide](AGENTS.md) · [Schema](max_chronicle/docs/SCHEMA_V1.md) ·
-[Requirements](max_chronicle/docs/ROADMAP-ULTIMATE-MEMORY.md)
 
 ```bash
 pip install -e '.[dev]'
