@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 from max_chronicle.mcp_server import _gate_session, build_server
 from max_chronicle.runtime_context import load_manifest, search_mem0_dump
 from max_chronicle.service import (
@@ -76,6 +76,7 @@ def _assert_startup_required(error: BaseException, tool_name: str, *, domain: st
 
 
 def _decode_mcp_json(result: Any) -> Any:
+    result = getattr(result, "content", result)  # SDK 2: a CallToolResult
     if isinstance(result, tuple):
         return _decode_mcp_json(result[0])
     if isinstance(result, list) and result and hasattr(result[0], "text"):
@@ -269,43 +270,42 @@ def test_build_startup_bundle_uses_service_contract(loaded_manifest) -> None:
 
 
 def test_mcp_readonly_profile_exposes_only_read_surface() -> None:
-    async def collect() -> tuple[list[str], list[str]]:
-        server = build_server(profile="readonly")
+    async def collect(profile: str) -> tuple[list[str], list[str]]:
+        server = build_server(profile=profile)
         tools = await server.list_tools()
         resources = await server.list_resources()
         return [item.name for item in tools], [str(item.uri) for item in resources]
 
-    tools, resources = asyncio.run(collect())
+    tools, resources = asyncio.run(collect("readonly"))
+    _, admin_resources = asyncio.run(collect("admin"))
 
-    assert tools == [
-        "startup_bundle",
-        "recent_events",
-        "state_at",
-        "query_context",
-        "query_memory",
-        "sources_audit",
-    ]
-    assert "chronicle://attach/current" in resources
-    assert "chronicle://sources/audit" in resources
+    assert tools == ["startup_bundle", "recent_events", "state_at", "query_memory", "get_memory"]
+    # The legacy attach/state/audit documents are an operator's, not an agent's.
+    assert "chronicle://attach/current" not in resources
+    assert "chronicle://attach/current" in admin_resources
+    assert "chronicle://sources/audit" in admin_resources
 
 
 def test_mcp_chronicler_profile_exposes_write_surface() -> None:
-    async def collect() -> list[str]:
-        server = build_server(profile="chronicler")
+    async def collect(profile: str) -> list[str]:
+        server = build_server(profile=profile)
         tools = await server.list_tools()
         return [item.name for item in tools]
 
-    tools = asyncio.run(collect())
+    tools = asyncio.run(collect("chronicler"))
+    admin_tools = asyncio.run(collect("admin"))
 
     assert "record_event" in tools
-    assert "capture_snapshot" in tools
-    assert "entity_admin" in tools
+    # Maintenance lives in the admin profile: agents never called it (client logs, 2026-10).
+    for name in ("capture_snapshot", "entity_admin", "query_context", "sources_audit", "activate_agent"):
+        assert name not in tools and name in admin_tools
     # Consolidated away in the 15->10 tool-surface simplification:
-    assert "normalize_entities" not in tools
-    assert "render_projections" not in tools
-    assert "add_entity_alias" not in tools
-    assert "merge_entities" not in tools
-    assert "entity_resolution_report" not in tools
+    for tool_list in (tools, admin_tools):
+        assert "normalize_entities" not in tool_list
+        assert "render_projections" not in tool_list
+        assert "add_entity_alias" not in tool_list
+        assert "merge_entities" not in tool_list
+        assert "entity_resolution_report" not in tool_list
 
 
 def test_mcp_chronicler_mutating_tool_descriptions_include_startup_guidance(chronicle_sandbox) -> None:
@@ -316,29 +316,32 @@ def test_mcp_chronicler_mutating_tool_descriptions_include_startup_guidance(chro
 
     descriptions = asyncio.run(collect())
 
-    for tool_name in (
-        "record_event",
-        "capture_snapshot",
-        "entity_admin",
-    ):
-        assert "startup_bundle" in descriptions[tool_name]
-        assert "activate_agent" in descriptions[tool_name]
+    # A write needs no prior call; continuing a task means reading its checkpoint first.
+    assert "No prior call is required" in descriptions["record_event"]
+    assert "startup_bundle(project, task_id)" in descriptions["record_event"]
+    assert "activate_agent" not in descriptions["record_event"]
 
 
 def test_mcp_tool_input_schemas_include_param_descriptions_and_query_mode_enum(chronicle_sandbox) -> None:
     async def collect() -> dict[str, dict[str, Any]]:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
         tools = await server.list_tools()
-        return {item.name: item.inputSchema for item in tools}
+        return {item.name: item.input_schema for item in tools}
 
     schemas = asyncio.run(collect())
+
+    async def collect_admin() -> dict[str, dict[str, Any]]:
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
+        return {item.name: item.input_schema for item in await server.list_tools()}
+
+    admin_schemas = asyncio.run(collect_admin())
 
     startup_props = schemas["startup_bundle"]["properties"]
     assert startup_props["domain"]["description"] == "Chronicle domain id from the manifest."
     assert startup_props["capture"]["description"] == "Capture a fresh runtime snapshot before building the bundle."
     assert startup_props["compact"]["description"] == "Return the compact startup bundle variant."
 
-    query_props = schemas["query_context"]["properties"]
+    query_props = admin_schemas["query_context"]["properties"]
     assert query_props["query"]["description"] == (
         "Search string matched across Chronicle events, status markdown sections and the Mem0 dump."
     )
@@ -368,50 +371,31 @@ def test_startup_gate_session_fails_closed_without_session_context() -> None:
     assert _gate_session(RaisingContext()) is None
 
 
-def test_mcp_chronicler_record_event_requires_startup_until_unlocked(chronicle_sandbox, loaded_manifest) -> None:
-    async def exercise() -> str:
+def test_mcp_chronicler_record_event_needs_no_startup(chronicle_sandbox, loaded_manifest) -> None:
+    """The gate is gone: every reconnect and restart re-locked it (22 refusals in a month)."""
+    async def exercise() -> dict:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
         arguments = {
-            "text": "Blocked MCP write before startup.",
+            "text": "MCP write before any startup.",
             "domain": "global",
             "category": "decision",
             "project": "status",
-            "why": "Gate should redirect before mutating Chronicle.",
+            "why": "Writes no longer wait for a startup call.",
             "agent": "pytest",
             "source_files": [],
         }
+        return _decode_mcp_json(await server.call_tool("record_event", arguments))
 
-        with pytest.raises(ToolError) as first_error:
-            await server.call_tool("record_event", arguments)
-        with pytest.raises(ToolError) as second_error:
-            await server.call_tool("record_event", arguments)
+    stored = asyncio.run(exercise())
 
-        _assert_startup_required(first_error.value, "record_event")
-        _assert_startup_required(second_error.value, "record_event")
-
-        startup = await server.call_tool(
-            "startup_bundle",
-            {
-                "domain": "global",
-                "agent": "pytest",
-                "capture": False,
-                "limit": 2,
-            },
-        )
-        stored = _decode_mcp_json(await server.call_tool("record_event", arguments))
-        startup_payload = _decode_mcp_json(startup)
-        assert startup_payload["domain"]["id"] == "global"
-        return stored["id"]
-
-    stored_id = asyncio.run(exercise())
-
+    assert stored["chronicle_status"] == "stored"
+    assert stored["notice"] == "startup_not_read" and "startup_bundle" in stored["hint"]
     config = config_from_manifest(loaded_manifest)
     with open_connection(config) as connection:
         event_count = connection.execute(
-            "SELECT COUNT(*) FROM events WHERE text = ?",
-            ("Blocked MCP write before startup.",),
-        ).fetchone()[0]
-        outbox_count = connection.execute("SELECT COUNT(*) FROM mem0_outbox WHERE event_id = ?", (stored_id,)).fetchone()[0]
+            "SELECT COUNT(*) FROM events WHERE text = ?", ("MCP write before any startup.",)).fetchone()[0]
+        outbox_count = connection.execute("SELECT COUNT(*) FROM mem0_outbox WHERE event_id = ?",
+                                          (stored["id"],)).fetchone()[0]
         snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
 
     assert event_count == 1
@@ -419,20 +403,14 @@ def test_mcp_chronicler_record_event_requires_startup_until_unlocked(chronicle_s
     assert snapshot_count == 0
 
 
-def test_mcp_chronicler_capture_snapshot_requires_startup_without_side_effects(chronicle_sandbox, loaded_manifest) -> None:
+def test_mcp_capture_snapshot_is_an_admin_tool(chronicle_sandbox, loaded_manifest) -> None:
     async def exercise() -> None:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        with pytest.raises(ToolError) as error:
+        with pytest.raises(ToolError, match="Unknown tool"):
             await server.call_tool(
                 "capture_snapshot",
-                {
-                    "domain": "global",
-                    "agent": "pytest",
-                    "title": "Blocked snapshot",
-                    "focus": "tests",
-                },
+                {"domain": "global", "agent": "pytest", "title": "Not here", "focus": "tests"},
             )
-        _assert_startup_required(error.value, "capture_snapshot")
 
     asyncio.run(exercise())
 
@@ -445,30 +423,25 @@ def test_mcp_chronicler_capture_snapshot_requires_startup_without_side_effects(c
     assert event_count == 0
 
 
-def test_mcp_chronicler_entity_admin_mutations_require_startup_but_report_is_free(
-    chronicle_sandbox, loaded_manifest
-) -> None:
-    async def exercise() -> Any:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        with pytest.raises(ToolError) as blocked:
-            await server.call_tool("entity_admin", {"action": "normalize", "domain": "global"})
-        _assert_startup_required(blocked.value, "entity_admin")
-        # report is read-only QA and must work without the gate
-        report = _decode_mcp_json(await server.call_tool("entity_admin", {"action": "report"}))
-        assert report["action"] == "report"
-        return report
+def test_mcp_entity_admin_lives_in_the_admin_profile(chronicle_sandbox, loaded_manifest) -> None:
+    async def exercise() -> dict:
+        chronicler = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        with pytest.raises(ToolError, match="Unknown tool"):
+            await chronicler.call_tool("entity_admin", {"action": "normalize", "domain": "global"})
+        admin = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
+        report = _decode_mcp_json(await admin.call_tool("entity_admin", {"action": "report"}))
+        normalized = _decode_mcp_json(await admin.call_tool("entity_admin", {"action": "normalize", "domain": "global"}))
+        return {"report": report, "normalized": normalized}
 
-    asyncio.run(exercise())
+    result = asyncio.run(exercise())
 
-    config = config_from_manifest(loaded_manifest)
-    with open_connection(config) as connection:
-        normalized_count = connection.execute("SELECT COUNT(*) FROM normalized_entities").fetchone()[0]
-    assert normalized_count == 0
+    assert result["report"]["action"] == "report"
+    assert result["normalized"]["action"] == "normalize"
 
 
 def test_mcp_chronicler_entity_admin_validates_action_params(chronicle_sandbox) -> None:
     async def exercise() -> tuple[Any, Any]:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         await server.call_tool(
             "startup_bundle",
             {"domain": "global", "agent": "pytest", "capture": False, "limit": 1},
@@ -487,9 +460,9 @@ def test_mcp_chronicler_entity_admin_validates_action_params(chronicle_sandbox) 
     assert "source_entity_id" in merge_missing["hint"]
 
 
-def test_mcp_chronicler_activate_agent_unlocks_mutating_surface(chronicle_sandbox, loaded_manifest) -> None:
+def test_mcp_chronicler_activate_agent_then_writes(chronicle_sandbox, loaded_manifest) -> None:
     async def exercise() -> str:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         activation = await server.call_tool(
             "activate_agent",
             {
@@ -525,63 +498,30 @@ def test_mcp_chronicler_activate_agent_unlocks_mutating_surface(chronicle_sandbo
     assert event_count == 1
 
 
-def test_mcp_chronicler_startup_gate_is_session_scoped(chronicle_sandbox, loaded_manifest) -> None:
-    async def exercise() -> tuple[str, str]:
+def test_mcp_a_fresh_server_accepts_writes_without_startup(chronicle_sandbox, loaded_manifest) -> None:
+    """What the old session-scoped gate refused: a new connection writing straight away."""
+    async def exercise() -> tuple[dict, dict]:
         first_server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        await first_server.call_tool(
-            "startup_bundle",
-            {
-                "domain": "global",
-                "agent": "pytest",
-                "capture": False,
-                "limit": 1,
-            },
-        )
-        stored = await first_server.call_tool(
-            "record_event",
-            {
-                "text": "Session one unlocked write.",
-                "domain": "global",
-                "category": "decision",
-                "project": "status",
-                "why": "Need to confirm session-local unlock behavior.",
-                "agent": "pytest",
-                "source_files": [],
-            },
-        )
-        stored_payload = _decode_mcp_json(stored)
-
+        await first_server.call_tool("startup_bundle", {"agent": "pytest", "project": "status"})
+        first = _decode_mcp_json(await first_server.call_tool("record_event", {
+            "text": "Session one write.", "domain": "global", "category": "decision", "project": "status",
+            "agent": "pytest", "source_files": []}))
         second_server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        with pytest.raises(ToolError) as error:
-            await second_server.call_tool(
-                "record_event",
-                {
-                    "text": "Session two should still be blocked.",
-                    "domain": "global",
-                    "category": "decision",
-                    "project": "status",
-                    "why": "Fresh server instance must not inherit startup unlock state.",
-                    "agent": "pytest",
-                    "source_files": [],
-                },
-            )
-        _assert_startup_required(error.value, "record_event")
-        return stored_payload["id"], "Session two should still be blocked."
+        second = _decode_mcp_json(await second_server.call_tool("record_event", {
+            "text": "Session two write after a reconnect.", "domain": "global", "category": "decision",
+            "project": "status", "agent": "pytest", "source_files": []}))
+        return first, second
 
-    stored_id, blocked_text = asyncio.run(exercise())
+    first, second = asyncio.run(exercise())
 
-    config = config_from_manifest(loaded_manifest)
-    with open_connection(config) as connection:
-        first_count = connection.execute("SELECT COUNT(*) FROM events WHERE id = ?", (stored_id,)).fetchone()[0]
-        blocked_count = connection.execute("SELECT COUNT(*) FROM events WHERE text = ?", (blocked_text,)).fetchone()[0]
-
-    assert first_count == 1
-    assert blocked_count == 0
+    assert first["chronicle_status"] == second["chronicle_status"] == "stored"
+    assert "notice" not in first
+    assert second["notice"] == "startup_not_read"  # a new server knows nothing yet; it reminds, never refuses
 
 
 def test_mcp_read_surfaces_remain_available_without_startup(chronicle_sandbox) -> None:
     async def exercise() -> tuple[list[dict], dict, dict]:
-        chronicler = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        chronicler = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         readonly = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="readonly")
         recent = await chronicler.call_tool("recent_events", {"domain": "global", "limit": 5})
         query = await chronicler.call_tool(
@@ -599,6 +539,7 @@ def test_mcp_read_surfaces_remain_available_without_startup(chronicle_sandbox) -
                 "agent": "pytest",
                 "capture": False,
                 "limit": 2,
+                "mode": "bundle",
             },
         )
         return _decode_mcp_json(recent), _decode_mcp_json(query), _decode_mcp_json(startup)
@@ -628,6 +569,7 @@ def test_readonly_startup_bundle_capture_true_does_not_mutate_but_chronicler_can
                 "agent": "pytest",
                 "capture": True,
                 "limit": 2,
+                "mode": "bundle",
             },
         )
         return _decode_mcp_json(result)
@@ -1580,7 +1522,7 @@ def test_slow_tool_does_not_block_fast_tool(chronicle_sandbox, monkeypatch) -> N
     monkeypatch.setattr(mcp_server_module, "build_sources_audit", slow_audit)
 
     async def exercise() -> float:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         loop = asyncio.get_running_loop()
         slow_task = asyncio.create_task(server.call_tool("sources_audit", {"domain": "global"}))
         await asyncio.sleep(0.2)  # let the slow tool enter its worker thread
@@ -1706,7 +1648,7 @@ def test_mcp_activate_agent_does_not_return_the_full_document_bundle(
     returns the prompt, a runtime digest and the freshness audit.
     """
     async def exercise() -> dict:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         activation = await server.call_tool(
             "activate_agent",
             {"domain": "global", "agent": "pytest", "capture": False},
@@ -1723,12 +1665,12 @@ def test_mcp_activate_agent_does_not_return_the_full_document_bundle(
         assert bulk_key not in payload["snapshot"]
 
 
-def test_mcp_activate_agent_still_unlocks_and_still_carries_runtime_state(
+def test_mcp_activate_agent_still_writes_and_still_carries_runtime_state(
     chronicle_sandbox, loaded_manifest
 ) -> None:
     """Trimming the payload must not cost the caller what the tool is for."""
     async def exercise() -> dict:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         activation = await server.call_tool(
             "activate_agent",
             {"domain": "global", "agent": "pytest", "capture": False},
@@ -1768,8 +1710,7 @@ def test_mcp_capture_snapshot_returns_a_receipt_not_the_whole_snapshot(
     what was written, not a replay.
     """
     async def exercise() -> dict:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
-        await server.call_tool("startup_bundle", {"domain": "global", "agent": "pytest"})
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         captured = await server.call_tool(
             "capture_snapshot",
             {"domain": "global", "agent": "pytest", "title": "Receipt shape"},
@@ -1800,11 +1741,11 @@ def test_query_context_leaves_old_situation_models_out(loaded_manifest) -> None:
 
 def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sandbox) -> None:
     async def collect() -> dict[str, Any]:
-        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
+        server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         return {item.name: item for item in await server.list_tools()}
 
     tools = asyncio.run(collect())
-    hints = {name: (tool.annotations.readOnlyHint, tool.annotations.destructiveHint, tool.annotations.openWorldHint)
+    hints = {name: (tool.annotations.read_only_hint, tool.annotations.destructive_hint, tool.annotations.open_world_hint)
              for name, tool in tools.items()}
 
     assert hints["query_memory"] == (True, None, False)
@@ -1812,9 +1753,9 @@ def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sand
     assert hints["startup_bundle"] == (False, False, False)  # capture=true writes a snapshot
     assert hints["entity_admin"] == (False, True, False)
     assert hints.get("search_mem0_live", (True, None, True)) == (True, None, True)
-    recall_query = tools["query_memory"].inputSchema["properties"]["query"]["description"]
+    recall_query = tools["query_memory"].input_schema["properties"]["query"]["description"]
     assert "Mem0" not in recall_query and "status" not in recall_query
-    window = tools["state_at"].inputSchema["properties"]["window_hours"]
+    window = tools["state_at"].input_schema["properties"]["window_hours"]
     assert (window["minimum"], window["maximum"]) == (1, 720)
 
 

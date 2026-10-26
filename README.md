@@ -36,11 +36,16 @@ projects. See [installation](INSTALL.md).
 Use the same `project` and `task_id` across agents. Domains are broad configured
 areas; they are not a substitute for project/task identity.
 
-1. **Start:** call `startup_bundle(project=..., task_id=..., focus=...)` once per
-   MCP session. It returns the current task context and unlocks writes.
-2. **Recall:** call `query_memory(query=..., project=..., task_id=...)`. Inspect
-   evidence, `degraded` and `no_confident_match`. Results without a confident match
-   are leads to verify; a weak or empty result does not prove the memory is absent.
+1. **Start:** call `startup_bundle(project=..., task_id=...)` before continuing a
+   task. It returns the project's brief and, for a task, its checkpoint, current
+   facts and changes. Writes do not depend on it: a write by an agent that has not
+   read the project recently is stored with a `notice` and a hint to read first.
+2. **Recall:** call `query_memory(query=..., project=..., task_id=...)`. Each hit is
+   one short line (`event:<id>` or `note:<id>`, when, project, task, agent, a gist,
+   how it matched); `get_memory(ids=[...])` returns the full records, evidence and
+   provenance of the ones you pick (`detail="full"` returns them all). Results
+   without a confident match are leads to verify; a weak or empty result does not
+   prove the memory is absent.
 3. **Record:** use `record_event` for significant decisions, actions, and findings.
    Supply `why` and `source_files` where available. Reuse `request_id` unchanged
    if delivery is uncertain; a changed request requires a new ID. Likely secrets
@@ -130,6 +135,11 @@ and does not require a separately running HTTP service. For supervised HTTP, use
 `GET /health` checks service and database availability and names the database,
 manifest, schema version and installed code path that answered; `sources_audit` and
 startup source health describe freshness. These are different checks.
+One HTTP endpoint serves both MCP protocol eras (MCP Python SDK 2). A client
+on `2026-07-28` sends each request on its own, with no session, so a server
+restart does not interrupt it; an older client gets the `initialize` handshake
+and a session, which a restart ends (the client starts a new one) and which
+closes after 30 minutes without traffic.
 Over HTTP, `/health` also reports the process: event-loop lag (`loop`), the write
 queue (`writes`), the last committed write and the background embedder.
 `GET /health/live` answers from the event loop alone, without the database: a slow
@@ -183,8 +193,10 @@ curl -fsS -m 2 --get --data-urlencode "cwd=$dir" http://127.0.0.1:8093/brief 2>/
 
 Claude Code and Codex add a SessionStart hook's plain standard output to the
 session context; Claude Code keeps up to 10,000 characters, above the brief's
-maximum. Without HTTP, `chronicle brief --cwd DIR` prints the same text. An MCP client can call `startup_bundle(mode="brief")`, which also unlocks
-writes, or read the resource `chronicle://brief/{project}`.
+maximum. Without HTTP, `chronicle brief --cwd DIR` prints the same text. An MCP client
+calls `startup_bundle(project=...)`, whose default mode is this brief, or reads the
+resource `chronicle://brief/{project}`. A project's brief shows its own decisions
+only, and its own facts before at most four facts recorded without a project.
 
 ### One name per project, domain and agent
 
@@ -262,23 +274,32 @@ section of each note, with its heading, path and id. In a project scope, the
 project's own notes come before global ones. `chronicle://note/{document_id}`
 serves a whole note; `chronicle notes status` counts what the index holds.
 
+The default (`chronicler`) profile serves the six tools agents use:
+
 | Tool | Purpose |
 | --- | --- |
-| `startup_bundle` | Task context, checkpoint, current facts, change cursor; unlock writes. `mode="brief"`: only the brief. |
-| `query_memory` | Scoped lexical/vector recall with provenance and coverage. |
-| `query_context` | Broader search through source documents and optional Mem0 dump. |
+| `startup_bundle` | The project's brief; with `task_id`, the task's checkpoint, current facts and change cursor. `mode="bundle"`: the full startup bundle. |
+| `query_memory` | Scoped lexical/vector recall over events and notes, one short line per hit (`detail="full"` for whole records). |
+| `get_memory` | Full records for `event:`/`note:` ids: text, why, checkpoint or fact, evidence, provenance. |
+| `record_event` | Attributed observation, evidence, optional checkpoint or explicit fact. |
 | `recent_events` | Recent event history. |
 | `state_at` | Historical snapshots/events; `mode="as_of"` keeps only what was known then and adds the facts current then; `detail="full"` restores the full payload. |
+
+`--profile admin` adds the maintenance surface, and `chronicle-mcp-readonly`
+(`--profile readonly`) drops `record_event`:
+
+| Admin tool | Purpose |
+| --- | --- |
+| `query_context` | Broader search through source documents and optional Mem0 dump. |
 | `sources_audit` | Source coverage, freshness, and trust metadata. |
-| `record_event` | Attributed observation, evidence, optional checkpoint or explicit fact. |
 | `capture_snapshot` | Archive runtime state and update readable projections. |
 | `entity_admin` | Report, normalize, alias, or merge entities. |
+| `activate_agent` | Deprecated alias of `startup_bundle`. |
 | `search_mem0_live` | Optional external semantic mirror through an operator-supplied bridge; absent without Mem0. |
 
-`chronicle-mcp-readonly` exposes only read surfaces. The deprecated `activate_agent`
-alias remains compatible. Failures set MCP `isError` and carry a JSON envelope
-with `error_type`, `retryable`, and `hint`; follow that hint. A committed snapshot
-can separately report `side_effect_errors` for failed evidence/projection outputs.
+Failures set MCP `isError` and carry a JSON envelope with `error_type`,
+`retryable`, and `hint`; follow that hint. A committed snapshot can separately
+report `side_effect_errors` for failed evidence/projection outputs.
 
 ### Without Mem0
 

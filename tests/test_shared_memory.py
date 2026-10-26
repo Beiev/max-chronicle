@@ -337,7 +337,7 @@ def test_two_mcp_clients_share_handoff_and_keep_distinct_sessions(chronicle_sand
     )
 
     def decode(result):
-        assert not result.isError, result.content
+        assert not result.is_error, result.content
         return json.loads(result.content[0].text)
 
     async def run():
@@ -392,6 +392,8 @@ def test_two_mcp_clients_share_handoff_and_keep_distinct_sessions(chronicle_sand
                         },
                     )
                 )
-                assert hits["results"][0]["event_id"] == receipt["id"]
+                assert hits["results"][0]["id"] == f"event:{receipt['id']}"
+                full = decode(await b.call_tool("get_memory", {"ids": [hits["results"][0]["id"]]}))
+                assert full["items"][0]["checkpoint"]["goal"] == "Ship recall"
 
     asyncio.run(run())

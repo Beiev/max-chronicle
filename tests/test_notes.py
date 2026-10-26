@@ -771,7 +771,7 @@ def test_a_server_that_never_syncs_ignores_a_bad_notes_section(chronicle_sandbox
         pass  # a read-only server needs a database to exist
     with chronicle_sandbox.manifest_path.open("a", encoding="utf-8") as handle:
         handle.write('\n[notes]\npaths = ["/nonexistent/*.md"]\nsync_minutes = 0\n')
-    async def served() -> None:
+    async def served(**options) -> None:
         return None
 
     monkeypatch.setattr(mcp_server_module, "build_server",

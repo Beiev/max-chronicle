@@ -11,7 +11,7 @@ import base64
 import json
 
 import pytest
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp import Client
 from mcp.types import Implementation
 
 from max_chronicle import service
@@ -177,13 +177,12 @@ def _decode(result) -> dict:
     return json.loads(result.content[0].text)
 
 
-def test_a_session_that_names_no_agent_is_attributed_to_its_client(chronicle_sandbox) -> None:
+@pytest.mark.parametrize("mode", ["legacy", "auto"])  # an initialize handshake, and a 2026 connection
+def test_a_session_that_names_no_agent_is_attributed_to_its_client(chronicle_sandbox, mode) -> None:
     server = build_server(manifest_path=chronicle_sandbox.manifest_path)
 
     async def scenario() -> dict:
-        async with create_connected_server_and_client_session(
-            server, client_info=Implementation(name="claude-code", version="2.1")
-        ) as client:
+        async with Client(server, client_info=Implementation(name="claude-code", version="2.1"), mode=mode) as client:
             await client.call_tool("startup_bundle", {"mode": "brief"})
             return _decode(await client.call_tool("record_event", {"text": "Written without naming an agent"}))
 
@@ -191,26 +190,25 @@ def test_a_session_that_names_no_agent_is_attributed_to_its_client(chronicle_san
     assert (stored["agent"], stored["actor_raw"], stored["agent_source"]) == ("claude", "claude-code", "client")
 
 
-def test_a_retry_after_a_reconnect_is_the_same_request(chronicle_sandbox) -> None:
+@pytest.mark.parametrize("mode", ["legacy", "auto"])
+def test_a_retry_after_a_reconnect_is_the_same_request(chronicle_sandbox, mode) -> None:
     server = build_server(manifest_path=chronicle_sandbox.manifest_path)
     arguments = {"text": "Retried after the transport dropped", "request_id": "retry-1"}
 
     async def scenario() -> tuple[dict, dict]:
-        async with create_connected_server_and_client_session(
-            server, client_info=Implementation(name="claude-code", version="2.1")
-        ) as client:
+        async with Client(server, client_info=Implementation(name="claude-code", version="2.1"), mode=mode) as client:
             await client.call_tool("startup_bundle", {"mode": "brief", "agent": "memory-librarian"})
             first = _decode(await client.call_tool("record_event", arguments))
-        async with create_connected_server_and_client_session(
-            server, client_info=Implementation(name="claude-code", version="2.1")
-        ) as client:
+        async with Client(server, client_info=Implementation(name="claude-code", version="2.1"), mode=mode) as client:
             await client.call_tool("startup_bundle", {"mode": "brief"})
             result = await client.call_tool("record_event", arguments)
-            assert not result.isError, result.content[0].text
+            assert not result.is_error, result.content[0].text
             return first, _decode(result)
 
     first, retried = asyncio.run(scenario())
-    assert first["agent"] == "memory-librarian"
+    # A pre-2026 session remembers the agent startup named; a 2026 request has no
+    # session, so an unnamed write is the client's.
+    assert first["agent"] == ("memory-librarian" if mode == "legacy" else "claude")
     assert (retried["id"], retried["chronicle_status"]) == (first["id"], "existing")
 
 
@@ -260,9 +258,7 @@ def test_two_agents_confirming_the_same_text_are_two_observations(chronicle_sand
     server = build_server(manifest_path=chronicle_sandbox.manifest_path)
 
     async def scenario() -> list[str]:
-        async with create_connected_server_and_client_session(
-            server, client_info=Implementation(name="claude-code", version="2.1")
-        ) as client:
+        async with Client(server, client_info=Implementation(name="claude-code", version="2.1"), mode="legacy") as client:
             await client.call_tool("startup_bundle", {"mode": "brief", "agent": "claude"})
             first = _decode(await client.call_tool("record_event", {"text": "The launch slips a week"}))
             await client.call_tool("startup_bundle", {"mode": "brief", "agent": "codex"})

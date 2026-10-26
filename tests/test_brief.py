@@ -74,14 +74,46 @@ def test_the_brief_leaves_out_closed_tasks_old_decisions_and_quarantine(loaded_m
     assert "monthly" not in text and "Hidden" not in text
 
 
-def test_a_project_brief_keeps_global_items_and_drops_other_projects(loaded_manifest) -> None:
-    _record(loaded_manifest, "Global rule", category="decision")
-    _record(loaded_manifest, "Alpha rule", project="alpha", category="decision")
-    _record(loaded_manifest, "Beta rule", project="beta", category="decision")
+def test_a_project_brief_shows_only_its_own_decisions(loaded_manifest) -> None:
+    """A decision without a project (a pipeline's) used to show up in every project's brief."""
+    _record(loaded_manifest, "Global decision", category="decision")
+    _record(loaded_manifest, "Alpha decision", project="alpha", category="decision")
+    _record(loaded_manifest, "Beta decision", project="beta", category="decision")
+
+    alpha = _brief(loaded_manifest, project="alpha")["text"]
+    everything = _brief(loaded_manifest)["text"]
+
+    assert "Alpha decision" in alpha and "Global decision" not in alpha and "Beta decision" not in alpha
+    assert all(name in everything for name in ("Global decision", "Alpha decision", "Beta decision"))
+
+
+def test_a_project_brief_lists_its_facts_first_and_caps_global_ones(loaded_manifest) -> None:
+    from max_chronicle.brief import BRIEF_GLOBAL_FACTS
+
+    for index in range(BRIEF_GLOBAL_FACTS + 3):
+        _record(loaded_manifest, f"Global rule {index}",
+                fact={"slot": f"global.rule{index}", "value": f"g{index}", "kind": "decision"})
+    _record(loaded_manifest, "Alpha rule", project="alpha",
+            fact={"slot": "alpha.rule", "value": "a1", "kind": "decision"})
 
     text = _brief(loaded_manifest, project="alpha")["text"]
+    facts = [line for line in text.splitlines() if line.startswith("- ") and " = " in line]
 
-    assert "Global rule" in text and "Alpha rule" in text and "Beta rule" not in text
+    assert facts[0].startswith("- alpha.rule = a1")
+    assert len(facts) == 1 + BRIEF_GLOBAL_FACTS
+
+
+def test_the_unscoped_brief_shows_a_new_global_rule_before_old_project_facts(loaded_manifest) -> None:
+    from max_chronicle.brief import BRIEF_FACTS
+
+    for index in range(BRIEF_FACTS):
+        _record(loaded_manifest, f"Alpha rule {index}", days_ago=5, project="alpha",
+                fact={"slot": f"alpha.rule{index}", "value": f"a{index}", "kind": "decision"})
+    _record(loaded_manifest, "Global rule", days_ago=0.01, fact={"slot": "global.rule", "value": "g", "kind": "decision"})
+
+    text = _brief(loaded_manifest)["text"]
+
+    assert "- global.rule = g" in text
 
 
 def test_warnings_cover_a_stale_capture_and_recent_job_failures_only(loaded_manifest) -> None:
@@ -287,12 +319,12 @@ def test_the_brief_route_validates_the_budget_and_serves_json(chronicle_sandbox)
     assert as_json.json()["project"] == "alpha" and as_json.json()["text"].startswith(FRAMING)
 
 
-def test_startup_in_brief_mode_returns_the_brief_and_unlocks_writes(chronicle_sandbox) -> None:
+def test_startup_in_brief_mode_returns_the_brief_and_writes_go_through(chronicle_sandbox) -> None:
     async def exercise() -> tuple[dict, dict]:
         server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
         started = await server.call_tool("startup_bundle", {"agent": "agent-a", "mode": "brief", "project": "alpha"})
         written = await server.call_tool("record_event", {"agent": "agent-a", "text": "Recorded after a brief start"})
-        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else result)[0].text)
+        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else getattr(result, "content", result))[0].text)
         return decode(started), decode(written)
 
     started, written = asyncio.run(exercise())
@@ -307,7 +339,7 @@ def test_a_brief_start_binds_the_agent_like_a_full_start(chronicle_sandbox) -> N
         server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
         started = await server.call_tool("startup_bundle", {"agent": "agent-a", "mode": "brief"})
         written = await server.call_tool("record_event", {"text": "Recorded without naming the agent"})
-        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else result)[0].text)
+        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else getattr(result, "content", result))[0].text)
         return decode(started), decode(written)
 
     started, written = asyncio.run(exercise())
