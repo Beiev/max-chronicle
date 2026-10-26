@@ -6,7 +6,9 @@ any operator's personal workspace.
 
 ## Read first
 
-- `README.md`: client workflow, tool contract, and examples.
+- `README.md`: what Chronicle is, quick start, where each topic is documented.
+- `docs/CONCEPTS.md`: the records and their rules; `docs/AGENT_PROTOCOL.md`: the agent
+  surface, generated from the registered tools; `docs/OPERATIONS.md`, `docs/RECALL.md`.
 - `max_chronicle/docs/SCHEMA_V1.md`: current schema (filename retained for old links).
 - `max_chronicle/docs/ROADMAP-ULTIMATE-MEMORY.md`: accepted requirements and checks.
 
@@ -23,6 +25,7 @@ any operator's personal workspace.
 - `liveness.py`: the HTTP server's event-loop monitor and background embedder.
 - `scheduler.py`: the HTTP server's job scheduler (due occurrences, run keys, retries).
 - `viewer.py`: the read-only web view under `/ui` (server-rendered, no script).
+- `agent_doc.py`: writes `docs/AGENT_PROTOCOL.md` from the registered tools.
 - `scaffold.py`: neutral new-workspace templates.
 
 ## Invariants
@@ -46,8 +49,10 @@ for new contracts, including two-agent handoff, retries, and failure paths.
 
 Schema changes require a new numbered migration; do not edit applied migrations.
 Migration numbers are unique; loading fails on a duplicate.
-Keep existing CLI/MCP entrypoints compatible and update README/examples alongside
-the implementation. Keep changes focused; avoid broad style-only rewrites.
+Keep existing CLI/MCP entrypoints compatible and update the docs alongside the
+implementation. A changed tool or tool description needs
+`python -m max_chronicle.agent_doc`: `tests/test_agent_doc.py` fails until the page
+matches the tools. Keep changes focused; avoid broad style-only rewrites.
 
 Build from this clean source checkout. Inspect both wheel and source archive for
 personal paths, credentials, databases, logs, and generated workspace files.
