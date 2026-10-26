@@ -45,6 +45,13 @@ def test_the_weekly_audit_is_due_on_its_sunday_and_keyed_by_that_week() -> None:
     assert occurrence_key("weekly-audit", monday) == "2026-W43"
 
 
+def test_in_the_repeated_hour_the_day_s_occurrence_is_already_due() -> None:
+    """2026-10-25 02:10 CET comes after 02:20 CEST: wall clocks alone said not yet."""
+    now = datetime(2026, 10, 25, 1, 10, tzinfo=timezone.utc).astimezone(WARSAW)
+
+    assert due_occurrence(DAILY, now) == _at(2026, 10, 25, 2, 20)
+
+
 def test_a_late_run_after_midnight_keys_the_day_it_was_due() -> None:
     occurrence = due_occurrence(DAYBOOK, _at(2026, 10, 21, 0, 40))
 
@@ -113,8 +120,10 @@ def test_a_failed_run_is_retried_after_a_pause_and_given_up_after_its_attempts(s
     assert _actions(scheduler.decide())["daily-capture"] == "gave_up"
 
 
-def test_a_deferred_backup_is_retried_until_its_disk_comes_back(scheduler_env) -> None:
-    """launchd's StartOnMount backed up a disk plugged in late; the scheduler must not give up on it."""
+def test_a_deferred_run_is_retried_until_it_runs(scheduler_env) -> None:
+    """A backup deferred for its unmounted disk (launchd's StartOnMount caught the
+    disk plugged in late); the scheduler must not give up on it. Any job's
+    deferred row behaves the same."""
     scheduler, clock, runs, manifest, _ = scheduler_env
     zone = ZoneInfo(config_from_manifest(manifest).timezone)
     key = occurrence_key("daily-capture", due_occurrence(DAILY, clock["now"].astimezone(zone)))
@@ -209,3 +218,102 @@ def test_turning_the_scheduler_on_retires_the_job_agents_an_earlier_install_left
     assert before["installed"] and not list(agents.glob("*.plist"))
     assert sorted(after["retired"]) == sorted(item["label"] for item in before["installed"])
     assert len(list((runtime / "retired-job-agents").glob("*.plist"))) == len(before["installed"])
+
+
+def test_a_job_that_fails_before_recording_a_row_is_paused_and_given_up(scheduler_env) -> None:
+    """A broken config fails before any row exists; it used to start again every minute."""
+    scheduler, clock, runs, _, _ = scheduler_env
+
+    def run_job(job: str, occurrence: datetime) -> int:
+        runs.append((job, occurrence))
+        return 1
+
+    scheduler._run_job = run_job
+    scheduler.tick()
+    assert _actions(scheduler.decide())["daily-capture"] == "wait"
+    for _ in range(MAX_ATTEMPTS):
+        clock["now"] += RETRY_AFTER
+        scheduler.tick()
+
+    assert _actions(scheduler.decide())["daily-capture"] == "gave_up"
+    assert len([job for job, _ in runs if job == "daily-capture"]) == MAX_ATTEMPTS
+
+
+def test_the_stale_ttl_comes_from_the_automation_config(scheduler_env) -> None:
+    _, clock, _, manifest, automation = scheduler_env
+    longer = replace(automation, guards=replace(automation.guards, stale_run_ttl_hours=12))
+    scheduler = Scheduler(lambda: manifest, lambda: longer, lambda job, occurrence: 0, clock=lambda: clock["now"])
+    zone = ZoneInfo(config_from_manifest(manifest).timezone)
+    key = occurrence_key("daily-capture", due_occurrence(DAILY, clock["now"].astimezone(zone)))
+    started = clock["now"] - timedelta(hours=7)
+    with open_connection(config_from_manifest(manifest)) as connection, connection:
+        connection.execute(
+            "INSERT INTO automation_runs(id, job_name, run_key, trigger_source, started_at_utc, status) "
+            "VALUES ('r1', 'daily-capture', ?, 'scheduler', ?, 'running')",
+            (key, started.strftime("%Y-%m-%dT%H:%M:%SZ")))
+
+    assert _actions(scheduler.decide())["daily-capture"] == "running"
+
+
+def test_a_monday_catch_up_of_the_audit_leaves_next_week_free(loaded_manifest, loaded_automation) -> None:
+    """The audit's own record took the week it ran in; next Sunday's audit then found it taken."""
+    first = run_automation_job(loaded_manifest, loaded_automation, job_name="weekly-audit",
+                               trigger_source="pytest", occurrence=_at(2026, 10, 25, 6, 10))
+    second = run_automation_job(loaded_manifest, loaded_automation, job_name="weekly-audit",
+                                trigger_source="pytest", occurrence=_at(2026, 11, 1, 6, 10))
+
+    with open_connection(config_from_manifest(loaded_manifest)) as connection:
+        keys = sorted(row[0] for row in connection.execute(
+            "SELECT run_key FROM curation_runs WHERE curation_type = 'weekly_audit'"))
+    assert keys == ["2026-W43", "2026-W44"]
+    assert "existing" not in (first.get("status"), second.get("status"))
+
+
+def test_retiring_unloads_every_job_agent_by_label(chronicle_sandbox, loaded_manifest, loaded_automation,
+                                                   monkeypatch) -> None:
+    """A plist moved aside without unloading left its agent loaded and firing."""
+    from max_chronicle import native_automation
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(native_automation.subprocess, "run",
+                        lambda args, **_: calls.append(list(args)) or native_automation.subprocess.CompletedProcess(args, 0))
+    native_automation.install_launchd(
+        loaded_manifest, replace(loaded_automation, scheduler_enabled=True),
+        agent_dir=chronicle_sandbox.root / "agents", runtime_dir=chronicle_sandbox.root / "rt",
+        log_dir=chronicle_sandbox.root / "logs", load_jobs=True)
+
+    booted_out = {args[-1].rsplit("/", 1)[-1] for args in calls if args[:2] == ["launchctl", "bootout"]}
+    assert booted_out == set(native_automation.launchd_labels(loaded_automation).values())
+
+
+def test_a_scheduler_that_cannot_be_built_does_not_stop_the_server(loaded_automation, monkeypatch) -> None:
+    from max_chronicle import mcp_server
+
+    monkeypatch.setattr(mcp_server, "load_automation_config",
+                        lambda path: replace(loaded_automation, scheduler_enabled=True))
+    monkeypatch.setattr(mcp_server.Scheduler, "for_installation",
+                        classmethod(lambda cls, *a, **k: (_ for _ in ()).throw(FileExistsError("runtime dir is a file"))))
+
+    assert mcp_server._start_scheduler(mcp_server.Path("/nonexistent/SSOT_MANIFEST.toml")) is None
+
+
+def test_a_stale_running_row_is_retried_with_a_pause_and_a_limit(scheduler_env) -> None:
+    """A job that dies again before retiring the dead row used to start every minute."""
+    scheduler, clock, runs, manifest, _ = scheduler_env
+    zone = ZoneInfo(config_from_manifest(manifest).timezone)
+    key = occurrence_key("daily-capture", due_occurrence(DAILY, clock["now"].astimezone(zone)))
+    with open_connection(config_from_manifest(manifest)) as connection, connection:
+        connection.execute(
+            "INSERT INTO automation_runs(id, job_name, run_key, trigger_source, started_at_utc, status) "
+            "VALUES ('r1', 'daily-capture', ?, 'scheduler', ?, 'running')",
+            (key, (clock["now"] - STALE_RUNNING - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")))
+
+    scheduler.tick()
+    clock["now"] += timedelta(minutes=1)
+    assert _actions(scheduler.decide())["daily-capture"] == "wait"
+    for _ in range(MAX_ATTEMPTS):
+        clock["now"] += RETRY_AFTER
+        scheduler.tick()
+
+    assert _actions(scheduler.decide())["daily-capture"] == "gave_up"
+    assert len([job for job, _ in runs if job == "daily-capture"]) == MAX_ATTEMPTS - 1

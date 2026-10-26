@@ -124,3 +124,18 @@ def test_a_task_id_with_a_slash_links_to_its_page(client, loaded_manifest) -> No
 
     assert "/ui/task/alpha/fix%2Fviewer" in client.get("/ui").text
     assert "Ship the viewer" in client.get("/ui/task/alpha/fix%2Fviewer").text
+
+
+def test_a_quarantined_checkpoint_and_fact_stay_off_the_task_and_fact_pages(client, loaded_manifest) -> None:
+    _record(loaded_manifest, "Visible step", project="alpha", task_id="t1",
+            checkpoint={"goal": "Visible goal", "next_steps": ["Go on"]})
+    _record(loaded_manifest, "Hidden step", project="alpha", task_id="t1",
+            checkpoint={"goal": "Hiddengoal", "next_steps": ["Hiddenstep"]},
+            fact={"slot": "hidden.slot", "value": "Hiddenvalue", "kind": "decision"},
+            memory_guard={"visibility": "raw_only"})
+
+    pages = [client.get(path).text for path in
+             ("/ui", "/ui/project/alpha", "/ui/task/alpha/t1", "/ui/facts", "/ui/facts?slot=hidden.slot")]
+
+    assert "Visible goal" in pages[2]
+    assert not any(secret in page for page in pages for secret in ("Hiddengoal", "Hiddenstep", "Hiddenvalue"))

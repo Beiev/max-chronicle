@@ -216,7 +216,9 @@ SESSION_IDLE_TIMEOUT_S = 1800
 # created it, so these live in RunVars — one set per async run. A plain module
 # global would hand a limiter from a dead loop to a new one (the daemon has a
 # single loop, but tests spin up an asyncio.run per case).
-_LIMITER_TOKENS = {"read": 8, "write": 1}
+# Web pages get threads of their own: a page abandoned at its time limit keeps
+# its thread until it ends, and must not take one /health or a tool needs.
+_LIMITER_TOKENS = {"read": 8, "write": 1, "ui": 2}
 _limiter_vars = {kind: RunVar(f"chronicle_{kind}_limiter") for kind in _LIMITER_TOKENS}
 
 
@@ -597,7 +599,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         try:
             with anyio.fail_after(VIEW_TIMEOUT_S):
                 status, page = await anyio.to_thread.run_sync(
-                    lambda: viewer.render(manifest(), segments, query, lambda: health), abandon_on_cancel=True)
+                    lambda: viewer.render(manifest(), segments, query, lambda: health), abandon_on_cancel=True,
+                    limiter=_get_limiter("ui"))
         except ValueError as exc:
             status, page = 400, viewer.error_page(str(exc))
         except Exception as exc:  # noqa: BLE001 — a page that failed says so instead of hanging
@@ -1335,9 +1338,13 @@ def _start_scheduler(manifest_path: Path) -> Scheduler | None:
         return None
     if not automation.scheduler_enabled:
         return None
-    scheduler = Scheduler.for_installation(manifest_path, automation_path)
+    try:
+        scheduler = Scheduler.for_installation(manifest_path, automation_path)
+        scheduler.start()
+    except Exception as exc:  # noqa: BLE001 — the server serves memory even when its jobs cannot run
+        _LOGGER.error("scheduler not started: %s: %s", type(exc).__name__, exc)
+        return None
     _RUNTIME["scheduler"] = scheduler
-    scheduler.start()
     _LOGGER.info("scheduler started: jobs %s", sorted(automation.jobs))
     return scheduler
 

@@ -2320,10 +2320,14 @@ def run_audit(
     trigger_source: str = "manual",
     force: bool = False,
     persist: bool = True,
+    occurrence: datetime | None = None,
 ) -> dict[str, Any]:
     config = config_from_manifest(manifest)
     local_now = _local_now(config)
-    base_run_key = local_now.strftime("%G-W%V") if weekly else local_now.strftime("%Y-%m-%d")
+    # A Monday catch-up of Sunday's audit keys Sunday's week, or next Sunday's
+    # audit would find its week taken and do nothing.
+    keyed = occurrence.astimezone(local_now.tzinfo) if occurrence is not None else local_now
+    base_run_key = keyed.strftime("%G-W%V") if weekly else keyed.strftime("%Y-%m-%d")
     run_key = base_run_key if not force else f"{base_run_key}:force:{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
     curation_type = "weekly_audit" if weekly else "daily_audit"
 
@@ -2591,7 +2595,8 @@ def run_automation_job(
 
     if job_name == "weekly-audit":
         def _weekly_audit(run_id: str) -> dict[str, Any]:
-            result = run_audit(manifest, automation, weekly=True, trigger_source=trigger_source)
+            result = run_audit(manifest, automation, weekly=True, trigger_source=trigger_source,
+                               occurrence=keyed if occurrence is not None else None)
             finish_automation_run(
                 config,
                 run_id=run_id,
@@ -2797,12 +2802,14 @@ def _retire_job_agents(automation: AutomationConfig, agent_dir: Path, runtime_di
     retired_dir = runtime_dir / "retired-job-agents"
     retired: list[str] = []
     for label in launchd_labels(automation).values():
+        if unload:
+            # By label: an agent whose plist an earlier run moved aside without
+            # unloading it is still loaded and still fires.
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], check=False,
+                           capture_output=True, text=True, timeout=_subprocess_timeout_seconds(automation))
         plist_path = agent_dir / f"{label}.plist"
         if not plist_path.exists():
             continue
-        if unload:
-            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)], check=False,
-                           capture_output=True, text=True, timeout=_subprocess_timeout_seconds(automation))
         retired_dir.mkdir(parents=True, exist_ok=True)
         plist_path.replace(retired_dir / plist_path.name)
         retired.append(label)

@@ -22,6 +22,8 @@ Here the server decides, once a minute:
 - a run still marked running after the stale TTL died without a word (a job
   killed at ``JOB_TIMEOUT_S`` writes no final status): it is started again,
   and the job retires the dead row itself;
+- a job that fails before it records a row (a broken config, an import error)
+  is paused and limited the same way, from the scheduler's own count;
 - an occurrence older than ``MAX_LATENESS`` is left alone: the daybook
   repairs its last three days by itself, and an old capture is worthless.
 """
@@ -34,6 +36,7 @@ from datetime import date, datetime, time as wall_time, timedelta, timezone
 import logging
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -53,6 +56,9 @@ MAX_ATTEMPTS = 6
 MAX_LATENESS = timedelta(days=3)
 JOB_TIMEOUT_S = 2 * 3600
 STALE_RUNNING = timedelta(hours=DEFAULT_STALE_RUN_TTL_HOURS)
+# The first tick waits until the server has its port: a second server started
+# by mistake exits on the busy port before it can start a job.
+FIRST_TICK_DELAY_S = 30.0
 WEEKLY_JOBS = {"weekly-audit"}
 DONE_STATUSES = {"ok", "skipped", "issues", "failed_soft"}
 RETRY_STATUSES = {"failed", "deferred", "stale_failed"}
@@ -74,14 +80,21 @@ def due_occurrence(schedule: JobSchedule, now: datetime) -> datetime:
         raise ValueError("now must carry a zoneinfo timezone")
     if schedule.weekday is None:
         candidate = _at(now.date(), schedule, zone)
-        return candidate if candidate <= now else _at(now.date() - timedelta(days=1), schedule, zone)
+        return candidate if _before(candidate, now) else _at(now.date() - timedelta(days=1), schedule, zone)
     target = 7 if int(schedule.weekday) in (0, 7) else int(schedule.weekday)  # launchd: 0 and 7 are Sunday
     for back in range(0, 8):
         day = now.date() - timedelta(days=back)
         candidate = _at(day, schedule, zone)
-        if day.isoweekday() == target and candidate <= now:
+        if day.isoweekday() == target and _before(candidate, now):
             return candidate
     raise AssertionError("a weekday recurs within eight days")
+
+
+def _before(moment: datetime, now: datetime) -> bool:
+    """Moments compared as instants: within one zone Python compares wall
+    clocks, and in the repeated hour after the autumn change 02:10 CET would
+    count as before 02:20 CEST."""
+    return moment.astimezone(timezone.utc) <= now.astimezone(timezone.utc)
 
 
 def occurrence_key(job: str, occurrence: datetime) -> str:
@@ -96,6 +109,7 @@ class Decision:
     key: str
     action: str  # run | done | running | wait | gave_up | too_old
     detail: str | None = None
+    attempts: int = 0  # attempts so far at this occurrence; a failed row from elsewhere counts as one
 
 
 def _subprocess_runner(manifest_path: Path, automation_path: Path, log_dir: Path) -> Callable[[str, datetime], int]:
@@ -111,8 +125,15 @@ def _subprocess_runner(manifest_path: Path, automation_path: Path, log_dir: Path
             log.write(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} scheduler: "
                       f"{job} for {occurrence.isoformat()}\n")
             log.flush()
-            return subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=JOB_TIMEOUT_S,
-                                  env=os.environ.copy(), check=False).returncode
+            # Its own process group, so a timeout ends the job's children too.
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy(),
+                                       start_new_session=True)
+            try:
+                return process.wait(timeout=JOB_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                raise
 
     return run
 
@@ -133,6 +154,7 @@ class Scheduler:
         self._run_job = run_job
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._attempts: dict[tuple[str, str], int] = {}
+        self._last_started: dict[tuple[str, str], datetime] = {}
         self._lock = threading.Lock()
         self._last_tick: str | None = None
         self._last_runs: list[dict[str, Any]] = []
@@ -151,7 +173,10 @@ class Scheduler:
         automation = self._automation()
         config = config_from_manifest(manifest)
         zone = ZoneInfo(config.timezone)
-        now = self._clock().astimezone(zone)
+        clock = self._clock()
+        now = clock.astimezone(zone)
+        ttl_hours = float(getattr(automation.guards, "stale_run_ttl_hours", DEFAULT_STALE_RUN_TTL_HOURS))
+        stale_running = timedelta(hours=ttl_hours if ttl_hours > 0 else DEFAULT_STALE_RUN_TTL_HOURS)
         decisions = []
         for key, schedule in sorted(automation.jobs.items()):
             job = job_name(key)
@@ -159,29 +184,36 @@ class Scheduler:
                 continue
             occurrence = due_occurrence(schedule, now)
             run_key = occurrence_key(job, occurrence)
-            decision = Decision(job, occurrence.isoformat(), run_key, "run")
-            if now - occurrence > MAX_LATENESS:
+            decision = Decision(job, occurrence.isoformat(), run_key, "run",
+                                attempts=self._attempts.get((job, run_key), 0))
+            if clock - occurrence > MAX_LATENESS:  # aware datetimes in different zones subtract as instants
                 decision.action = "too_old"
-            else:
-                row = fetch_automation_run(config, job_name=job, run_key=run_key)
-                status = (row or {}).get("status")
-                if status in DONE_STATUSES:
-                    decision.action = "done"
-                elif status == "running":
-                    started = _parse((row or {}).get("started_at_utc"))
-                    if started is None or self._clock() - started > STALE_RUNNING:
-                        decision.detail = "stale running row"
-                    else:
-                        decision.action = "running"
-                elif status in RETRY_STATUSES:
-                    finished = _parse((row or {}).get("finished_at_utc"))
-                    attempts = self._attempts.get((job, run_key), 1)
-                    if status != "deferred" and attempts >= MAX_ATTEMPTS:
-                        decision.action, decision.detail = "gave_up", f"{attempts} attempts"
-                    elif finished is not None and self._clock() - finished < RETRY_AFTER:
-                        decision.action, decision.detail = "wait", f"retry after {status}"
-                elif status is not None:
-                    decision.action, decision.detail = "done", status
+                decisions.append(decision)
+                continue
+            row = fetch_automation_run(config, job_name=job, run_key=run_key)
+            status = (row or {}).get("status")
+            if status == "running":
+                started = _parse((row or {}).get("started_at_utc"))
+                if started is not None and clock - started <= stale_running:
+                    decision.action = "running"
+                    decisions.append(decision)
+                    continue
+                status = "stale running row"  # died without a word: retried like a failure
+            if status in DONE_STATUSES:
+                decision.action = "done"
+            elif status is not None and status not in RETRY_STATUSES and status != "stale running row":
+                decision.action, decision.detail = "done", status
+            elif status is not None or decision.attempts:
+                # Failed, deferred or dead, or failed before it recorded anything:
+                # paused between attempts and, unless deferred, limited.
+                if status is not None:
+                    decision.attempts = max(decision.attempts, 1)
+                    decision.detail = status
+                last = _parse((row or {}).get("finished_at_utc")) or self._last_started.get((job, run_key))
+                if status != "deferred" and decision.attempts >= MAX_ATTEMPTS:
+                    decision.action, decision.detail = "gave_up", f"{decision.attempts} attempts"
+                elif last is not None and clock - last < RETRY_AFTER:
+                    decision.action, decision.detail = "wait", f"retry after {status or 'a failed start'}"
             decisions.append(decision)
         return decisions
 
@@ -191,9 +223,10 @@ class Scheduler:
         for decision in decisions:
             if decision.action != "run":
                 continue
+            attempt = decision.attempts + 1
             with self._lock:
-                attempt = self._attempts.get((decision.job, decision.key), 0) + 1
                 self._attempts[(decision.job, decision.key)] = attempt
+                self._last_started[(decision.job, decision.key)] = self._clock()
             started = time.monotonic()
             try:
                 code: int | str = self._run_job(decision.job, datetime.fromisoformat(decision.occurrence))
@@ -211,6 +244,7 @@ class Scheduler:
         return decisions
 
     def loop(self) -> None:
+        time.sleep(FIRST_TICK_DELAY_S)
         while True:
             try:
                 self.tick()
