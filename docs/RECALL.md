@@ -36,6 +36,23 @@ what never gets stored, and how to measure recall on your own corpus.
   it on your own corpus with `chronicle eval`; cosine and reciprocal-rank scores
   are not confidence values.
 
+## How much stands behind a hit
+
+Each recalled event carries `trust`, read from all of its visible observations:
+- `assumption`: its author marked the fact it set as an assumption; nothing
+  attached outranks that;
+- `evidence`: a source file was archived when it was recorded. The file backs
+  the record; it does not prove the text, and the label stays if the archive is
+  later purged;
+- `confirmed`: more than one agent (by canonical name) recorded the same text;
+- `assertion`: one agent's word, with nothing archived.
+
+A recalled note carries `trust: note`: a file someone keeps on purpose, whose
+author and history are the file's own.
+
+A mistaken or poisoned record most often looks like the last. `trust` ranks
+nothing; it tells the reader what to check before acting on a hit.
+
 ## Secrets
 
 A content-based filter replaces likely credentials with

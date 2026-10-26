@@ -4,7 +4,9 @@ Recall used to return every hit in full, with provenance, so a dozen hits
 cost an agent thousands of tokens it mostly did not read. ``index_view``
 turns a recall response into one line per hit — id, when, where, who, a
 gist of the text, how it matched — and ``get_items`` returns the full
-records for the ids an agent picks. Ids carry their kind: ``event:<id>``,
+records for the ids an agent picks. Each hit says how much stands behind
+it (``trust``): archived evidence, confirmation by more than one agent, a
+single agent's assertion, or an assumption. Ids carry their kind: ``event:<id>``,
 ``note:<id>`` and ``fact:<id>`` (a brief prints fact ids); a bare id is an
 event, or else a fact.
 """
@@ -40,6 +42,33 @@ def _match(channels: dict[str, Any]) -> dict[str, Any]:
             "similarity": round(similarity, 3) if similarity is not None else None}
 
 
+def trust(hit: dict[str, Any]) -> str:
+    """What stands behind a recalled event, from its provenance.
+
+    ``assumption``: its author marked the fact it set as an assumption; nothing
+    attached outranks that. Otherwise, strongest first: ``evidence``, a copy of
+    a source file was archived when it was recorded (the file backs the record;
+    it does not prove the text); ``confirmed``, more than one agent recorded the
+    same text; ``assertion``, one agent's word. A poisoned or mistaken record
+    most often looks like the last.
+    """
+    provenance = hit.get("provenance") or {}
+    observations = provenance.get("observations") or []
+    summary = provenance.get("summary") or {}
+    if any(fact.get("kind") == "assumption" for fact in provenance.get("facts") or []):
+        return "assumption"
+    archived = summary.get("archived_evidence")
+    if archived is None:  # a provenance from before the summary
+        archived = any((item or {}).get("status") == "archived" for observation in observations
+                       for item in observation.get("evidence") or [])
+    if archived:
+        return "evidence"
+    agents = summary.get("agents")
+    if agents is None:
+        agents = len({observation.get("agent") for observation in observations if observation.get("agent")})
+    return "confirmed" if agents > 1 else "assertion"
+
+
 def _event_hit(hit: dict[str, Any]) -> dict[str, Any]:
     text, cut = gist(hit.get("text"))
     why, why_cut = gist(hit.get("why"), WHY_GIST_CHARS)
@@ -52,6 +81,7 @@ def _event_hit(hit: dict[str, Any]) -> dict[str, Any]:
         "category": hit.get("category"),
         "text": text,
         "match": _match(hit.get("channels") or {}),
+        "trust": trust(hit),
     }
     if why:
         item["why"] = why
@@ -73,6 +103,7 @@ def _note_hit(note: dict[str, Any]) -> dict[str, Any]:
         "modified": note.get("modified_at_utc"),
         "text": text,
         "match": _match(note.get("channels") or {}),
+        "trust": "note",  # a file someone keeps on purpose; its author is the file's
     }
     if cut or (note.get("text") or "").endswith("…"):
         item["truncated"] = True

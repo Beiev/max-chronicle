@@ -26,6 +26,7 @@ any operator's personal workspace.
 - `scheduler.py`: the HTTP server's job scheduler (due occurrences, run keys, retries).
 - `viewer.py`: the read-only web view under `/ui` (server-rendered, no script).
 - `agent_doc.py`: writes `docs/AGENT_PROTOCOL.md` from the registered tools.
+- `doctor.py`: what `chronicle doctor` reports about the running installation, and its summary.
 - `scaffold.py`: neutral new-workspace templates.
 
 ## Invariants
