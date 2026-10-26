@@ -337,7 +337,7 @@ def test_two_mcp_clients_share_handoff_and_keep_distinct_sessions(chronicle_sand
     )
 
     def decode(result):
-        assert not result.isError, result.content
+        assert not result.is_error, result.content
         return json.loads(result.content[0].text)
 
     async def run():

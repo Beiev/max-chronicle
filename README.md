@@ -135,6 +135,11 @@ and does not require a separately running HTTP service. For supervised HTTP, use
 `GET /health` checks service and database availability and names the database,
 manifest, schema version and installed code path that answered; `sources_audit` and
 startup source health describe freshness. These are different checks.
+One HTTP endpoint serves both MCP protocol eras (MCP Python SDK 2). A client
+on `2026-07-28` sends each request on its own, with no session, so a server
+restart does not interrupt it; an older client gets the `initialize` handshake
+and a session, which a restart ends (the client starts a new one) and which
+closes after 30 minutes without traffic.
 Over HTTP, `/health` also reports the process: event-loop lag (`loop`), the write
 queue (`writes`), the last committed write and the background embedder.
 `GET /health/live` answers from the event loop alone, without the database: a slow

@@ -73,7 +73,7 @@ def test_agents_do_not_see_a_quarantined_event_in_the_timeline(chronicle_sandbox
 
     async def state_at() -> dict:
         result = await server.call_tool("state_at", {"timestamp": T.isoformat(), "mode": mode})
-        content = result[0] if isinstance(result, tuple) else result
+        content = result[0] if isinstance(result, tuple) else getattr(result, "content", result)
         return json.loads(content[0].text)
 
     assert _texts(asyncio.run(state_at())) == []
@@ -90,7 +90,7 @@ def test_agents_do_not_see_the_fact_of_a_quarantined_event(chronicle_sandbox, lo
 
     async def state_at() -> dict:
         result = await server.call_tool("state_at", {"timestamp": T.isoformat(), "mode": "as_of"})
-        content = result[0] if isinstance(result, tuple) else result
+        content = result[0] if isinstance(result, tuple) else getattr(result, "content", result)
         return json.loads(content[0].text)
 
     assert asyncio.run(state_at())["facts"] == []

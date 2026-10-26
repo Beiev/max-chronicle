@@ -20,8 +20,8 @@ import anyio
 import anyio.to_thread
 import re
 from anyio.lowlevel import RunVar
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -190,6 +190,9 @@ _PROCESS_STARTED_AT = time.time()
 # another program) has none of them and behaves as before.
 _RUNTIME: dict[str, Any] = {"loop": None, "embedder": None, "dump_signal": None, "last_write": None}
 STACK_DUMP_SIGNAL = "SIGUSR1"
+# A pre-2026 client's session with nothing in flight for this long is closed;
+# the client starts a new one on its next request. SDK 1.x never closed them.
+SESSION_IDLE_TIMEOUT_S = 1800
 
 # Writers get a single slot (SQLite is single-writer anyway, and queueing here
 # beats surfacing `database is locked` to agents); readers get 8 so a slow read
@@ -212,13 +215,20 @@ def _get_limiter(kind: str) -> anyio.CapacityLimiter:
 
 
 def _gate_session(ctx: Context | None) -> Any | None:
-    """Return the live session object for gate keying, or None outside a request."""
+    """The object that lasts as long as the client's connection, or None outside a request.
+
+    SDK 2 hands every request a fresh session proxy; the connection behind it
+    is what lasts for a pre-2026 client's session. A 2026-07-28 request has no
+    session at all, so its identity is per call: the `agent` it names, or the
+    client's own name.
+    """
     if ctx is None:
         return None
     try:
-        return ctx.session
+        session = ctx.session
     except Exception:
         return None
+    return getattr(session, "_connection", session)
 
 
 def _envelope_error(
@@ -328,10 +338,10 @@ def _offload_read(fn):
 
 
 def _client_name(ctx: Context | None) -> str | None:
-    """The name the MCP client gave in its initialize request, if any."""
+    """The name the MCP client gave: in its initialize request, or in a 2026 request's _meta."""
     session = _gate_session(ctx)
     try:
-        name = session.client_params.clientInfo.name
+        name = session.client_params.client_info.name
     except AttributeError:
         return None
     return name if isinstance(name, str) and name.strip() else None
@@ -364,7 +374,7 @@ def _audit_summary(audit: dict | None) -> dict | None:
     return {key: audit[key] for key in ("status", "issue_count", "warnings", "issues") if key in audit}
 
 
-def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER_PROFILE) -> FastMCP:
+def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER_PROFILE) -> MCPServer:
     if profile not in MCP_PROFILES:
         raise ValueError(f"Unsupported MCP profile: {profile}")
     resolved_manifest_path = manifest_path or default_manifest_path()
@@ -436,7 +446,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             return None
         return {"notice": "startup_not_read", "hint": STARTUP_NOTICE_HINT}
 
-    server = FastMCP(
+    server = MCPServer(
         name={CHRONICLER_PROFILE: "Max Chronicle", ADMIN_PROFILE: "Max Chronicle Admin"}.get(
             profile, "Max Chronicle Read Only"),
         instructions=(
@@ -483,9 +493,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                 return fn
             read_only = writes is False
             annotations = ToolAnnotations(
-                readOnlyHint=read_only,
-                destructiveHint=None if read_only else destructive,
-                openWorldHint=open_world,
+                read_only_hint=read_only,
+                destructive_hint=None if read_only else destructive,
+                open_world_hint=open_world,
             )
             tool_kwargs: dict[str, Any] = {"name": name, "description": description, "annotations": annotations}
             if structured_output is not None:
@@ -1232,15 +1242,26 @@ def _configure_logging() -> None:
             fmt=f'{utc} %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s', datefmt=datefmt)
 
 
-def _serve(server: FastMCP, transport: str) -> None:
-    """Run the server; over HTTP with the loop monitor and its stall watcher."""
+def _serve(server: MCPServer, transport: str, http_options: dict[str, Any] | None = None) -> None:
+    """Run the server; over HTTP with the loop monitor and its stall watcher.
+
+    Streamable HTTP serves both protocol eras on one endpoint: a 2026-07-28
+    request is answered on its own, with no session to lose on a restart; an
+    older client gets the initialize handshake and a session, closed after
+    SESSION_IDLE_TIMEOUT_S without traffic instead of kept forever.
+    """
     if transport == "stdio":
         server.run(transport="stdio")
         return
     monitor = LoopMonitor(c_timer=True)
     _RUNTIME["loop"] = monitor
     monitor.start_watcher()
-    run = server.run_streamable_http_async if transport == "streamable-http" else server.run_sse_async
+    options = dict(http_options or {})
+    if transport == "streamable-http":
+        options.setdefault("session_idle_timeout", SESSION_IDLE_TIMEOUT_S)
+        run = functools.partial(server.run_streamable_http_async, **options)
+    else:
+        run = functools.partial(server.run_sse_async, **options)
 
     async def serve() -> None:
         async with anyio.create_task_group() as group:
@@ -1333,6 +1354,7 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         )
     server = build_server(manifest_path, profile=args.profile)
     endpoint = args.transport
+    http_options: dict[str, Any] = {}
     if args.transport in ("sse", "streamable-http"):
         host = os.environ.get("MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("MCP_PORT", "8000"))
@@ -1349,9 +1371,11 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         allowed_hosts.extend(
             item.strip() for item in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if item.strip()
         )
-        server.settings.host = host
-        server.settings.port = port
-        server.settings.transport_security = TransportSecuritySettings(allowed_hosts=allowed_hosts)
+        http_options = {
+            "host": host,
+            "port": port,
+            "transport_security": TransportSecuritySettings(allowed_hosts=allowed_hosts),
+        }
         endpoint = f"{args.transport} {host}:{port}"
     # Startup banner: with no banner and WARNING-level logs, restarts were
     # invisible — an empty err.log looked like health when it proved nothing.
@@ -1371,7 +1395,7 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         _start_notes_sync(manifest_path)
         if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
             _start_embedder(manifest_path)
-    _serve(server, args.transport)
+    _serve(server, args.transport, http_options)
     return 0
 
 

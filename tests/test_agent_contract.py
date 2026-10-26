@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 from max_chronicle.mcp_server import _gate_session, build_server
 from max_chronicle.runtime_context import load_manifest, search_mem0_dump
 from max_chronicle.service import (
@@ -76,6 +76,7 @@ def _assert_startup_required(error: BaseException, tool_name: str, *, domain: st
 
 
 def _decode_mcp_json(result: Any) -> Any:
+    result = getattr(result, "content", result)  # SDK 2: a CallToolResult
     if isinstance(result, tuple):
         return _decode_mcp_json(result[0])
     if isinstance(result, list) and result and hasattr(result[0], "text"):
@@ -325,13 +326,13 @@ def test_mcp_tool_input_schemas_include_param_descriptions_and_query_mode_enum(c
     async def collect() -> dict[str, dict[str, Any]]:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="chronicler")
         tools = await server.list_tools()
-        return {item.name: item.inputSchema for item in tools}
+        return {item.name: item.input_schema for item in tools}
 
     schemas = asyncio.run(collect())
 
     async def collect_admin() -> dict[str, dict[str, Any]]:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
-        return {item.name: item.inputSchema for item in await server.list_tools()}
+        return {item.name: item.input_schema for item in await server.list_tools()}
 
     admin_schemas = asyncio.run(collect_admin())
 
@@ -1744,7 +1745,7 @@ def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sand
         return {item.name: item for item in await server.list_tools()}
 
     tools = asyncio.run(collect())
-    hints = {name: (tool.annotations.readOnlyHint, tool.annotations.destructiveHint, tool.annotations.openWorldHint)
+    hints = {name: (tool.annotations.read_only_hint, tool.annotations.destructive_hint, tool.annotations.open_world_hint)
              for name, tool in tools.items()}
 
     assert hints["query_memory"] == (True, None, False)
@@ -1752,9 +1753,9 @@ def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sand
     assert hints["startup_bundle"] == (False, False, False)  # capture=true writes a snapshot
     assert hints["entity_admin"] == (False, True, False)
     assert hints.get("search_mem0_live", (True, None, True)) == (True, None, True)
-    recall_query = tools["query_memory"].inputSchema["properties"]["query"]["description"]
+    recall_query = tools["query_memory"].input_schema["properties"]["query"]["description"]
     assert "Mem0" not in recall_query and "status" not in recall_query
-    window = tools["state_at"].inputSchema["properties"]["window_hours"]
+    window = tools["state_at"].input_schema["properties"]["window_hours"]
     assert (window["minimum"], window["maximum"]) == (1, 720)
 
 

@@ -311,7 +311,7 @@ def test_startup_in_brief_mode_returns_the_brief_and_unlocks_writes(chronicle_sa
         server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
         started = await server.call_tool("startup_bundle", {"agent": "agent-a", "mode": "brief", "project": "alpha"})
         written = await server.call_tool("record_event", {"agent": "agent-a", "text": "Recorded after a brief start"})
-        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else result)[0].text)
+        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else getattr(result, "content", result))[0].text)
         return decode(started), decode(written)
 
     started, written = asyncio.run(exercise())
@@ -326,7 +326,7 @@ def test_a_brief_start_binds_the_agent_like_a_full_start(chronicle_sandbox) -> N
         server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
         started = await server.call_tool("startup_bundle", {"agent": "agent-a", "mode": "brief"})
         written = await server.call_tool("record_event", {"text": "Recorded without naming the agent"})
-        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else result)[0].text)
+        decode = lambda result: json.loads((result[0] if isinstance(result, tuple) else getattr(result, "content", result))[0].text)
         return decode(started), decode(written)
 
     started, written = asyncio.run(exercise())

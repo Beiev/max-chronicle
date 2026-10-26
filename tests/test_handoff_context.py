@@ -207,7 +207,7 @@ def test_the_recent_events_tool_honours_quarantine(chronicle_sandbox, loaded_man
     async def recent() -> list:
         server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
         result = await server.call_tool("recent_events", {"domain": "global", "limit": 10})
-        content = result[0] if isinstance(result, tuple) else result
+        content = result[0] if isinstance(result, tuple) else getattr(result, "content", result)
         items = [json.loads(item.text) for item in content]  # one text block per listed event
         return items[0] if len(items) == 1 and isinstance(items[0], list) else items
 

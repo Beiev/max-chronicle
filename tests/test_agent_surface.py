@@ -14,6 +14,7 @@ from max_chronicle.mcp_server import build_server
 
 
 def _decode(result: Any) -> Any:
+    result = getattr(result, "content", result)  # SDK 2: a CallToolResult
     if isinstance(result, tuple):
         return _decode(result[0])
     if isinstance(result, list) and result and hasattr(result[0], "text"):
