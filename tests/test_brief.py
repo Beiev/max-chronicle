@@ -103,6 +103,19 @@ def test_a_project_brief_lists_its_facts_first_and_caps_global_ones(loaded_manif
     assert len(facts) == 1 + BRIEF_GLOBAL_FACTS
 
 
+def test_the_unscoped_brief_shows_a_new_global_rule_before_old_project_facts(loaded_manifest) -> None:
+    from max_chronicle.brief import BRIEF_FACTS
+
+    for index in range(BRIEF_FACTS):
+        _record(loaded_manifest, f"Alpha rule {index}", days_ago=5, project="alpha",
+                fact={"slot": f"alpha.rule{index}", "value": f"a{index}", "kind": "decision"})
+    _record(loaded_manifest, "Global rule", days_ago=0.01, fact={"slot": "global.rule", "value": "g", "kind": "decision"})
+
+    text = _brief(loaded_manifest)["text"]
+
+    assert "- global.rule = g" in text
+
+
 def test_warnings_cover_a_stale_capture_and_recent_job_failures_only(loaded_manifest) -> None:
     config = config_from_manifest(loaded_manifest)
     with open_connection(config) as connection, connection:
@@ -306,7 +319,7 @@ def test_the_brief_route_validates_the_budget_and_serves_json(chronicle_sandbox)
     assert as_json.json()["project"] == "alpha" and as_json.json()["text"].startswith(FRAMING)
 
 
-def test_startup_in_brief_mode_returns_the_brief_and_unlocks_writes(chronicle_sandbox) -> None:
+def test_startup_in_brief_mode_returns_the_brief_and_writes_go_through(chronicle_sandbox) -> None:
     async def exercise() -> tuple[dict, dict]:
         server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
         started = await server.call_tool("startup_bundle", {"agent": "agent-a", "mode": "brief", "project": "alpha"})

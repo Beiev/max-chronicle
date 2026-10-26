@@ -123,6 +123,9 @@ def _facts(connection: sqlite3.Connection, identities: Registry, project: str | 
         domain="f.domain", project="json_extract(f.attributes_json,'$.project')",
         task="json_extract(f.attributes_json,'$.task_id')", project_or_unset=True,
     )
+    # A project's own facts come first; the unscoped brief is newest first, or
+    # ten old project facts would hide a global rule recorded a minute ago.
+    project_first = "(json_extract(f.attributes_json,'$.project') IS NULL), " if project else ""
     rows = connection.execute(
         """SELECT f.id, f.slot_key, f.value_key, json_extract(f.attributes_json,'$.project') AS project,
                   json_extract(f.attributes_json,'$.task_id') AS task_id, json_extract(f.attributes_json,'$.kind') AS kind
@@ -130,7 +133,7 @@ def _facts(connection: sqlite3.Connection, identities: Registry, project: str | 
         WHERE COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
           AND f.slot_key != 'task.status'
           AND """ + where + """
-        ORDER BY (json_extract(f.attributes_json,'$.project') IS NULL), f.recorded_at_utc DESC, f.id LIMIT ?""",
+        ORDER BY """ + project_first + """f.recorded_at_utc DESC, f.id LIMIT ?""",
         (*params, BRIEF_FACTS + BRIEF_GLOBAL_FACTS),
     ).fetchall()
     facts = [dict(row) | {"project": identities.project(row["project"])} for row in rows]

@@ -4,17 +4,19 @@ Recall used to return every hit in full, with provenance, so a dozen hits
 cost an agent thousands of tokens it mostly did not read. ``index_view``
 turns a recall response into one line per hit — id, when, where, who, a
 gist of the text, how it matched — and ``get_items`` returns the full
-records for the ids an agent picks. Ids carry their kind: ``event:<id>`` and
-``note:<id>``; a bare id is an event.
+records for the ids an agent picks. Ids carry their kind: ``event:<id>``,
+``note:<id>`` and ``fact:<id>`` (a brief prints fact ids); a bare id is an
+event, or else a fact.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .memory import event_provenance
 from .notes import read_note
-from .store import config_from_manifest, fetch_event
+from .store import config_from_manifest, fetch_event, open_connection
 
 GIST_CHARS = 280
 WHY_GIST_CHARS = 160
@@ -87,6 +89,11 @@ def index_view(response: dict[str, Any]) -> dict[str, Any]:
         view[key] = bool(response.get(key))
     if response.get("channel_errors"):
         view["channel_errors"] = response["channel_errors"]
+    coverage = response.get("vector_coverage") or {}
+    if coverage.get("missing_or_incompatible"):
+        # Not degraded, but meaning-search saw only part of the memory (a backfill
+        # under way, a model change half re-embedded).
+        view["vector_coverage"] = {key: coverage.get(key) for key in ("eligible", "missing_or_incompatible")}
     if response.get("hint"):
         view["hint"] = response["hint"]
     if view["results"] or view.get("notes"):
@@ -94,31 +101,68 @@ def index_view(response: dict[str, Any]) -> dict[str, Any]:
     return view
 
 
+def _visible_event(config, event_id: str) -> dict[str, Any] | None:
+    event = fetch_event(config, event_id=event_id)
+    if event is None or (event.get("memory_guard") or {}).get("visibility") == "raw_only":
+        return None  # quarantined events stay out of agents' reach
+    return event
+
+
+def _event_item(config, event_id: str) -> dict[str, Any] | None:
+    event = _visible_event(config, event_id)
+    if event is None:
+        return None
+    return {**event, "id": f"event:{event_id}", "kind": "event", "provenance": event_provenance(config, event_id)}
+
+
+def _fact_item(config, fact_id: str) -> dict[str, Any] | None:
+    """A fact with the event that asserted it; a fact whose event is hidden is hidden too."""
+    with open_connection(config) as connection:
+        row = connection.execute(
+            """SELECT id, slot_key, value_key, fact_text, status, recorded_at_utc, expired_at_utc,
+                      attributed_to, attributes_json
+            FROM facts WHERE id = ?""", (fact_id,)).fetchone()
+    if row is None:
+        return None
+    attributes = json.loads(row["attributes_json"] or "{}")
+    event_id = attributes.get("event_id")
+    event = _visible_event(config, event_id) if event_id else None
+    if event is None:
+        return None
+    return {
+        "id": f"fact:{fact_id}", "kind": "fact", "slot": row["slot_key"], "value": row["value_key"],
+        "text": row["fact_text"], "agent": row["attributed_to"], "recorded_at_utc": row["recorded_at_utc"],
+        "current": row["status"] == "active" and row["expired_at_utc"] is None,
+        "attributes": attributes, "event": {**event, "id": f"event:{event_id}"},
+    }
+
+
 def get_items(manifest: dict[str, Any], ids: list[str]) -> dict[str, Any]:
-    """Full records for recall ids, in the order asked; unknown ids are listed apart."""
+    """Full records for recall ids, in the order asked, each once; ids that name nothing are listed apart."""
     if not ids:
-        raise ValueError("ids must name at least one event: or note: id")
+        raise ValueError("ids must name at least one event:, note: or fact: id")
     if len(ids) > MAX_GET_IDS:
         raise ValueError(f"at most {MAX_GET_IDS} ids per call")
     config = config_from_manifest(manifest)
     items: list[dict[str, Any]] = []
     missing: list[str] = []
+    seen: set[str] = set()
     for raw in ids:
-        kind, _, identifier = raw.partition(":") if ":" in raw else ("event", "", raw)
-        identifier = identifier.strip()
-        if kind == "note":
+        kind, separator, identifier = raw.strip().partition(":")
+        kind, identifier = (kind.strip().lower(), identifier.strip()) if separator else ("", kind.strip())
+        item = None
+        if identifier and kind == "note":
             note = read_note(manifest, identifier)
-            if note is None:
-                missing.append(raw)
-            else:
-                items.append({**note, "id": f"note:{identifier}", "kind": "note"})
-        elif kind == "event":
-            event = fetch_event(config, event_id=identifier)
-            if event is None or (event.get("memory_guard") or {}).get("visibility") == "raw_only":
-                missing.append(raw)  # quarantined events stay out of agents' reach
-            else:
-                items.append({**event, "id": f"event:{identifier}", "kind": "event",
-                              "provenance": event_provenance(config, identifier)})
-        else:
-            raise ValueError(f"unknown id kind in {raw!r}: use event:<id> or note:<id>")
+            item = {**note, "id": f"note:{identifier}", "kind": "note"} if note is not None else None
+        elif identifier and kind in ("event", ""):
+            item = _event_item(config, identifier)
+            if item is None and not kind:
+                item = _fact_item(config, identifier)
+        elif identifier and kind == "fact":
+            item = _fact_item(config, identifier)
+        if item is None:
+            missing.append(raw)
+        elif item["id"] not in seen:  # the same record under two spellings comes back once
+            seen.add(item["id"])
+            items.append(item)
     return {"items": items, "missing": missing}

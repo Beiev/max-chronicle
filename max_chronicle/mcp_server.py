@@ -123,6 +123,10 @@ CAPTURE_ARG = Annotated[
     Field(description="Capture a fresh runtime snapshot before building the bundle."),
 ]
 LIMIT_ARG = Annotated[int, Field(ge=1, le=100, description="Maximum number of recent items or hits (1–100).")]
+STARTUP_LIMIT_ARG = Annotated[int | None, Field(ge=1, le=100, description=(
+    "Maximum task changes (brief mode, default 10) or recent events (bundle mode, default 3)."))]
+BRIEF_TASK_CHANGES = 10
+BUNDLE_RECENT_EVENTS = 3
 TASK_ARG = Annotated[str | None, Field(description="Stable task ID within project. Requires project; reuse it across agents and sessions. Case, spaces and underscores do not matter.")]
 SESSION_ARG = Annotated[str | None, Field(description="Originating session ID; defaults to the current MCP session identity.")]
 REQUEST_ARG = Annotated[str | None, Field(description="Unique write request ID. Reuse unchanged on retries; changed input requires a new ID.")]
@@ -156,7 +160,7 @@ DETAIL_ARG = Annotated[
 ]
 IDS_ARG = Annotated[
     list[str],
-    Field(min_length=1, max_length=20, description="Ids from query_memory or a brief: event:<id> or note:<id> (a bare id is an event)."),
+    Field(min_length=1, max_length=20, description="Ids from query_memory or a brief: event:<id>, note:<id> or fact:<id> (a bare id is an event, or else a fact)."),
 ]
 QUERY_MODE_ARG = Annotated[
     QUERY_CONTEXT_MODE,
@@ -719,8 +723,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "adds that task's checkpoint, its current facts and the changes since `since` (save "
             "`task_context.cursor` for the next start; page back with `before`). Call it before "
             "continuing a task; writes do not require it. mode='bundle' returns the full startup "
-            "bundle instead (domain state, recent events, freshness audit). Changes nothing unless "
-            "capture=true."
+            "bundle instead (domain state, recent events, freshness audit); focus, title, capture "
+            "or compact=false ask for the bundle too. Changes nothing unless capture=true."
         ),
     )
     def tool_startup_bundle(
@@ -729,7 +733,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         title: OPTIONAL_TITLE_ARG = None,
         focus: OPTIONAL_FOCUS_ARG = None,
         capture: CAPTURE_ARG = False,
-        limit: LIMIT_ARG = 3,
+        limit: STARTUP_LIMIT_ARG = None,
         compact: COMPACT_ARG = True,
         project: PROJECT_ARG = None,
         task_id: TASK_ARG = None,
@@ -739,16 +743,20 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         ctx: Context | None = None,
     ) -> dict:
         identity = session_identity(ctx, agent)
-        if mode == "brief":
+        # A caller that names a bundle-only argument is a caller of the bundle,
+        # which was the default before the brief: it gets what it asked for.
+        if mode == "brief" and not (focus or title or capture or not compact):
             loaded = manifest()
             brief = build_brief(loaded, project=project)
             payload = {"brief": brief["text"], "project": brief["project"], "counts": brief["counts"]}
             if task_id:
                 # The brief alone used to answer a task_id: an agent believed it had
                 # resumed the task without ever seeing its checkpoint.
+                # The same domain as the bundle's, so a cursor saved from either mode
+                # resumes in both.
                 payload["task_context"] = read_task_context(
-                    loaded, domain=None, project=brief["project"] or project, task_id=task_id,
-                    since=since, before=before, limit=max(limit, 10))
+                    loaded, domain=domain, project=brief["project"] or project, task_id=task_id,
+                    since=since, before=before, limit=limit or BRIEF_TASK_CHANGES)
             payload.update(_public_identity(identity))
             note_startup(identity, brief["project"] or project)
             return payload
@@ -760,7 +768,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             title=title,
             focus=focus,
             capture=effective_capture,
-            limit=limit,
+            limit=limit or BUNDLE_RECENT_EVENTS,
             compact=compact,
             project=project,
             task_id=task_id,
@@ -869,7 +877,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         description=(
             "Full records for ids that query_memory (or a brief) returned: `event:<id>` gives the "
             "event with its why, checkpoint or fact, evidence files and provenance; `note:<id>` "
-            "gives the whole indexed note. Up to 20 ids; unknown ones come back in `missing`."
+            "gives the whole indexed note; `fact:<id>` gives a fact with the event that asserted it. "
+            "Up to 20 ids; ids that name nothing come back in `missing`."
         ),
     )
     def tool_get_memory(ids: IDS_ARG) -> dict:
@@ -890,9 +899,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         name="activate_agent",
         description=(
             "DEPRECATED alias — prefer `startup_bundle` as the single session entry point. "
-            "Kept for transition: captures current state (capture=true by default), unlocks "
-            "the chronicler write surface, and returns the activation prompt plus a digest of "
-            "runtime state. Call `startup_bundle` for the full brief."
+            "Kept for transition: captures current state (capture=true by default) and returns "
+            "the activation prompt plus a digest of runtime state. Writes need no startup. Call "
+            "`startup_bundle` for the brief."
         ),
     )
     def tool_activate_agent(
@@ -916,7 +925,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         # capture-time copies of the ledger and semantic recall (~40 KB). Handing
         # that to an agent at session start costs more context than the session
         # has to spend, and it is the entry point older agents still call by this
-        # name. What this tool is actually for is the prompt and the unlock; the
+        # name. What this tool is actually for is the prompt; the
         # documents are served by `startup_bundle`, `query_context` and the
         # resources. The CLI keeps the unabridged payload.
         snapshot = activation.get("snapshot") or {}

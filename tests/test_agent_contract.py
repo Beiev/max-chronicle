@@ -460,7 +460,7 @@ def test_mcp_chronicler_entity_admin_validates_action_params(chronicle_sandbox) 
     assert "source_entity_id" in merge_missing["hint"]
 
 
-def test_mcp_chronicler_activate_agent_unlocks_mutating_surface(chronicle_sandbox, loaded_manifest) -> None:
+def test_mcp_chronicler_activate_agent_then_writes(chronicle_sandbox, loaded_manifest) -> None:
     async def exercise() -> str:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")
         activation = await server.call_tool(
@@ -1665,7 +1665,7 @@ def test_mcp_activate_agent_does_not_return_the_full_document_bundle(
         assert bulk_key not in payload["snapshot"]
 
 
-def test_mcp_activate_agent_still_unlocks_and_still_carries_runtime_state(
+def test_mcp_activate_agent_still_writes_and_still_carries_runtime_state(
     chronicle_sandbox, loaded_manifest
 ) -> None:
     """Trimming the payload must not cost the caller what the tool is for."""
