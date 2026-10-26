@@ -198,6 +198,27 @@ calls `startup_bundle(project=...)`, whose default mode is this brief, or reads 
 resource `chronicle://brief/{project}`. A project's brief shows its own decisions
 only, and its own facts before at most four facts recorded without a project.
 
+### Web view
+
+The HTTP server also serves a read-only view of the memory for people, at
+`http://127.0.0.1:8093/ui`:
+- `/ui`: process health (event-loop lag, last write, unindexed events, last
+  scheduled runs), the last good backup, warnings, open tasks, projects active in
+  the last 30 days, the latest events;
+- `/ui/project/{project}`: its open tasks, current facts and latest events;
+- `/ui/task/{project}/{task_id}`: the latest checkpoint, earlier ones, the task's
+  facts and events;
+- `/ui/facts`: every current fact; `/ui/facts?slot=X`: every value that slot had,
+  newest first, with what replaced it;
+- `/ui/search?q=...&project=...`: recall, with how each hit matched;
+- `/ui/event/{id}`, `/ui/note/{id}`: one record with its evidence and who recorded it.
+
+Pages are rendered on the server with no script. Everything shown is escaped
+text, and a Content-Security-Policy forbids scripts, frames and outside
+requests. Only this machine is answered: the `Host` must be a loopback name, an
+`Origin` must be the server's own, and a cross-site `Sec-Fetch-Site` is refused.
+Quarantined events never appear.
+
 ### One name per project, domain and agent
 
 One project often gets written several ways (`status`, `chronicle`,
@@ -406,6 +427,22 @@ index reads (FR-10).
   months that have one (`[backup_retention]` in the automation config:
   `daily`, `weekly`, `monthly`). Each backup reports what the policy would remove;
   removal happens only with `prune = true` or `chronicle backup-prune --apply`.
+  A backup the disk prevented (not mounted, full, read-only) is `deferred` and
+  retried the same day.
+- **Scheduled jobs:** with `[scheduler] enabled = true` in the automation config,
+  the HTTP server runs daily capture, daybook, weekly audit and backup itself,
+  each as its own process, one at a time, and `chronicle launchd install` installs
+  no job agents (launchd keeps only the server); job agents an earlier install left
+  are unloaded (with `--load`) and moved to `retired-job-agents/` in the launchd
+  runtime directory. A job's due moment is computed in
+  the installation's timezone, and its run is keyed by that moment (its date, or
+  for the weekly audit its ISO week): a run delayed past midnight fills the day it
+  was due, never the next. A failed run is retried after 30 minutes, up to six
+  times; a deferred one (the backup disk not mounted) every 30 minutes until it
+  runs; one still marked running after six hours is started again;
+  one due more than three days ago is skipped. `/health` shows
+  the last runs under `scheduler`. `chronicle automation run --job X --occurrence
+  ISO` runs a job as the occurrence it names.
 
 ### Measuring recall
 

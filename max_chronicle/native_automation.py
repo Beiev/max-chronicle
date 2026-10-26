@@ -77,7 +77,13 @@ def launchd_labels(automation) -> dict[str, str]:
 
 
 def _installed_jobs(manifest: dict[str, Any], automation) -> dict[str, str]:
-    """The launchd jobs this installation runs: without Mem0, no Mem0 dump."""
+    """The launchd jobs this installation runs: without Mem0, no Mem0 dump.
+
+    None when the server's scheduler runs the jobs ([scheduler] enabled):
+    launchd then keeps only the server alive.
+    """
+    if getattr(automation, "scheduler_enabled", False):
+        return {}
     labels = launchd_labels(automation)
     if not mem0_enabled(manifest):
         labels.pop("mem0_dump", None)
@@ -2314,10 +2320,14 @@ def run_audit(
     trigger_source: str = "manual",
     force: bool = False,
     persist: bool = True,
+    occurrence: datetime | None = None,
 ) -> dict[str, Any]:
     config = config_from_manifest(manifest)
     local_now = _local_now(config)
-    base_run_key = local_now.strftime("%G-W%V") if weekly else local_now.strftime("%Y-%m-%d")
+    # A Monday catch-up of Sunday's audit keys Sunday's week, or next Sunday's
+    # audit would find its week taken and do nothing.
+    keyed = occurrence.astimezone(local_now.tzinfo) if occurrence is not None else local_now
+    base_run_key = keyed.strftime("%G-W%V") if weekly else keyed.strftime("%Y-%m-%d")
     run_key = base_run_key if not force else f"{base_run_key}:force:{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
     curation_type = "weekly_audit" if weekly else "daily_audit"
 
@@ -2479,11 +2489,19 @@ def run_automation_job(
     *,
     job_name: str,
     trigger_source: str = "manual",
+    occurrence: datetime | None = None,
 ) -> dict[str, Any]:
+    """Run one job; with *occurrence*, as the run that was due at that moment.
+
+    The scheduler passes the occurrence: the run key then names the slot the
+    run was due for (its local date, its ISO week), so a late run fills that
+    slot instead of taking the next one.
+    """
     config = config_from_manifest(manifest)
     local_now = _local_now(config)
+    keyed = occurrence.astimezone(local_now.tzinfo) if occurrence is not None else local_now
     ttl_hours = _stale_run_ttl_hours(automation)
-    daily_key = local_now.strftime("%Y-%m-%d")
+    daily_key = keyed.strftime("%Y-%m-%d")
 
     def _dispatch(run_key: str, body: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
         return _run_with_automation_bookkeeping(
@@ -2553,7 +2571,8 @@ def run_automation_job(
         # no-op. Which days need a daybook is decided per day, from events.
         # Microseconds and the UTC offset keep keys unique across quick
         # repeats and the DST fall-back hour.
-        return _dispatch(local_now.isoformat(timespec="microseconds"), _daybook)
+        return _dispatch(daily_key if occurrence is not None else local_now.isoformat(timespec="microseconds"),
+                         _daybook)
 
     if job_name == "mem0-dump":
         def _mem0_dump(run_id: str) -> dict[str, Any]:
@@ -2576,7 +2595,8 @@ def run_automation_job(
 
     if job_name == "weekly-audit":
         def _weekly_audit(run_id: str) -> dict[str, Any]:
-            result = run_audit(manifest, automation, weekly=True, trigger_source=trigger_source)
+            result = run_audit(manifest, automation, weekly=True, trigger_source=trigger_source,
+                               occurrence=keyed if occurrence is not None else None)
             finish_automation_run(
                 config,
                 run_id=run_id,
@@ -2586,7 +2606,7 @@ def run_automation_job(
             )
             return result | {"run_id": run_id}
 
-        return _dispatch(local_now.strftime("%G-W%V"), _weekly_audit)
+        return _dispatch(keyed.strftime("%G-W%V"), _weekly_audit)
 
     if job_name == "backup":
         def _backup(run_id: str) -> dict[str, Any]:
@@ -2708,6 +2728,8 @@ def install_launchd(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     installed: list[dict[str, Any]] = []
+    retired = _retire_job_agents(automation, agent_dir, runtime_dir, unload=load_jobs) \
+        if getattr(automation, "scheduler_enabled", False) else []
     for key, label in _installed_jobs(manifest, automation).items():
         wrapper_path = runtime_dir / f"{key}.sh"
         _write_executable_script(wrapper_path, _launchd_wrapper(manifest, automation, key.replace("_", "-")))
@@ -2765,8 +2787,33 @@ def install_launchd(
         "runtime_dir": str(runtime_dir),
         "log_dir": str(log_dir),
         "installed": installed,
+        "retired": retired,
         "loaded": load_jobs,
     }
+
+
+def _retire_job_agents(automation: AutomationConfig, agent_dir: Path, runtime_dir: Path, *,
+                       unload: bool) -> list[str]:
+    """Unload the job agents an earlier install left and move their plists aside.
+
+    With the server's scheduler on they would fire alongside it, and a run
+    launchd starts has no occurrence, so its key never meets the scheduler's.
+    """
+    retired_dir = runtime_dir / "retired-job-agents"
+    retired: list[str] = []
+    for label in launchd_labels(automation).values():
+        if unload:
+            # By label: an agent whose plist an earlier run moved aside without
+            # unloading it is still loaded and still fires.
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], check=False,
+                           capture_output=True, text=True, timeout=_subprocess_timeout_seconds(automation))
+        plist_path = agent_dir / f"{label}.plist"
+        if not plist_path.exists():
+            continue
+        retired_dir.mkdir(parents=True, exist_ok=True)
+        plist_path.replace(retired_dir / plist_path.name)
+        retired.append(label)
+    return retired
 
 
 def _probe_command(args: list[str], *, timeout_seconds: float):
