@@ -57,6 +57,7 @@ class LoopMonitor:
         stall_s: float = STALL_DUMP_S,
         stream: TextIO | None = None,
         clock: Callable[[], float] = time.monotonic,
+        c_timer: bool = False,
     ) -> None:
         self.tick_s = tick_s
         self.warn_s = warn_s
@@ -69,7 +70,10 @@ class LoopMonitor:
         self._samples: deque[tuple[float, float]] = deque()
         self._stalls = 0
         self._stall_dumped = False
-        self._c_timer = False  # faulthandler's own thread dumps a stall, GIL or not
+        # faulthandler's own thread dumps a stall, GIL or not. Opt-in: the timer
+        # is one per process and arming it replaces anyone else's.
+        self._use_c_timer = c_timer
+        self._c_timer = False
 
     async def run(self) -> None:
         """Tick forever on the loop it runs on; cancel it to stop."""
@@ -85,6 +89,8 @@ class LoopMonitor:
                 faulthandler.cancel_dump_traceback_later()
 
     def _arm_c_timer(self) -> None:
+        if not self._use_c_timer:
+            return
         """(Re)start faulthandler's timer: it fires only if the next tick is stall_s late.
 
         It runs in a C thread, so it dumps even while a C extension holds the
@@ -95,6 +101,8 @@ class LoopMonitor:
             faulthandler.dump_traceback_later(self.stall_s, repeat=False, file=self._stream or sys.stderr)
             self._c_timer = True
         except (AttributeError, OSError, RuntimeError, ValueError):
+            # The failed call did not cancel the timer armed before it.
+            faulthandler.cancel_dump_traceback_later()
             self._c_timer = False
 
     def tick(self, lag: float) -> None:

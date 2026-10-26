@@ -2586,7 +2586,7 @@ def start_automation_run(
                         reason="stale_failed row retired before new run",
                         move_run_key=True,
                     )
-                elif retry_failed and existing["status"] in {"failed", "failed_soft"}:
+                elif retry_failed and existing["status"] in {"failed", "failed_soft", "deferred"}:
                     retry_details = {
                         "retry": {
                             "previous_status": existing["status"],

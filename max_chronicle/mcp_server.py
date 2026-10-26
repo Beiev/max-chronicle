@@ -1191,7 +1191,7 @@ def _serve(server: FastMCP, transport: str) -> None:
     if transport == "stdio":
         server.run(transport="stdio")
         return
-    monitor = LoopMonitor()
+    monitor = LoopMonitor(c_timer=True)
     _RUNTIME["loop"] = monitor
     monitor.start_watcher()
     run = server.run_streamable_http_async if transport == "streamable-http" else server.run_sse_async

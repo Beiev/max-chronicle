@@ -65,7 +65,9 @@ def _good(manifest_path: Path) -> bool | None:
         return None
     if not isinstance(manifest, dict):
         return None
-    restore = manifest.get("restore_check") or {}
+    restore = manifest.get("restore_check", {})
+    if not isinstance(restore, dict) or not isinstance(restore.get("ok", True), bool):
+        return None  # a shape this package never writes
     if manifest.get("status") not in (None, "ok") or restore.get("ok") is False:
         return False
     return True
@@ -122,7 +124,8 @@ def plan_retention(
     backup a run just wrote).
     """
     good = [backup for backup in backups if backup.good]
-    keep: set[Path] = {Path(path) for path in protect}
+    protected = {Path(path).resolve() for path in protect}
+    keep: set[Path] = {backup.path for backup in good if backup.path.resolve() in protected}
     if good:
         keep.add(good[0].path)
     keep |= _newest_per_period(good, lambda moment: moment.date(), policy.daily)

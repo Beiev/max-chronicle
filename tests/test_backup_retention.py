@@ -161,3 +161,12 @@ def test_a_protected_backup_is_never_removed(tmp_path) -> None:
                               apply=True, protect=(paths[0],))
 
     assert paths[0].exists() and paths[-1].exists() and report["result"]["removed"] == len(paths) - 2
+
+
+
+@pytest.mark.parametrize("restore", ["corrupt", [1], {"ok": "yes"}])
+def test_a_manifest_of_a_shape_never_written_is_unreadable(tmp_path, restore) -> None:
+    path = _backup(tmp_path, datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc))
+    _manifest(path, {"status": "ok", "restore_check": restore})
+
+    assert find_backups(tmp_path)[0].good is None

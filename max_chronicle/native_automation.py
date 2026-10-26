@@ -1368,6 +1368,10 @@ def _rotate_jsonl_if_needed(path: Path, *, cap_bytes: int) -> dict[str, Any]:
     }
 
 
+BACKUP_INTERVAL_SLACK = timedelta(hours=1)
+BACKUP_DEFERRED_REASONS = frozenset({
+    "backup_target_not_mounted", "target_unmounted", "insufficient_space", "target_unwritable",
+})
 VACUUM_MIN_FREE_RATIO = 0.2  # share of free pages that makes a full VACUUM worth its lock
 
 
@@ -1820,7 +1824,10 @@ def run_backup(
     latest = fetch_latest_backup_run(config, successful_only=True)
     if latest and not force:
         last_dt = datetime.fromisoformat(latest["started_at_utc"].replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) - last_dt < timedelta(days=automation.guards.backup_interval_days):
+        # An hour of slack: a run at 04:30 two days after one that started at
+        # 04:30:01 is not early, and skipping it stretched the interval to three days.
+        interval = timedelta(days=automation.guards.backup_interval_days) - BACKUP_INTERVAL_SLACK
+        if datetime.now(timezone.utc) - last_dt < interval:
             return {
                 "status": "skipped",
                 "reason": "interval_guard",
@@ -2584,10 +2591,16 @@ def run_automation_job(
     if job_name == "backup":
         def _backup(run_id: str) -> dict[str, Any]:
             result = run_backup(manifest, automation, trigger_source=trigger_source)
+            # A skip the disk caused (not plugged in, full, read-only) leaves the
+            # day's backup to do: the run is deferred, and the next launch of the
+            # day (the disk's mount, a catch-up) retries it under the same key.
+            status = "deferred" if result.get("status") == "skipped" and result.get("reason") in BACKUP_DEFERRED_REASONS \
+                else result["status"]
+            result = result | {"status": status} if status == "deferred" else result
             finish_automation_run(
                 config,
                 run_id=run_id,
-                status=result["status"],
+                status=status,
                 details=result,
                 snapshot_id=result.get("snapshot_id"),
             )

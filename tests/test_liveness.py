@@ -158,7 +158,7 @@ def test_a_blocked_loop_is_dumped_by_the_c_timer_even_while_the_gil_is_held(tmp_
     import time
 
     dump = (tmp_path / "stacks.txt").open("w+")
-    monitor = LoopMonitor(tick_s=0.05, stall_s=0.3, stream=dump)
+    monitor = LoopMonitor(tick_s=0.05, stall_s=0.3, stream=dump, c_timer=True)
 
     async def main() -> None:
         async with anyio.create_task_group() as group:
@@ -172,3 +172,45 @@ def test_a_blocked_loop_is_dumped_by_the_c_timer_even_while_the_gil_is_held(tmp_
 
     dump.seek(0)
     assert "test_a_blocked_loop_is_dumped_by_the_c_timer" in dump.read()
+
+
+def test_the_c_timer_is_opt_in_and_leaves_other_timers_alone(tmp_path) -> None:
+    """faulthandler keeps one timer per process; a monitor without c_timer never touches it."""
+    import faulthandler
+    import time
+
+    other = (tmp_path / "other.txt").open("w+")
+    faulthandler.dump_traceback_later(0.6, repeat=False, file=other)
+    monitor = LoopMonitor(tick_s=0.05, stream=(tmp_path / "s.txt").open("w"))
+
+    async def main() -> None:
+        async with anyio.create_task_group() as group:
+            group.start_soon(monitor.run)
+            await anyio.sleep(0.15)
+            group.cancel_scope.cancel()
+
+    try:
+        anyio.run(main)
+        time.sleep(0.8)
+        other.seek(0)
+        assert "Timeout" in other.read()  # the other timer still fired
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def test_a_failed_arm_cancels_the_timer_armed_before_it(tmp_path, monkeypatch) -> None:
+    import faulthandler
+    import io
+    import time
+
+    stream = (tmp_path / "s.txt").open("w+")
+    monitor = LoopMonitor(stall_s=0.4, stream=stream, c_timer=True)
+    monitor._arm_c_timer()
+    monitor._stream = io.StringIO()  # no file descriptor: the next arm fails
+
+    monitor._arm_c_timer()
+    time.sleep(0.6)
+
+    stream.seek(0)
+    assert stream.read() == "" and monitor._c_timer is False
+    faulthandler.cancel_dump_traceback_later()

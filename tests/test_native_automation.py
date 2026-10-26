@@ -1571,3 +1571,20 @@ def test_embed_backfill_reports_the_whole_backlog_not_the_batch(loaded_manifest,
     report = service_module.embed_backfill(loaded_manifest, limit=2)
 
     assert (report["embedded"], report["total_without_embedding"]) == (2, 5)
+
+
+
+def test_a_backup_skipped_for_a_missing_disk_is_deferred_and_retried_the_same_day(
+    chronicle_sandbox, loaded_manifest, loaded_automation
+) -> None:
+    """Round-2 review: the skip took the day's key, so plugging the disk in later backed up nothing."""
+    import shutil
+
+    shutil.rmtree(chronicle_sandbox.backup_root, ignore_errors=True)
+
+    first = run_automation_job(loaded_manifest, loaded_automation, job_name="backup", trigger_source="pytest")
+    chronicle_sandbox.backup_root.mkdir(parents=True)
+    second = run_automation_job(loaded_manifest, loaded_automation, job_name="backup", trigger_source="pytest")
+
+    assert first["status"] == "deferred"
+    assert second["status"] == "ok"

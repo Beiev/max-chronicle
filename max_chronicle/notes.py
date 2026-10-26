@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 from typing import Any
 
 from . import embeddings
@@ -534,6 +535,8 @@ def _shown(path: Path | str) -> str:
 
 
 NOTES_WRITE_BATCH = 100  # notes per write transaction
+MERGE_EVERY_S = 24 * 3600  # an unchanged index still gets a full-text merge this often
+_last_merge: dict[str, float] = {}  # database path -> monotonic time of its last merge
 
 
 def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int | None = None) -> dict[str, Any]:
@@ -616,6 +619,17 @@ def sync_notes(manifest: dict[str, Any], *, embed: bool = True, embed_limit: int
                 report["removed"] += 1
             # Deleted rows stay in older full-text segments until they merge.
             connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
+    merged = bool(batches or gone)
+    if not merged and time.monotonic() - _last_merge.get(str(config.db_path), float("-inf")) > MERGE_EVERY_S:
+        # A merge that rolled back with a failed batch whose change then went
+        # away (the note was deleted again) would never run: one a day, cheap
+        # on an index already merged, purges whatever it left.
+        with write_transaction(config) as connection:
+            connection.execute("PRAGMA secure_delete = ON")
+            connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('optimize')")
+        merged = True
+    if merged:
+        _last_merge[str(config.db_path)] = time.monotonic()
     _checkpoint(config)  # also retries one that a reader blocked last time
     if embed:
         report["embedding"] = embed_chunks(manifest, limit=embed_limit)
