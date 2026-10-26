@@ -250,3 +250,62 @@ def test_prompts_treat_an_unfilled_placeholder_as_no_argument(chronicle_sandbox)
 
     assert names == {"continue_work", "reconstruct_moment"}
     assert "Chronicle memory brief" in rendered.messages[0].content.text
+
+
+def test_each_hit_says_how_much_stands_behind_it() -> None:
+    from max_chronicle.agent_surface import trust
+
+    one = {"provenance": {"observations": [{"agent": "claude", "evidence": []}], "facts": []}}
+    two = {"provenance": {"observations": [{"agent": "claude"}, {"agent": "codex"}], "facts": []}}
+    archived = {"provenance": {"observations": [{"agent": "claude",
+                                                 "evidence": [{"path": "/a", "status": "archived"}]}]}}
+    pointer = {"provenance": {"observations": [{"agent": "claude",
+                                                "evidence": [{"path": "/a", "status": "pointer_only"}]}]}}
+    guess = {"provenance": {"observations": [{"agent": "claude"}], "facts": [{"kind": "assumption"}]}}
+
+    assert [trust(hit) for hit in (one, two, archived, pointer, guess)] == [
+        "assertion", "confirmed", "evidence", "assertion", "assumption"]
+    assert trust({}) == "assertion"
+
+
+def test_recall_over_mcp_marks_an_archived_source_as_evidence(chronicle_sandbox, loaded_manifest, tmp_path) -> None:
+    source = tmp_path / "decision.md"
+    source.write_text("We move the gateway to port 9000.\n", encoding="utf-8")
+    service.record_event(loaded_manifest, {"agent": "agent-a", "domain": "global", "project": "alpha",
+                                           "text": "Decided to move the gateway to port 9000",
+                                           "source_files": [str(source)]})
+    service.record_event(loaded_manifest, {"agent": "agent-a", "domain": "global", "project": "alpha",
+                                           "text": "Guessed the gateway port might be 8080"})
+    server = build_server(manifest_path=chronicle_sandbox.manifest_path, profile="chronicler")
+
+    hits = _decode(_call(server, "query_memory", {"query": "gateway port", "project": "alpha"}))["results"]
+
+    by_text = {hit["text"]: hit["trust"] for hit in hits}
+    assert by_text["Decided to move the gateway to port 9000"] == "evidence"
+    assert by_text["Guessed the gateway port might be 8080"] == "assertion"
+
+
+def test_an_assumption_stays_an_assumption_whatever_is_attached() -> None:
+    from max_chronicle.agent_surface import trust
+
+    attached = {"provenance": {"observations": [{"agent": "a", "evidence": [{"status": "archived"}]},
+                                                {"agent": "b"}],
+                               "facts": [{"kind": "assumption"}]}}
+    many = {"provenance": {"observations": [{"agent": "a"}], "facts": [],
+                           "summary": {"agents": 2, "archived_evidence": False}}}
+
+    assert trust(attached) == "assumption"
+    assert trust(many) == "confirmed"  # the summary counts observations beyond the five listed
+
+
+def test_provenance_counts_every_observation_under_canonical_names(loaded_manifest) -> None:
+    from max_chronicle.memory import event_provenance
+    from max_chronicle.store import config_from_manifest
+
+    stored = service.record_event(loaded_manifest, {"agent": "claude", "domain": "global", "text": "Shared finding"})
+    for spelling in ("Claude-Code", "claude-mac"):
+        service.record_event(loaded_manifest, {"agent": spelling, "domain": "global", "text": "Shared finding"})
+
+    summary = event_provenance(config_from_manifest(loaded_manifest), stored["id"])["summary"]
+
+    assert summary == {"agents": 1, "archived_evidence": False}

@@ -269,9 +269,12 @@ chronicle timeline --at "2026-09-15T12:00:00Z"
 chronicle timeline --at "2026-09-15T12:00:00Z" --as-of   # what was known then
 chronicle backup --force
 chronicle backup-prune            # what retention would remove; --apply removes it
+chronicle doctor --summary        # server, jobs, last good backup, disks on one screen
 ```
 
-`--fact-file` accepts the assertion JSON above. Startup defaults to compact source
+`chronicle doctor` asks the HTTP server at `CHRONICLE_SERVER_URL`, or else at the
+address the server reads (`MCP_HOST`, `MCP_PORT`, default port 8000); `--server-url`
+overrides both. `--fact-file` accepts the assertion JSON above. Startup defaults to compact source
 metadata; `--full` includes full source content. Run `chronicle --help` for optional
 automation and maintenance commands.
 

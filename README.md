@@ -64,7 +64,8 @@ anything is stored.
   checkpoint history, facts with every value a slot had, search that says why each
   hit matched, and single records with their evidence. Read-only, no script,
   answered only on this machine.
-- **CLI:** `chronicle query-memory`, `chronicle timeline --as-of`, `chronicle record`.
+- **CLI:** `chronicle query-memory`, `chronicle timeline --as-of`, `chronicle record`;
+  `chronicle doctor --summary` answers "is everything running" on one screen.
 
 ## Running it
 

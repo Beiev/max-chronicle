@@ -709,6 +709,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         runtime_dir=Path(args.runtime_dir).expanduser() if args.runtime_dir else None,
         strict_loaded=args.strict,
     )
+    from .doctor import render_summary, runtime_component
+
     payload = {
         "status": _doctor_status(audit.get("status"), sources.get("status"), launchd.get("status")),
         "generated_at_utc": audit.get("report", {}).get("generated_at_utc"),
@@ -718,8 +720,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "audit": audit,
             "sources_audit": sources,
             "launchd": launchd,
+            # What is running now: reported, not counted in the status, since a
+            # stdio-only installation has no server to answer.
+            "runtime": runtime_component(manifest, automation, server_url=args.server_url),
         },
     }
+    if args.summary:
+        print(render_summary(payload))
+        failed = args.strict and payload["status"] in {"issues", "critical"}
+        return 1 if failed else 0
     return _print_json(payload, strict=args.strict, failure_statuses={"issues", "critical"})
 
 
@@ -1155,6 +1164,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument("--agent-dir", default=None, help="Override LaunchAgents directory")
     p_doctor.add_argument("--runtime-dir", default=None, help="Override wrapper scripts directory")
     p_doctor.add_argument("--trigger-source", default="manual", help="Trigger source label")
+    p_doctor.add_argument("--summary", action="store_true", help="Print a one-screen summary instead of JSON")
+    p_doctor.add_argument("--server-url", default=None,
+                          help="HTTP server to ask for its health (default: CHRONICLE_SERVER_URL, else MCP_HOST/MCP_PORT)")
     p_doctor.set_defaults(handler=cmd_doctor)
 
     p_backup = sub.add_parser("backup", help="Run Chronicle backup to the configured target")

@@ -620,7 +620,24 @@ def event_provenance(config, event_id: str, *, limit: int = 5) -> dict:
             WHERE json_extract(attributes_json,'$.event_id')=? ORDER BY recorded_at_utc DESC LIMIT ?""",
             (event_id, limit),
         ).fetchall()
+        # Over every visible observation, not only the ones listed: what stands
+        # behind the event (agents under their canonical names, archived files).
+        visible = """COALESCE(json_extract(o.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+            AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'"""
+        actors = [row[0] for row in connection.execute(
+            "SELECT DISTINCT o.actor FROM event_observations o JOIN events e ON e.id = o.event_id "
+            "WHERE o.event_id=? AND " + visible,
+            (event_id,))]
+        archived = connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM event_observations o JOIN events e ON e.id = o.event_id, "
+            "json_each(o.payload_json,'$.evidence') item WHERE o.event_id=? "
+            "AND json_extract(item.value,'$.status')='archived' AND " + visible + ")",
+            (event_id,)).fetchone()[0] == 1
     return {
+        "summary": {
+            "agents": len({config.identities.agent(actor) for actor in actors if actor}),
+            "archived_evidence": archived,
+        },
         "observations": [
             {
                 key: value
