@@ -37,7 +37,7 @@ class _FakeEmbedder:
 @pytest.fixture()
 def runtime(monkeypatch):
     """A clean _RUNTIME per test; the server's real one is process-wide."""
-    state = {"loop": None, "embedder": None, "dump_signal": None, "last_write": None}
+    state = {"loop": None, "embedder": None, "dump_signal": None, "last_write": None, "scheduler": None}
     monkeypatch.setattr(mcp_server, "_RUNTIME", state)
     return state
 

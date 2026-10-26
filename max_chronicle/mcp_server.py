@@ -30,7 +30,16 @@ from starlette.responses import JSONResponse, PlainTextResponse
 
 from . import __version__
 
-from .config import EXIT_CONFIG_ERROR, EXIT_SCHEMA_ACTION, ChronicleConfigError, default_manifest_path, feature_enabled, mem0_enabled
+from .automation import load_automation_config
+from .config import (
+    EXIT_CONFIG_ERROR,
+    EXIT_SCHEMA_ACTION,
+    ChronicleConfigError,
+    default_automation_path,
+    default_manifest_path,
+    feature_enabled,
+    mem0_enabled,
+)
 from .db import MigrationError
 from .runtime_context import load_manifest, load_manifest_cached, parse_when
 from .brief import BRIEF_DEFAULT_CHARS, build_brief
@@ -69,6 +78,7 @@ from .store import (
 from .identity import UNKNOWN_AGENT, Registry
 from .agent_surface import get_items, index_view
 from .liveness import BackgroundEmbedder, LoopMonitor
+from .scheduler import Scheduler
 from .notes import note_settings, read_note, sync_notes
 from .memory import Checkpoint, FactInput
 from .memory import task_context as read_task_context
@@ -192,7 +202,8 @@ _PROCESS_STARTED_AT = time.time()
 # the loop monitor, the background embedder, the stack-dump signal, and the
 # last committed write. A server built without _main (tests, embedding in
 # another program) has none of them and behaves as before.
-_RUNTIME: dict[str, Any] = {"loop": None, "embedder": None, "dump_signal": None, "last_write": None}
+_RUNTIME: dict[str, Any] = {"loop": None, "embedder": None, "dump_signal": None, "last_write": None,
+                            "scheduler": None}
 STACK_DUMP_SIGNAL = "SIGUSR1"
 # A pre-2026 client's session with nothing in flight for this long is closed;
 # the client starts a new one on its next request. SDK 1.x never closed them.
@@ -1221,6 +1232,8 @@ def _runtime_health() -> dict[str, Any]:
         health["last_write"] = _RUNTIME["last_write"]
     if _RUNTIME["embedder"] is not None:
         health["embedder"] = _RUNTIME["embedder"].snapshot()
+    if _RUNTIME["scheduler"] is not None:
+        health["scheduler"] = _RUNTIME["scheduler"].snapshot()
     return health
 
 
@@ -1290,6 +1303,23 @@ def _install_stack_dump() -> None:
         _LOGGER.warning("stack dumps unavailable: %s: %s", type(exc).__name__, exc)
         return
     _RUNTIME["dump_signal"] = STACK_DUMP_SIGNAL
+
+
+def _start_scheduler(manifest_path: Path) -> Scheduler | None:
+    """Run the automation jobs from this server when the installation says so."""
+    try:
+        automation_path = default_automation_path()
+        automation = load_automation_config(automation_path)
+    except (ChronicleConfigError, OSError, KeyError, ValueError) as exc:
+        _LOGGER.info("scheduler not started: no usable automation config (%s: %s)", type(exc).__name__, exc)
+        return None
+    if not automation.scheduler_enabled:
+        return None
+    scheduler = Scheduler.for_installation(manifest_path, automation_path)
+    _RUNTIME["scheduler"] = scheduler
+    scheduler.start()
+    _LOGGER.info("scheduler started: jobs %s", sorted(automation.jobs))
+    return scheduler
 
 
 def _start_embedder(manifest_path: Path) -> BackgroundEmbedder:
@@ -1404,6 +1434,7 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         _start_notes_sync(manifest_path)
         if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS, default=True):
             _start_embedder(manifest_path)
+        _start_scheduler(manifest_path)
     _serve(server, args.transport, http_options)
     return 0
 

@@ -406,6 +406,21 @@ index reads (FR-10).
   months that have one (`[backup_retention]` in the automation config:
   `daily`, `weekly`, `monthly`). Each backup reports what the policy would remove;
   removal happens only with `prune = true` or `chronicle backup-prune --apply`.
+  A backup the disk prevented (not mounted, full, read-only) is `deferred` and
+  retried the same day.
+- **Scheduled jobs:** with `[scheduler] enabled = true` in the automation config,
+  the HTTP server runs daily capture, daybook, weekly audit and backup itself,
+  each as its own process, one at a time, and `chronicle launchd install` installs
+  no job agents (launchd keeps only the server); job agents an earlier install left
+  are unloaded (with `--load`) and moved to `retired-job-agents/` in the launchd
+  runtime directory. A job's due moment is computed in
+  the installation's timezone, and its run is keyed by that moment (its date, or
+  for the weekly audit its ISO week): a run delayed past midnight fills the day it
+  was due, never the next. A failed or deferred run is retried after 30 minutes,
+  up to six times; one still marked running after six hours is started again;
+  one due more than three days ago is skipped. `/health` shows
+  the last runs under `scheduler`. `chronicle automation run --job X --occurrence
+  ISO` runs a job as the occurrence it names.
 
 ### Measuring recall
 

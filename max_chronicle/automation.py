@@ -55,6 +55,8 @@ class AutomationConfig:
     repos: tuple[RepoConfig, ...]
     jobs: dict[str, JobSchedule]
     backup_retention: RetentionPolicy = RetentionPolicy()
+    # The server runs the jobs on schedule; launchd keeps only the server.
+    scheduler_enabled: bool = False
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -107,6 +109,7 @@ def load_automation_config(path: Path | None = None) -> AutomationConfig:
             for name, job in jobs.items()
         },
         backup_retention=RetentionPolicy.from_mapping(raw.get("backup_retention")),
+        scheduler_enabled=bool((raw.get("scheduler") or {}).get("enabled", False)),
     )
 
 

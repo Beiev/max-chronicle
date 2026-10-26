@@ -726,11 +726,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_automation_run(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     automation = load_native_automation(args.automation_config)
+    occurrence = None
+    if args.occurrence:
+        from datetime import datetime as _datetime
+
+        occurrence = _datetime.fromisoformat(args.occurrence)
+        if occurrence.tzinfo is None:
+            raise ValueError("--occurrence needs a UTC offset, as the scheduler writes it")
     payload = run_automation_job(
         manifest,
         automation,
         job_name=args.job,
         trigger_source=args.trigger_source,
+        occurrence=occurrence,
     )
     code = _print_json(payload)
     # Hard failures must surface a non-zero exit so launchd/wrappers see the
@@ -1189,6 +1197,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Job to execute",
     )
     p_automation_run.add_argument("--trigger-source", default="manual", help="Trigger source label")
+    p_automation_run.add_argument(
+        "--occurrence", default=None,
+        help="ISO time the run was due (the scheduler's); its run key names that slot",
+    )
     p_automation_run.set_defaults(handler=cmd_automation_run)
 
     p_sync_mem0 = sub.add_parser("sync-mem0", help="Replay queued Mem0 writes directly from Chronicle mem0_outbox")
