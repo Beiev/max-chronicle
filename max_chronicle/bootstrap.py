@@ -15,6 +15,7 @@ from .store import (
     _json,
     _parse_iso,
     _slugify,
+    guard_visibility,
     to_local_iso as _to_local_iso,
 )
 
@@ -138,19 +139,21 @@ def import_legacy_ledger(
                     category,
                     entity_type,
                     entity_id,
-                    title,
+                    project,
+                    task_id,
                     text,
                     why,
-                    circumstances,
+                    domain,
+                    visibility,
                     source_kind,
                     source_path,
                     source_hash,
                     payload_json,
-                    imported_from,
+                    written_by,
                     mem0_status,
                     mem0_error
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -164,9 +167,11 @@ def import_legacy_ledger(
                     entity_type,
                     entity_id,
                     row.get("project"),
+                    row.get("task_id"),
                     row.get("text") or "",
                     row.get("why"),
                     row.get("domain"),
+                    guard_visibility(row.get("memory_guard")),
                     "legacy_jsonl",
                     str(config.ledger_path),
                     source_hash,

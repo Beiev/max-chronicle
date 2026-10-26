@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import sqlite3
 
 import pytest
@@ -23,14 +24,22 @@ def _record(manifest: dict, text: str, **fields) -> dict:
 
 def _insert_fact(connection: sqlite3.Connection, fact_id: str, group_id: str | None, value: str,
                  recorded_at: str, domain: str = "global") -> None:
+    """A fact as the code of the schema at hand writes it: the group_id pair before 0016, columns since."""
     tx = connection.execute(
         "INSERT INTO fact_transactions(domain,operation,recorded_at_utc) VALUES (?,'record_episode',?)",
         (domain, recorded_at),
     ).lastrowid
+    project, task_id = json.loads(group_id) if group_id else (None, None)
+    attributes = json.dumps({"project": project, "task_id": task_id, "kind": "decision"})
+    if "group_id" in {row[1] for row in connection.execute("PRAGMA table_info(facts)")}:
+        scope_columns, scope = "group_id,relation", (group_id, "deploy.target")
+    else:
+        scope_columns, scope = "project,task_id,kind", (project, task_id, "decision")
     connection.execute(
-        """INSERT INTO facts(id,domain,group_id,relation,fact_text,fact_hash,recorded_at_utc,created_tx_id,
-        slot_key,value_key,cardinality,attributes_json) VALUES (?,?,?,'deploy.target',?,?,?,?,'deploy.target',?,'single','{}')""",
-        (fact_id, domain, group_id, f"deploy.target: {value}", f"hash-{fact_id}", recorded_at, tx, value),
+        f"""INSERT INTO facts(id,domain,{scope_columns},fact_text,fact_hash,recorded_at_utc,created_tx_id,
+        slot_key,value_key,cardinality,attributes_json)
+        VALUES (?,?,{",".join("?" for _ in scope)},?,?,?,?,'deploy.target',?,'single',?)""",
+        (fact_id, domain, *scope, f"deploy.target: {value}", f"hash-{fact_id}", recorded_at, tx, value, attributes),
     )
 
 

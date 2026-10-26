@@ -122,7 +122,7 @@ def test_a_swapped_event_regenerates_the_day_at_the_same_count(
     # has one visible event, but not the same one.
     _execute(
         loaded_manifest,
-        "UPDATE events SET payload_json = json_set(COALESCE(payload_json, '{}'),"
+        "UPDATE events SET visibility = 'raw_only', payload_json = json_set(COALESCE(payload_json, '{}'),"
         " '$.memory_guard.visibility', 'raw_only') WHERE text LIKE 'Chose SQLite%'",
     )
     _record(loaded_manifest, "Moved the demo to the new hosting contract.", "2026-09-20T15:00:00Z")
@@ -184,7 +184,7 @@ def test_a_skipped_day_that_still_has_a_file_is_cleared(
     run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
     _execute(
         loaded_manifest,
-        "UPDATE events SET payload_json = json_set(COALESCE(payload_json, '{}'),"
+        "UPDATE events SET visibility = 'raw_only', payload_json = json_set(COALESCE(payload_json, '{}'),"
         " '$.memory_guard.visibility', 'raw_only')",
     )
     # A run recorded as skipped while the day's file stayed behind.
@@ -203,7 +203,7 @@ def test_hiding_every_event_of_a_day_clears_its_daybook(
     run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
     _execute(
         loaded_manifest,
-        "UPDATE events SET payload_json = json_set(COALESCE(payload_json, '{}'),"
+        "UPDATE events SET visibility = 'raw_only', payload_json = json_set(COALESCE(payload_json, '{}'),"
         " '$.memory_guard.visibility', 'raw_only')",
     )
 

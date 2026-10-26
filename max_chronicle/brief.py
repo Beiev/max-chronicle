@@ -120,17 +120,15 @@ def resolve_project(
 
 def _facts(connection: sqlite3.Connection, identities: Registry, project: str | None) -> list[dict[str, Any]]:
     where, params = identities.scope(project=project).where(
-        domain="f.domain", project="json_extract(f.attributes_json,'$.project')",
-        task="json_extract(f.attributes_json,'$.task_id')", project_or_unset=True,
+        domain="f.domain", project="f.project", task="f.task_id", project_or_unset=True,
     )
     # A project's own facts come first; the unscoped brief is newest first, or
     # ten old project facts would hide a global rule recorded a minute ago.
-    project_first = "(json_extract(f.attributes_json,'$.project') IS NULL), " if project else ""
+    project_first = "(f.project IS NULL), " if project else ""
     rows = connection.execute(
-        """SELECT f.id, f.slot_key, f.value_key, json_extract(f.attributes_json,'$.project') AS project,
-                  json_extract(f.attributes_json,'$.task_id') AS task_id, json_extract(f.attributes_json,'$.kind') AS kind
-        FROM current_facts f JOIN events e ON e.id=json_extract(f.attributes_json,'$.event_id')
-        WHERE COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+        """SELECT f.id, f.slot_key, f.value_key, f.project, f.task_id, f.kind
+        FROM current_facts f JOIN events e ON e.id=f.event_id
+        WHERE e.visibility != 'raw_only'
           AND f.slot_key != 'task.status'
           AND """ + where + """
         ORDER BY """ + project_first + """f.recorded_at_utc DESC, f.id LIMIT ?""",
@@ -149,21 +147,19 @@ def _decisions(
 ) -> list[dict[str, Any]]:
     since = (now - timedelta(days=BRIEF_DECISION_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     where, params = identities.scope(project=project).where(
-        domain="COALESCE(e.circumstances, json_extract(e.payload_json,'$.domain'))",
-        project="COALESCE(e.title, json_extract(e.payload_json,'$.project'))",
+        domain="e.domain", project="e.project",
         # A decision without a project (a pipeline's, another task's) is not
         # this project's: it showed up in every project's brief.
-        task="json_extract(e.payload_json,'$.task_id')", project_or_unset=False,
+        task="e.task_id", project_or_unset=False,
     )
     rows = connection.execute(
-        """SELECT e.id, e.occurred_at_utc, e.actor, e.text,
-                  COALESCE(e.title, json_extract(e.payload_json,'$.project')) AS project
+        """SELECT e.id, e.occurred_at_utc, e.actor, e.text, e.project
         FROM events e
         WHERE e.category = 'decision' AND e.occurred_at_utc >= ?
-          AND COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'
+          AND e.visibility != 'raw_only'
           -- A decision that set a fact is shown through the facts: the current value
           -- there, a replaced one nowhere, so an old decision never returns unmarked.
-          AND NOT EXISTS (SELECT 1 FROM facts f WHERE json_extract(f.attributes_json,'$.event_id') = e.id)
+          AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.event_id = e.id)
           AND """ + where + """
         ORDER BY e.occurred_at_utc DESC, e.id LIMIT ?""",
         (since, *params, BRIEF_DECISIONS),

@@ -199,7 +199,10 @@ serves a whole note; `chronicle notes status` counts what the index holds.
   another application's SQLite file, is refused. After installing a release with new
   migrations, migrate before scheduled jobs run: until then they exit with code 3.
   `CHRONICLE_AUTO_MIGRATE=1` restores upgrade-on-connect for the CLI and library;
-  a server upgrades only with `--migrate`. `CHRONICLE_REQUIRE_ROOT=1`
+  a server upgrades only with `--migrate`. `chronicle migrate --revert N` undoes the
+  newest migration N with its down script (`migrations/down/`), after an online backup
+  (`chronicle.db.bak-prerevert-…`); install the previous release before the server
+  restarts, or `--migrate` applies N again. `CHRONICLE_REQUIRE_ROOT=1`
   makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
   instead of falling back to `~/.max-chronicle`.
 - **Read-only servers:** SQLite reads a WAL database through its `-wal` and `-shm`

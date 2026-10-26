@@ -37,7 +37,7 @@ _SAME_SITE = {None, "same-origin", "none"}
 PAGE_EVENTS = 30
 OVERVIEW_EVENTS = 20
 PROJECT_DAYS = 30
-QUARANTINE = "COALESCE(json_extract(e.payload_json,'$.memory_guard.visibility'),'') != 'raw_only'"
+QUARANTINE = "e.visibility != 'raw_only'"
 CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; "
        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 SECURITY_HEADERS = {
@@ -207,13 +207,11 @@ def overview(manifest: dict[str, Any], runtime: dict[str, Any] | None = None) ->
 
 def _current_facts(connection, identities, *, project: str | None = None, task_id: str | None = None):
     where, params = identities.scope(project=project, task_id=task_id).where(
-        domain="f.domain", project="json_extract(f.attributes_json,'$.project')",
-        task="json_extract(f.attributes_json,'$.task_id')", task_or_unset=True)
+        domain="f.domain", project="f.project", task="f.task_id", task_or_unset=True)
     return connection.execute(
         f"""SELECT f.id, f.slot_key, f.value_key, f.recorded_at_utc, f.attributed_to,
-                  json_extract(f.attributes_json,'$.project') AS project, json_extract(f.attributes_json,'$.task_id') AS task_id,
-                  json_extract(f.attributes_json,'$.kind') AS kind, json_extract(f.attributes_json,'$.event_id') AS event_id
-        FROM current_facts f JOIN events e ON e.id = json_extract(f.attributes_json,'$.event_id')
+                  f.project, f.task_id, f.kind, f.event_id
+        FROM current_facts f JOIN events e ON e.id = f.event_id
         WHERE {QUARANTINE} AND {where} ORDER BY f.slot_key""", params).fetchall()
 
 
@@ -284,9 +282,9 @@ def facts_page(manifest: dict[str, Any], slot: str | None = None) -> str:
             return _page("Current facts", _facts_table(_current_facts(connection, identities)))
         rows = connection.execute(
             f"""SELECT f.id, f.value_key, f.status, f.recorded_at_utc, f.expired_at_utc, f.attributed_to,
-                      json_extract(f.attributes_json,'$.project') AS project, json_extract(f.attributes_json,'$.event_id') AS event_id,
+                      f.project, f.event_id,
                       (SELECT s.new_fact_id FROM fact_supersessions s WHERE s.old_fact_id = f.id LIMIT 1) AS replaced_by
-            FROM facts f JOIN events e ON e.id = json_extract(f.attributes_json,'$.event_id')
+            FROM facts f JOIN events e ON e.id = f.event_id
             WHERE {QUARANTINE} AND f.slot_key = ? ORDER BY f.recorded_at_utc DESC""", (slot,)).fetchall()
     body = ("<p class=\"muted\">Every value this slot had, newest first.</p>"
             "<table><tr><th>Value</th><th>Project</th><th>By</th><th>Recorded</th><th>State</th></tr>"

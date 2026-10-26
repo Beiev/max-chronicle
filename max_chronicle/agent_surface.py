@@ -13,10 +13,9 @@ event, or else a fact.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from .memory import event_provenance
+from .memory import FACT_SCOPE, event_provenance
 from .notes import read_note
 from .store import config_from_manifest, fetch_event, open_connection
 
@@ -134,7 +133,7 @@ def index_view(response: dict[str, Any]) -> dict[str, Any]:
 
 def _visible_event(config, event_id: str) -> dict[str, Any] | None:
     event = fetch_event(config, event_id=event_id)
-    if event is None or (event.get("memory_guard") or {}).get("visibility") == "raw_only":
+    if event is None or event["visibility"] == "raw_only":
         return None  # quarantined events stay out of agents' reach
     return event
 
@@ -151,12 +150,12 @@ def _fact_item(config, fact_id: str) -> dict[str, Any] | None:
     with open_connection(config) as connection:
         row = connection.execute(
             """SELECT id, slot_key, value_key, fact_text, status, recorded_at_utc, expired_at_utc,
-                      attributed_to, attributes_json
+                      attributed_to, """ + ", ".join(FACT_SCOPE) + """
             FROM facts WHERE id = ?""", (fact_id,)).fetchone()
     if row is None:
         return None
-    attributes = json.loads(row["attributes_json"] or "{}")
-    event_id = attributes.get("event_id")
+    attributes = {key: row[key] for key in FACT_SCOPE}
+    event_id = attributes["event_id"]
     event = _visible_event(config, event_id) if event_id else None
     if event is None:
         return None
