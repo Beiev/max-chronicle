@@ -68,6 +68,15 @@ FROM archive.events AS copy
 WHERE copy.id = events.id AND json_type(copy.payload_json, '$.mem0_synced_at') IS NOT NULL
   AND json_type(events.payload_json, '$.mem0_synced_at') IS NULL;
 
+-- A quarantine set since (guard_event) reaches the outbox too, as v0.25 would
+-- have put it there: v0.25 syncs by the outbox's copy of memory_guard.
+UPDATE mem0_outbox SET payload_json = json_set(mem0_outbox.payload_json, '$.memory_guard',
+                                               json(event.payload_json -> '$.memory_guard'))
+FROM events AS event, archive.events AS copy
+WHERE event.id = mem0_outbox.event_id AND copy.id = event.id
+  AND json_type(event.payload_json, '$.memory_guard') IS NOT NULL
+  AND json(event.payload_json -> '$.memory_guard') IS NOT json(copy.payload_json -> '$.memory_guard');
+
 -- Observations ----------------------------------------------------------------
 -- No code path changes an observation, and v0.25 never reads these keys there.
 UPDATE event_observations SET payload_json = copy.payload_json
@@ -77,16 +86,18 @@ WHERE copy.id = event_observations.id
       '$.mem0_status', '$.mem0_error', '$.mem0_raw', '$.mem0_synced_at');
 
 -- Snapshots -------------------------------------------------------------------
--- The copy's payload where this one is the copy less mem0_dump (and, from a
--- copy taken before 0017, less what 0017 rewrote: the ledger, as long, and
--- mem0_snapshot_hits).
+-- The copy's payload where this one is the copy less mem0_dump. From a copy
+-- taken before 0017 too, 0017's rewrite is allowed for (the ledger, as long,
+-- and mem0_snapshot_hits), as 0017's own revert allows for it.
 UPDATE snapshots SET payload_json = copy.payload_json
 FROM archive.snapshots AS copy
 WHERE copy.id = snapshots.id
-  AND json_remove(snapshots.payload_json, '$.recent_ledger')
-      = json_remove(copy.payload_json, '$.recent_ledger', '$.mem0_snapshot_hits', '$.mem0_dump')
-  AND json_array_length(snapshots.payload_json, '$.recent_ledger')
-      IS json_array_length(copy.payload_json, '$.recent_ledger');
+  AND (snapshots.payload_json = json_remove(copy.payload_json, '$.mem0_dump')
+       OR (NOT EXISTS (SELECT 1 FROM archive.schema_migrations WHERE version = 17)
+           AND json_remove(snapshots.payload_json, '$.recent_ledger')
+               = json_remove(copy.payload_json, '$.recent_ledger', '$.mem0_snapshot_hits', '$.mem0_dump')
+           AND json_array_length(snapshots.payload_json, '$.recent_ledger')
+               IS json_array_length(copy.payload_json, '$.recent_ledger')));
 
 UPDATE snapshots SET payload_json = json_set(snapshots.payload_json, '$.mem0_dump', json(copy.payload_json -> '$.mem0_dump'))
 FROM archive.snapshots AS copy

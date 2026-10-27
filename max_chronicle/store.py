@@ -776,6 +776,8 @@ def guard_visibility(memory_guard: Any) -> str:
 # Event keys of the Mem0 mirror, removed in 0.26 (migration 0018). An old client
 # may still send them; no event keeps them.
 RETIRED_EVENT_KEYS = frozenset({"mem0_status", "mem0_error", "mem0_raw", "mem0_synced_at"})
+# And of a snapshot (migrations 0017 and 0018): a legacy import may still carry them.
+RETIRED_SNAPSHOT_KEYS = frozenset({"mem0_dump", "mem0_snapshot_hits"})
 
 
 def _event_payload(entry: dict[str, Any]) -> dict[str, Any]:
@@ -1110,7 +1112,9 @@ def snapshot_payload_to_store(connection: sqlite3.Connection, payload: dict[str,
     A reader takes each event as it is now (_snapshot_row_to_entry), so an
     event quarantined after the capture stays out. Only an entry with the id of
     an event in this database becomes that id; anything else is kept as it is.
+    What the Mem0 mirror added to a capture (RETIRED_SNAPSHOT_KEYS) is left out.
     """
+    payload = {key: value for key, value in payload.items() if key not in RETIRED_SNAPSHOT_KEYS}
     ledger = payload.get("recent_ledger")
     if not isinstance(ledger, list):
         return payload

@@ -61,14 +61,21 @@ LAUNCHD_JOB_SUFFIXES = {
 }
 
 
-def launchd_labels(automation) -> dict[str, str]:
+# Jobs the package no longer has. An agent an earlier install left for one
+# would fail every day on a job the CLI refuses, so an install takes it down.
+RETIRED_JOB_SUFFIXES = {
+    "mem0_dump": "mem0-dump",  # 0.26: the Mem0 mirror is gone
+}
+
+
+def launchd_labels(automation, suffixes: dict[str, str] = LAUNCHD_JOB_SUFFIXES) -> dict[str, str]:
     """Job -> launchd label for this installation.
 
     The prefix lives in CHRONICLE_AUTOMATION.toml ([paths] launchd_label_prefix)
     so an installation keeps its own namespace; the package default is generic.
     """
     prefix = getattr(automation, "launchd_label_prefix", "com.chronicle")
-    return {key: f"{prefix}.chronicle.{suffix}" for key, suffix in LAUNCHD_JOB_SUFFIXES.items()}
+    return {key: f"{prefix}.chronicle.{suffix}" for key, suffix in suffixes.items()}
 
 
 def _installed_jobs(manifest: dict[str, Any], automation) -> dict[str, str]:
@@ -2148,8 +2155,10 @@ def install_launchd(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     installed: list[dict[str, Any]] = []
-    retired = _retire_job_agents(automation, agent_dir, runtime_dir, unload=load_jobs) \
-        if getattr(automation, "scheduler_enabled", False) else []
+    to_retire = list(launchd_labels(automation, RETIRED_JOB_SUFFIXES).values())
+    if getattr(automation, "scheduler_enabled", False):
+        to_retire += launchd_labels(automation).values()
+    retired = _retire_job_agents(automation, agent_dir, runtime_dir, to_retire, unload=load_jobs)
     for key, label in _installed_jobs(manifest, automation).items():
         wrapper_path = runtime_dir / f"{key}.sh"
         _write_executable_script(wrapper_path, _launchd_wrapper(manifest, automation, key.replace("_", "-")))
@@ -2212,16 +2221,17 @@ def install_launchd(
     }
 
 
-def _retire_job_agents(automation: AutomationConfig, agent_dir: Path, runtime_dir: Path, *,
+def _retire_job_agents(automation: AutomationConfig, agent_dir: Path, runtime_dir: Path, labels: list[str], *,
                        unload: bool) -> list[str]:
     """Unload the job agents an earlier install left and move their plists aside.
 
     With the server's scheduler on they would fire alongside it, and a run
     launchd starts has no occurrence, so its key never meets the scheduler's.
+    A job the package no longer has is retired either way.
     """
     retired_dir = runtime_dir / "retired-job-agents"
     retired: list[str] = []
-    for label in launchd_labels(automation).values():
+    for label in labels:
         if unload:
             # By label: an agent whose plist an earlier run moved aside without
             # unloading it is still loaded and still fires.
@@ -2310,6 +2320,14 @@ def doctor_launchd(
                 "issues": job_issues,
             }
         )
+    for key, label in launchd_labels(automation, RETIRED_JOB_SUFFIXES).items():
+        plist_path = agent_dir / f"{label}.plist"
+        if plist_path.exists():
+            issue_count += 1
+            jobs.append({"label": label, "plist_exists": True, "status": "critical",
+                         "issues": ["retired_job_installed"],
+                         "detail": f"{key.replace('_', '-')} is no longer a Chronicle job: "
+                                   "`chronicle launchd install` takes its agent down"})
     return {
         "status": "ok" if issue_count == 0 else "issues",
         "issue_count": issue_count,

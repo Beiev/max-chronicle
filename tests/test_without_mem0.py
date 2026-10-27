@@ -13,7 +13,7 @@ import pytest
 from max_chronicle import service
 from max_chronicle.automation import load_automation_config
 from max_chronicle.config import MIGRATIONS_DIR
-from max_chronicle.db import connect
+from max_chronicle.db import connect, revert_migration
 from max_chronicle.mcp_server import build_server
 from max_chronicle.runtime_context import load_manifest
 from max_chronicle.scheduler import Scheduler
@@ -221,3 +221,80 @@ def test_the_mcp_server_offers_no_mem0(old_settings, chronicle_sandbox) -> None:
         assert not [tool.name for tool in listed if "mem0" in tool.name.casefold()]
         assert "mem0" not in server.instructions.casefold()
         assert "mem0" not in json.dumps([tool.model_dump(mode="json") for tool in listed]).casefold(), profile
+
+
+def _upgraded_from_v17(loaded_manifest, tmp_path: Path):
+    """A seeded v17 database brought to 18, and the copy taken before."""
+    config = config_from_manifest(loaded_manifest)
+    prepare_database(_upto(config, tmp_path, 17), allow_upgrade=True)
+    _seed_v17(config)
+    return config, prepare_database(config, allow_upgrade=True).backup_path
+
+
+def _revert_18(config, archive: Path) -> None:
+    with connect(config.db_path) as connection:
+        revert_migration(connection, config, 18, archive=archive)
+
+
+def test_revert_18_carries_a_later_quarantine_to_the_outbox(loaded_manifest, tmp_path) -> None:
+    """v0.25 syncs by the outbox's copy of the guard; one set on 18 must reach it."""
+    config, archive = _upgraded_from_v17(loaded_manifest, tmp_path)
+    service.guard_event(loaded_manifest, event_id="e-synced", verdict="local_only", reason="test", apply=True)
+
+    _revert_18(config, archive)
+
+    with connect(config.db_path) as connection:
+        outbox = json.loads(connection.execute(
+            "SELECT payload_json FROM mem0_outbox WHERE event_id = 'e-synced'").fetchone()[0])
+    assert outbox["memory_guard"]["verdict"] == "local_only" and outbox["text"] == "Atlas ships"
+
+
+def test_revert_18_keeps_a_snapshot_stored_again_since(loaded_manifest, tmp_path) -> None:
+    config, archive = _upgraded_from_v17(loaded_manifest, tmp_path)
+    # Stored again under its id with a ledger as long and everything else as it was.
+    with connect(config.db_path) as connection:
+        connection.execute("UPDATE snapshots SET payload_json = json_set(payload_json, '$.recent_ledger', "
+                           "json_array('e-plain')) WHERE id = 's-old'")
+
+    _revert_18(config, archive)
+
+    with connect(config.db_path) as connection:
+        payload = json.loads(connection.execute("SELECT payload_json FROM snapshots WHERE id = 's-old'").fetchone()[0])
+    assert payload["recent_ledger"] == ["e-plain"] and payload["mem0_dump"] == OLD_SNAPSHOT["mem0_dump"]
+
+
+def test_install_takes_down_a_mem0_dump_agent_and_doctor_shows_it(loaded_manifest, loaded_automation,
+                                                                  chronicle_sandbox) -> None:
+    from max_chronicle.native_automation import RETIRED_JOB_SUFFIXES, doctor_launchd, install_launchd, launchd_labels
+
+    dirs = {"agent_dir": chronicle_sandbox.root / "agents", "runtime_dir": chronicle_sandbox.root / "rt"}
+    label = launchd_labels(loaded_automation, RETIRED_JOB_SUFFIXES)["mem0_dump"]
+    dirs["agent_dir"].mkdir()
+    (dirs["agent_dir"] / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+
+    before = doctor_launchd(loaded_manifest, loaded_automation, **dirs)
+    install = install_launchd(loaded_manifest, loaded_automation, log_dir=chronicle_sandbox.root / "logs",
+                              load_jobs=False, **dirs)
+    after = doctor_launchd(loaded_manifest, loaded_automation, **dirs)
+
+    assert before["status"] == "issues"
+    assert [job["issues"] for job in before["jobs"] if job["label"] == label] == [["retired_job_installed"]]
+    assert install["retired"] == [label] and (dirs["runtime_dir"] / "retired-job-agents" / f"{label}.plist").exists()
+    assert label not in {job["label"] for job in after["jobs"]}
+
+
+def test_a_legacy_snapshot_leaves_the_mem0_copies_behind(loaded_manifest) -> None:
+    from max_chronicle.bootstrap import bootstrap_legacy
+
+    config = config_from_manifest(loaded_manifest)
+    config.snapshot_path.write_text(json.dumps({
+        "id": "legacy-snap", "captured_at_utc": "2026-03-01T10:00:00Z", "domain": "global", "recent_ledger": [],
+        "mem0_dump": {"exists": True}, "mem0_snapshot_hits": {"q": [{"memory": "y" * 400}]}}) + "\n",
+        encoding="utf-8")
+
+    with open_connection(config) as connection, connection:
+        bootstrap_legacy(connection, config)
+        payload = json.loads(connection.execute(
+            "SELECT payload_json FROM snapshots WHERE id = 'legacy-snap'").fetchone()[0])
+
+    assert payload["domain"] == "global" and not {"mem0_dump", "mem0_snapshot_hits"} & set(payload)

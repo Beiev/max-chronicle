@@ -248,7 +248,9 @@ Chronicle mirrored events into Mem0 until 0.26; migration 0018 removed the
 mirror. A manifest or automation config from before may keep its Mem0 settings
 (`[mem0]`, `paths.mem0_dump`, `paths.mem0_bridge`, `mem0_queries`,
 `[jobs.mem0_dump]`, `mem0_sync_batch_size`): Chronicle ignores them and runs no
-job for them. To keep what Mem0 held, export it as notes the index reads (FR-10).
+job for them. A launchd agent an earlier install left for `mem0-dump` shows in
+`chronicle launchd doctor` as `retired_job_installed`; `chronicle launchd install`
+takes it down. To keep what Mem0 held, export it as notes the index reads (FR-10).
 
 
 ## CLI
