@@ -11,6 +11,7 @@ import sys
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+from .automation import JOB_NAMES
 from .bootstrap import bootstrap_legacy
 from .brief import BRIEF_DEFAULT_CHARS, build_brief
 from .notes import notes_status, read_note, sync_notes
@@ -26,7 +27,6 @@ from .config import (
     default_manifest_path,
     ensure_runtime_dirs,
     feature_enabled,
-    mem0_enabled,
     resolve_status_root,
 )
 from .db import MigrationError, connect, database_summary, ensure_schema, read_schema_state, revert_migration
@@ -41,11 +41,9 @@ from .native_automation import (
     run_backup,
     run_daybook,
     run_git_commit_hook,
-    sync_mem0_outbox,
 )
 from .runtime_context import expand_path, load_manifest, read_toml
 from .service import (
-    backfill_mem0_queue,
     build_activation,
     build_sources_audit,
     build_startup_bundle,
@@ -61,7 +59,6 @@ from .service import (
     record_event,
     render_projections,
     repair_event_categories,
-    repair_mem0_state,
     repair_stale_runs,
 )
 from .scaffold import scaffold_workspace
@@ -165,16 +162,13 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 def cmd_import_legacy(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
-    if args.queue_mem0 and not mem0_enabled(load_manifest(args.manifest)):
-        return _print_error(ValueError("--queue-mem0 needs Mem0: the manifest says [mem0] enabled = false"),
-                            exit_code=EXIT_CONFIG_ERROR)
     with _connection(config) as connection:
         ensure_schema(
             connection,
             config,
             allow_upgrade=feature_enabled(ENV_CHRONICLE_AUTO_MIGRATE, default=False),
         )
-        result = bootstrap_legacy(connection, config, queue_mem0=args.queue_mem0)
+        result = bootstrap_legacy(connection, config)
         summary = database_summary(connection)
     payload = {
         "db_path": str(config.db_path),
@@ -306,9 +300,6 @@ def cmd_record(args: argparse.Namespace) -> int:
         "text": args.text,
         "why": args.why,
         "source_files": args.source_file or [],
-        "mem0_status": args.mem0_status,
-        "mem0_error": args.mem0_error,
-        "mem0_raw": None,
     }
     stored = record_event(
         manifest,
@@ -356,7 +347,7 @@ def cmd_recent(args: argparse.Namespace) -> int:
     for entry in events:
         project = entry.get("project") or "n/a"
         category = entry.get("category") or "n/a"
-        print(f"- {entry.get('recorded_at')} | {category} | {project} | mem0={entry.get('mem0_status')}")
+        print(f"- {entry.get('recorded_at')} | {category} | {project}")
         print(f"  {entry.get('text')}")
         if entry.get("why"):
             print(f"  why: {entry['why']}")
@@ -498,20 +489,6 @@ def cmd_query(args: argparse.Namespace) -> int:
     else:
         print("- No SSOT source hits.")
 
-    print()
-    print("## Mem0 Recall")
-    if payload["mem0_dump_hits"]:
-        for hit in payload["mem0_dump_hits"]:
-            collections = ", ".join(hit.get("source_collections") or [])
-            duplicate_count = int(hit.get("duplicate_count", 1))
-            suffix = f" collections={collections}" if collections else ""
-            print(f"- {hit.get('id') or 'memory'} score={hit['score']}{suffix}")
-            print(f"  {hit.get('memory') or ''}")
-            if duplicate_count > 1:
-                print(f"  deduped_matches={duplicate_count}")
-    else:
-        print("- No Mem0 dump hits.")
-
     if payload["interpretation_hits"]:
         print()
         print("## Interpretation Hits")
@@ -576,21 +553,9 @@ def cmd_repair_categories(args: argparse.Namespace) -> int:
     return _print_json(payload)
 
 
-def cmd_repair_mem0(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
-    payload = repair_mem0_state(manifest, dry_run=(args.dry_run or not args.apply))
-    return _print_json(payload)
-
-
 def cmd_repair_stale_runs(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     payload = repair_stale_runs(manifest, dry_run=args.dry_run, ttl_hours=args.ttl_hours)
-    return _print_json(payload)
-
-
-def cmd_backfill_mem0(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
-    payload = backfill_mem0_queue(manifest, dry_run=(args.dry_run or not args.apply))
     return _print_json(payload)
 
 
@@ -768,18 +733,6 @@ def cmd_automation_run(args: argparse.Namespace) -> int:
     if payload.get("status") == "failed":
         return 1
     return code
-
-
-def cmd_sync_mem0(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
-    automation = load_native_automation(args.automation_config)
-    payload = sync_mem0_outbox(
-        manifest,
-        automation,
-        limit=args.limit,
-        trigger_source=args.trigger_source,
-    )
-    return _print_json(payload)
 
 
 def cmd_embed_backfill(args: argparse.Namespace) -> int:
@@ -994,11 +947,6 @@ def build_parser() -> argparse.ArgumentParser:
         "import-legacy",
         help="Import transitional JSONL ledger/snapshots into chronicle.db",
     )
-    p_import.add_argument(
-        "--queue-mem0",
-        action="store_true",
-        help="Also seed mem0_outbox rows for imported durable events",
-    )
     p_import.set_defaults(handler=cmd_import_legacy)
 
     p_status = sub.add_parser("status", help="Report chronicle.db health and counts")
@@ -1035,7 +983,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_startup.add_argument("--format", choices=["text", "json"], default="text")
     p_startup.set_defaults(handler=cmd_startup)
 
-    p_query = sub.add_parser("query", help="Search Chronicle, active SSOT docs, and the Mem0 dump via the native service")
+    p_query = sub.add_parser("query", help="Search Chronicle and the active SSOT docs via the native service")
     p_query.add_argument("query", help="Search string")
     p_query.add_argument("--domain", default=None, help="Optional manifest domain filter")
     p_query.add_argument("--limit", type=int, default=5, help="Maximum hits per surface")
@@ -1073,8 +1021,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_record.add_argument("--fact-file", default=None, help="JSON assertion: slot, value, kind, optional supersedes")
     p_record.add_argument("--why", default=None, help="Reason or context")
     p_record.add_argument("--source-file", action="append", help="Source file path")
-    p_record.add_argument("--mem0-status", default="queued", help="Mem0 state for outbox tracking")
-    p_record.add_argument("--mem0-error", default=None, help="Optional Mem0 error text")
     p_record.set_defaults(handler=cmd_record)
 
     p_capture = sub.add_parser("capture", help="Write a snapshot directly to chronicle.db")
@@ -1124,11 +1070,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair.add_argument("--dry-run", action="store_true", help="Report affected rows without mutating chronicle.db")
     p_repair.set_defaults(handler=cmd_repair_categories)
 
-    p_repair_mem0 = sub.add_parser("repair-mem0-state", help="Reconcile events.mem0_* fields from authoritative mem0_outbox rows")
-    p_repair_mem0.add_argument("--dry-run", action="store_true", help="Report drift without mutating chronicle.db")
-    p_repair_mem0.add_argument("--apply", action="store_true", help="Apply the reconciliation to chronicle.db")
-    p_repair_mem0.set_defaults(handler=cmd_repair_mem0)
-
     p_repair_stale = sub.add_parser("repair-stale-runs", help="Mark stale running automation and curation rows failed")
     p_repair_stale.add_argument("--dry-run", action="store_true", help="Report stale running rows without mutating chronicle.db")
     p_repair_stale.add_argument(
@@ -1138,14 +1079,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Running rows older than this many hours are marked stale_failed",
     )
     p_repair_stale.set_defaults(handler=cmd_repair_stale_runs)
-
-    p_backfill_mem0 = sub.add_parser(
-        "backfill-mem0-queue",
-        help="Requeue eligible skipped MCP events so high-signal backlog can sync into Mem0",
-    )
-    p_backfill_mem0.add_argument("--dry-run", action="store_true", help="Report eligible rows without mutating chronicle.db")
-    p_backfill_mem0.add_argument("--apply", action="store_true", help="Apply the backfill and mark eligible rows pending")
-    p_backfill_mem0.set_defaults(handler=cmd_backfill_mem0)
 
     p_guard_event = sub.add_parser(
         "guard-event",
@@ -1235,7 +1168,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_automation_run.add_argument(
         "--job",
         required=True,
-        choices=["daily-capture", "daybook", "mem0-dump", "weekly-audit", "backup"],
+        choices=JOB_NAMES,
         help="Job to execute",
     )
     p_automation_run.add_argument("--trigger-source", default="manual", help="Trigger source label")
@@ -1244,11 +1177,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="ISO time the run was due (the scheduler's); its run key names that slot",
     )
     p_automation_run.set_defaults(handler=cmd_automation_run)
-
-    p_sync_mem0 = sub.add_parser("sync-mem0", help="Replay queued Mem0 writes directly from Chronicle mem0_outbox")
-    p_sync_mem0.add_argument("--limit", type=int, default=None, help="Maximum outbox rows to process")
-    p_sync_mem0.add_argument("--trigger-source", default="manual", help="Trigger source label")
-    p_sync_mem0.set_defaults(handler=cmd_sync_mem0)
 
     p_embed_backfill = sub.add_parser(
         "embed-backfill",

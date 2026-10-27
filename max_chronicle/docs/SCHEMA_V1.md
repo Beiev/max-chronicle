@@ -3,7 +3,7 @@
 
 ## Purpose
 
-`chronicle.db` is the canonical local database for durable events, snapshots, entities, ingest runs, and Mem0 sync state.
+`chronicle.db` is the canonical local database for durable events, snapshots, entities, and ingest runs.
 
 The core storage model:
 
@@ -16,9 +16,9 @@ The core storage model:
 
 Current operational database version:
 
-- `PRAGMA user_version = 17`
-- latest applied migration: `0017_dead_weight.sql`
-- next migration number: `0018`
+- `PRAGMA user_version = 18`
+- latest applied migration: `0018_without_mem0.sql`
+- next migration number: `0019`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
@@ -29,6 +29,7 @@ Migration `0013` adds the note index (FR-10): `documents`, `document_chunks`, `d
 Migration `0015` adds a unique index that holds each fact slot to one active value (W8); a database that already held several keeps the newest and retires the rest, with a transaction and a mutation log entry.
 Migration `0016` names columns after what they hold. In `events`, `title` becomes `project`, `circumstances` `domain` and `imported_from` `written_by`; `task_id` and `visibility` (`default` or `raw_only`, the quarantine) become columns. `event_observations` gets `visibility`. `facts` gets `project`, `task_id`, `kind`, `event_id` and `observation_id`, and drops `relation` (it repeated `slot_key`), `confidence`, `reference_time_utc` and `group_id`; `facts_fts` indexes `slot_key`. The unused `v_chronicle_timeline` view goes. A pre-hook refuses a database whose dropped columns hold anything the others cannot give back. `payload_json.memory_guard` and `attributes_json` are still written, so `chronicle migrate --revert 16` (`migrations/down/0016_schema_v2_columns.sql`) returns to schema 15 without losing what was written since (a NULL `group_id` comes back as `[null,null]`, the same scope to every v15 reader).
 Migration `0017` drops what nothing reads: `llm_calls`, `recall_outbox`, `reconciliation_runs` and `session_messages` (never written), the situation layer (`situation_models`, `lens_runs`, `scenario_runs`, `forecast_reviews`), `snapshots_fts` with its triggers, and two duplicate indexes. A snapshot's `recent_ledger` keeps the ids of the events it saw instead of copies; readers take each event as it is now, so one quarantined since stays out. An entry without the id of an event in the database stays a copy. `mem0_snapshot_hits` goes; `mem0_dump` stays. After the upgrade a full VACUUM returns the freed pages and switches the file to `auto_vacuum = INCREMENTAL`, so maintenance reclaims space with `incremental_vacuum`; a new database is switched the same way once initialised. `chronicle migrate --revert 17 --archive chronicle.db.bak-premigrate-v16-v17-…` (`migrations/down/0017_dead_weight.sql`) restores the tables, the index, and the snapshot payloads from the copy taken before the upgrade; nothing else changed, so nothing written since is lost.
+Migration `0018` removes the Mem0 mirror: `mem0_outbox`, the `events` columns `mem0_status` and `mem0_error`, the sync keys (`mem0_status`, `mem0_error`, `mem0_raw`, `mem0_synced_at`) in event and observation payloads, and `mem0_dump` in snapshot payloads. Artifacts, automation runs and entities that name Mem0 are history and stay. `chronicle migrate --revert 18 --archive chronicle.db.bak-premigrate-v17-v18-…` (`migrations/down/0018_without_mem0.sql`) brings them back from the copy taken before the upgrade; the two columns come back at the end of `events`, events written since have none, and snapshots captured since get `mem0_dump = {"enabled": false}`. After an upgrade from v16 straight to v18 the one copy serves both reverts, newest first.
 
 ## Core Tables
 
@@ -112,15 +113,6 @@ Why it exists:
 - forensic debugging
 - tracking data freshness and failures
 
-### `mem0_outbox`
-
-Queue for derived semantic sync into Mem0.
-
-Rule:
-
-- Chronicle first
-- Mem0 later
-
 ## Memory V2 Derived Tables
 
 Schema v1 now also carries derived analytical tables without changing the truth rule:
@@ -140,7 +132,7 @@ Schema v1 creates:
 - `events_fts`
 - `snapshots_fts` (dropped in `0017`: nothing queried it)
 
-This keeps semantic lookup local and inspectable even without live Mem0.
+This keeps lookup local and inspectable.
 
 ## Timeline View
 
@@ -155,8 +147,7 @@ timeline commands query the tables.
 3. Local timestamp is stored for human reconstruction.
 4. JSON payloads must pass `json_valid`.
 5. Imports must be idempotent.
-6. Mem0 sync failures must never corrupt canonical truth.
-7. Derived analytical tables must never be treated as canonical truth.
+6. Derived analytical tables must never be treated as canonical truth.
 
 ## Transitional Import
 

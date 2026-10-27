@@ -3,7 +3,7 @@
 This repository now supports a safe two-layer install model:
 
 - `core`: Chronicle CLI, SQLite truth store, MCP server, SSOT docs, snapshots, projections
-- `optional`: Mem0 bridge, launchd automation, external runtime feeds, repo hooks
+- `optional`: launchd automation, external runtime feeds, repo hooks
 
 The goal is to let someone install Chronicle without inheriting your personal machine layout.
 
@@ -47,7 +47,6 @@ chronicle-mcp --profile chronicler
 - `CHRONICLE_AUTOMATION.toml`
 - starter SSOT docs
 - placeholder runtime files for optional integrations
-- a stub `scripts/mem0_bridge.py` so fresh installs stay safe
 
 The generated workspace is intentionally additive and local. It does not modify your current repository state unless you point `--root` at an existing directory and pass `--force`.
 
@@ -55,7 +54,6 @@ The generated workspace is intentionally additive and local. It does not modify 
 
 These are not required for the core system to work:
 
-- Mem0 mirror
 - local vector recall through Ollama: `ollama pull qwen3-embedding:0.6b`, then `chronicle embed-backfill`
 - launchd scheduling
 - external digest feeds

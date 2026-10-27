@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -24,6 +23,11 @@ class JobSchedule:
     weekday: int | None = None
 
 
+# The jobs Chronicle runs. A [jobs.*] table naming any other (mem0_dump, until
+# 0.26) is left alone: no job runs for it.
+JOB_NAMES = ("daily-capture", "daybook", "weekly-audit", "backup")
+
+
 @dataclass(frozen=True)
 class GuardSettings:
     daybook_per_day: int
@@ -31,7 +35,6 @@ class GuardSettings:
     backup_interval_days: int
     projection_stale_hours: int
     snapshot_stale_hours: int
-    mem0_sync_batch_size: int
     stale_run_ttl_hours: int
     subprocess_timeout_seconds: float
     backup_space_margin_mb: float
@@ -91,7 +94,6 @@ def load_automation_config(path: Path | None = None) -> AutomationConfig:
             backup_interval_days=int(guards.get("backup_interval_days", 2)),
             projection_stale_hours=int(guards.get("projection_stale_hours", 36)),
             snapshot_stale_hours=int(guards.get("snapshot_stale_hours", 30)),
-            mem0_sync_batch_size=int(guards.get("mem0_sync_batch_size", 25)),
             stale_run_ttl_hours=int(guards.get("stale_run_ttl_hours", 6)),
             subprocess_timeout_seconds=float(guards.get("subprocess_timeout_seconds", 120.0)),
             backup_space_margin_mb=float(guards.get("backup_space_margin_mb", 512.0)),
@@ -118,23 +120,6 @@ def ensure_automation_dirs(config: AutomationConfig) -> None:
     config.launchd_log_dir.mkdir(parents=True, exist_ok=True)
     config.daybook_dir.mkdir(parents=True, exist_ok=True)
     config.git_hooks_dir.mkdir(parents=True, exist_ok=True)
-
-
-def load_env_file(path: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-    if not path.exists():
-        return env
-
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        env[key] = value
-        os.environ.setdefault(key, value)
-    return env
 
 
 def repo_by_slug(config: AutomationConfig, slug: str) -> RepoConfig:

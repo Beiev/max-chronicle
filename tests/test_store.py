@@ -188,14 +188,14 @@ def test_start_run_recovers_stale_running_rows_but_blocks_fresh_rows(loaded_mani
         connection.execute(
             """
             INSERT INTO automation_runs(id, job_name, run_key, trigger_source, started_at_utc, status, details_json)
-            VALUES ('stale-auto', 'mem0-dump', 'stale-key', 'pytest', ?, 'running', ?)
+            VALUES ('stale-auto', 'backup', 'stale-key', 'pytest', ?, 'running', ?)
             """,
             (stale_started, json.dumps({"before": "auto"})),
         )
         connection.execute(
             """
             INSERT INTO automation_runs(id, job_name, run_key, trigger_source, started_at_utc, status)
-            VALUES ('fresh-auto', 'mem0-dump', 'fresh-key', 'pytest', ?, 'running')
+            VALUES ('fresh-auto', 'backup', 'fresh-key', 'pytest', ?, 'running')
             """,
             (fresh_started,),
         )
@@ -216,14 +216,14 @@ def test_start_run_recovers_stale_running_rows_but_blocks_fresh_rows(loaded_mani
 
     new_auto_id, auto_created = start_automation_run(
         config,
-        job_name="mem0-dump",
+        job_name="backup",
         run_key="stale-key",
         trigger_source="pytest",
         stale_ttl_hours=6,
     )
     blocked_auto_id, blocked_auto_created = start_automation_run(
         config,
-        job_name="mem0-dump",
+        job_name="backup",
         run_key="fresh-key",
         trigger_source="pytest",
         stale_ttl_hours=6,
@@ -300,9 +300,6 @@ def test_record_event_dedupe_is_race_safe_under_concurrency(loaded_manifest) -> 
         "text": "Concurrent dedupe fact",
         "why": "Concurrent identical writes should collapse to one durable event.",
         "source_files": [],
-        "mem0_status": "off",
-        "mem0_error": None,
-        "mem0_raw": None,
         "recorded_at": "2026-03-29T12:00:00Z",
     }
     config = config_from_manifest(loaded_manifest)
@@ -446,9 +443,6 @@ def test_record_event_is_atomic_across_event_artifact_and_embedding(loaded_manif
                 "text": "Atomicity probe event",
                 "why": "Artifact linking blows up after the event insert.",
                 "source_files": [str(source_file)],
-                "mem0_status": "off",
-                "mem0_error": None,
-                "mem0_raw": None,
                 "_embed_fn": lambda _text: [0.5] * 768,
             },
         )
@@ -482,9 +476,6 @@ def test_record_event_commits_event_artifact_and_embedding_together(loaded_manif
             "text": "Atomic happy path",
             "why": "Event, artifact link and embedding land in one transaction.",
             "source_files": [str(source_file)],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
             "_embed_fn": lambda _text: [0.25] * 768,
         },
     )
@@ -548,7 +539,6 @@ def _snapshot_with_bulk(config, *, captured_at_utc: str) -> None:
         "captured_at_local": "2026-09-08T23:44:41+02:00",
         "repos": [{"path": "/tmp/repo", "branch": "main"}],
         "recent_ledger": [{"text": "x" * 400} for _ in range(8)],
-        "mem0_snapshot_hits": {"q": [{"memory": "y" * 400}]},
         "source_excerpts": [{"id": "status", "content": "z" * 800}],
     }
     with open_connection(config) as connection:
@@ -573,7 +563,7 @@ def _snapshot_with_bulk(config, *, captured_at_utc: str) -> None:
 def test_state_at_digests_snapshot_bulk_by_default(chronicle_sandbox, loaded_manifest) -> None:
     """A two-snapshot state_at used to return 62 KB and blow an agent's context.
 
-    The bulk is capture-time copies of the ledger and of semantic recall —
+    The bulk is capture-time copies of the ledger and of source excerpts —
     stale duplicates of what recent_events and query_memory serve live.
     """
     from max_chronicle.service import _config, reconstruct_timeline
@@ -590,11 +580,9 @@ def test_state_at_digests_snapshot_bulk_by_default(chronicle_sandbox, loaded_man
 
     snapshot = payload["nearest_snapshots"][0]
     assert "recent_ledger" not in snapshot
-    assert "mem0_snapshot_hits" not in snapshot
     assert "source_excerpts" not in snapshot
     assert snapshot["omitted"]["counts"] == {
         "recent_ledger": 8,
-        "mem0_snapshot_hits": 1,
         "source_excerpts": 1,
     }
     assert "detail" in snapshot["omitted"]["hint"]

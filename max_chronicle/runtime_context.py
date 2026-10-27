@@ -11,7 +11,7 @@ from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
-from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION, mem0_enabled
+from .config import ACTIVATION_CONTRACT_NAME, ACTIVATION_CONTRACT_VERSION
 from .db import utc_now  # re-exported: one timestamp format for the whole package
 from .identity import DomainMap, Names
 from .lexical import fold, query_terms
@@ -167,30 +167,6 @@ def score_text(haystack: str, tokens: list[str], raw_query: str) -> float:
     return float(token_hits) + exact_bonus
 
 
-def _normalize_mem0_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip()).casefold()
-
-
-def _normalize_mem0_metadata(value: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    normalized: dict[str, Any] = {}
-    for key, item in value.items():
-        if isinstance(item, str):
-            normalized[key] = re.sub(r"\s+", " ", item.strip())
-            continue
-        normalized[key] = item
-    return normalized
-
-
-def _mem0_result_key(item: dict[str, Any]) -> str:
-    text = _normalize_mem0_text(str(item.get("memory", "")))
-    metadata = _normalize_mem0_metadata(item.get("metadata", {}) or {})
-    if text:
-        return json.dumps({"memory": text, "metadata": metadata}, ensure_ascii=False, sort_keys=True)
-    return json.dumps({"id": item.get("id")}, ensure_ascii=False, sort_keys=True)
-
-
 def search_source_blocks(path: Path, query: str, limit: int) -> list[dict[str, Any]]:
     tokens = tokenize(query)
     hits: list[dict[str, Any]] = []
@@ -226,63 +202,6 @@ def search_source_blocks(path: Path, query: str, limit: int) -> list[dict[str, A
     flush_block()
     hits.sort(key=lambda item: (-item["score"], item["path"], item["line"]))
     return hits[:limit]
-
-
-def search_mem0_dump(path: Path, query: str, limit: int) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-
-    dump = json.loads(path.read_text(encoding="utf-8"))
-    memories = dump.get("memories", [])
-    tokens = tokenize(query)
-    scored: dict[str, dict[str, Any]] = {}
-    for item in memories:
-        text = item.get("memory", "")
-        metadata = item.get("metadata", {}) or {}
-        haystack = " ".join([text, json.dumps(metadata, ensure_ascii=False)])
-        score = score_text(haystack, tokens, query)
-        if score <= 0:
-            continue
-        key = _mem0_result_key(item)
-        existing = scored.get(key)
-        source_collection = item.get("source_collection")
-        source_collection_name = item.get("source_collection_name")
-        if existing is None:
-            deduped = {
-                "id": item.get("id"),
-                "score": score,
-                "memory": text,
-                "metadata": metadata,
-                "source_collections": [source_collection] if source_collection else [],
-                "source_collection_names": [source_collection_name] if source_collection_name else [],
-                "duplicate_ids": [item.get("id")] if item.get("id") else [],
-                "duplicate_count": 1,
-            }
-            if source_collection:
-                deduped["source_collection"] = source_collection
-            if source_collection_name:
-                deduped["source_collection_name"] = source_collection_name
-            scored[key] = deduped
-            continue
-
-        existing["score"] = max(float(existing["score"]), score)
-        existing["duplicate_count"] = int(existing.get("duplicate_count", 1)) + 1
-        if item.get("id") and item.get("id") not in existing["duplicate_ids"]:
-            existing["duplicate_ids"].append(item.get("id"))
-        if source_collection and source_collection not in existing["source_collections"]:
-            existing["source_collections"].append(source_collection)
-        if source_collection_name and source_collection_name not in existing["source_collection_names"]:
-            existing["source_collection_names"].append(source_collection_name)
-
-    ranked = list(scored.values())
-    ranked.sort(
-        key=lambda item: (
-            -item["score"],
-            -int(item.get("duplicate_count", 1)),
-            item.get("id") or "",
-        )
-    )
-    return ranked[:limit]
 
 
 def read_source_content(source: dict[str, Any]) -> dict[str, Any]:
@@ -464,16 +383,6 @@ def source_freshness(manifest: dict[str, Any], source_ids: list[str]) -> list[di
     return rows
 
 
-def mem0_meta(manifest: dict[str, Any]) -> dict[str, Any]:
-    path = expand_path(manifest["paths"]["mem0_dump"])
-    if not path.exists():
-        return {"path": str(path), "exists": False}
-    payload = read_json(path) or {}
-    meta = file_meta(path)
-    meta["total_memories"] = payload.get("total_memories")
-    return meta
-
-
 def build_source_excerpts(manifest: dict[str, Any], domain_id: str) -> list[dict[str, Any]]:
     excerpts: list[dict[str, Any]] = []
     for source_id in manifest["domain_map"][domain_id]["source_ids"]:
@@ -501,12 +410,6 @@ def build_runtime_snapshot(
     local_dt = now_local(manifest)
     domain = manifest["domain_map"][domain_id]
     paths = manifest["paths"]
-    mem0_hits: dict[str, list[dict[str, Any]]] = {}
-    mem0 = mem0_enabled(manifest)
-    if mem0:
-        mem0_dump_path = expand_path(paths["mem0_dump"])
-        for query in domain.get("mem0_queries", []):
-            mem0_hits[query] = search_mem0_dump(mem0_dump_path, query, 2)
 
     # Repo paths are optional: retiring a project means deleting its entry from
     # the manifest, and a snapshot must not hard-fail on a key that is simply
@@ -533,15 +436,12 @@ def build_runtime_snapshot(
         "source_freshness": source_freshness(manifest, domain["source_ids"]),
         "source_excerpts": build_source_excerpts(manifest, domain_id),
         "recent_ledger": recent_events[:8],
-        "mem0_dump": mem0_meta(manifest) if mem0 else {"enabled": False},
-        "mem0_snapshot_hits": mem0_hits,
         "portfolio_assets": summarize_asset_manifest(expand_path(paths["portfolio_asset_manifest"])) if paths.get("portfolio_asset_manifest") else {},
         "repos": repos,
     }
 
 
 def render_activation_prompt(snapshot: dict[str, Any]) -> str:
-    mem0 = (snapshot.get("mem0_dump") or {}).get("enabled") is not False  # a snapshot says when Mem0 is off
     portfolio = snapshot["portfolio_assets"]
     recent_ledger = snapshot["recent_ledger"][:5]
 
@@ -571,8 +471,6 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "Operating contract:",
         "- Treat `chronicle.db` as canonical truth.",
         "- Treat `status/` as the authoritative readable structure and operator-facing view.",
-        *(["- Treat `Mem0` and `mem0-dump.json` as derived semantic recall layers, not as truth."]
-          if mem0 else []),
         "- Treat `ssot-ledger.jsonl` and `chronicle-snapshots.jsonl` as compatibility logs; write through tools, not by hand.",
         "- Communicate in Russian. Write code and commits in English.",
         "- Prefer incremental shipping over rebuilding systems.",
@@ -583,8 +481,6 @@ def render_activation_prompt(snapshot: dict[str, Any]) -> str:
         "- At session start, load the activation context before making assumptions.",
         "- During work, record durable decisions, blockers, state changes, and rationale with `why`.",
         "- Before context switches, handoff, or thread end, capture a timestamped snapshot.",
-        *(["- If live Mem0 is blocked by sandbox or infra, keep Chronicle current and replay later."]
-          if mem0 else []),
         "",
         "Current task:",
         f"- Focus: {snapshot.get('focus') or 'Read current project context before choosing work.'}",

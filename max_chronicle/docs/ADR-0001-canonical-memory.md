@@ -1,6 +1,7 @@
 # ADR-0001 — Chronicle As Canonical Memory
 > Status: accepted
 > Date: 2026-03-15
+> Update 0.26.0: the Mem0 mirror described here is gone (migration 0018).
 
 ## Context
 

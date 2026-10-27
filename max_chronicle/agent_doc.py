@@ -77,10 +77,6 @@ def _arguments(schema: dict) -> str:
     return ", ".join(names) or "none"
 
 
-def _admin_name(name: str) -> str:
-    return f"`{name}` (with the optional Mem0 mirror)" if name == "search_mem0_live" else f"`{name}`"
-
-
 def render() -> str:
     """The page, from the tools of the default profile and the names the others add or drop."""
     default = {tool.name: tool for tool in asyncio.run(_tools(CHRONICLER_PROFILE))}
@@ -96,7 +92,7 @@ def render() -> str:
     dropped = sorted(set(default) - readonly)
     sections.append(
         "## Other profiles\n\n"
-        f"`--profile {ADMIN_PROFILE}` adds the maintenance tools: {', '.join(_admin_name(n) for n in admin)}, "
+        f"`--profile {ADMIN_PROFILE}` adds the maintenance tools: {', '.join(f'`{n}`' for n in admin)}, "
         "and the legacy resources. "
         f"`--profile {READ_ONLY_PROFILE}` (`chronicle-mcp-readonly`) drops {', '.join(f'`{n}`' for n in dropped)}.\n"
     )

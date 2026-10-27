@@ -37,37 +37,6 @@ def _write_text(
     created.append(str(path))
 
 
-def _write_json(
-    path: Path,
-    payload: Any,
-    *,
-    created: list[str],
-    skipped: list[str],
-    force: bool,
-) -> None:
-    _write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        created=created,
-        skipped=skipped,
-        force=force,
-    )
-
-
-def _write_executable(
-    path: Path,
-    content: str,
-    *,
-    created: list[str],
-    skipped: list[str],
-    force: bool,
-) -> None:
-    before = path.exists()
-    _write_text(path, content, created=created, skipped=skipped, force=force)
-    if (not before) or force:
-        path.chmod(0o755)
-
-
 def _manifest_template(root: Path, timezone_name: str) -> str:
     """A fresh installation has no invented projects or external feeds."""
     paths = {
@@ -75,7 +44,6 @@ def _manifest_template(root: Path, timezone_name: str) -> str:
         "chronicle_artifact_dir": root / "chronicle-artifacts",
         "chronicle_package_root": root, "ledger_file": root / "ssot-ledger.jsonl",
         "snapshot_file": root / "chronicle-snapshots.jsonl",
-        "mem0_dump": root / "mem0-dump.json", "mem0_bridge": root / "scripts/mem0_bridge.py",
         "workspace_root": root / "workspaces",
     }
     lines = ["version = 1", 'title = "Chronicle Workspace"', "", "[settings]",
@@ -93,8 +61,7 @@ def _manifest_template(root: Path, timezone_name: str) -> str:
                       f'role = "{role}"', 'trust_tier = "operator_curated"', 'priority = 80'])
     for domain, label in [("global", "Shared Memory"), ("memory", "Memory Architecture")]:
         lines.extend(["", "[[domains]]", f'id = "{domain}"', f'label = "{label}"',
-                      'source_ids = ["status", "priorities", "memory_system", "chronicle_protocol"]',
-                      "mem0_queries = []"])
+                      'source_ids = ["status", "priorities", "memory_system", "chronicle_protocol"]'])
     return "\n".join(lines) + "\n"
 
 
@@ -118,7 +85,6 @@ weekly_audit_per_week = 1
 backup_interval_days = 2
 projection_stale_hours = 36
 snapshot_stale_hours = 30
-mem0_sync_batch_size = 25
 jsonl_rotate_mb = 25
 artifact_store_warn_gb = 6
 
@@ -135,11 +101,6 @@ throttle_seconds = 600
 hour = 23
 minute = 15
 throttle_seconds = 600
-
-[jobs.mem0_dump]
-hour = 7
-minute = 0
-throttle_seconds = 900
 
 [jobs.weekly_audit]
 weekday = 0
@@ -193,7 +154,7 @@ def _priorities_template() -> str:
 
 ## Key Constraints
 - Chronicle is truth.
-- Mem0 and external signals are derived.
+- External signals are derived.
 - Record new facts instead of rewriting history.
 """
 
@@ -215,7 +176,7 @@ def _memory_system_template() -> str:
 
 - `chronicle.db` is canonical truth.
 - `status/*.md` are readable projections and operator docs.
-- `Mem0` and other semantic recall layers are derived, not truth.
+- Semantic recall layers, such as vector stores, are derived, not truth.
 - Compatibility JSONL logs are transitional audit trails.
 
 ## 2. Main Layers
@@ -230,7 +191,7 @@ def _memory_system_template() -> str:
 - ADRs, schema notes, runbooks, and project conventions.
 
 ### L3 — Optional Recall
-- Semantic search systems such as Mem0 or vector stores.
+- Semantic search systems such as vector stores.
 
 ## 5. How Optional Integrations Work
 
@@ -270,8 +231,7 @@ chronicle-mcp --profile chronicler
 
 1. `chronicle.db` is truth.
 2. `status/*.md` are readable projections.
-3. `mem0-dump.json` is optional derived recall.
-4. `chronicle-snapshots.jsonl` and `ssot-ledger.jsonl` are compatibility logs.
+3. `chronicle-snapshots.jsonl` and `ssot-ledger.jsonl` are compatibility logs.
 
 ## Shared Agent Memory
 
@@ -352,54 +312,6 @@ backups/
 """
 
 
-def _mem0_stub_template() -> str:
-    return """#!/usr/bin/env python3
-from __future__ import annotations
-
-import json
-from pathlib import Path
-import sys
-
-
-def _dump(args: list[str]) -> int:
-    output = Path("mem0-dump.json")
-    if "--output" in args:
-        output = Path(args[args.index("--output") + 1]).expanduser()
-    payload = {
-        "snapshot_type": "stub",
-        "total_memories": 0,
-        "collections": {},
-        "collection_totals": {},
-        "memories": [],
-    }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
-    print(json.dumps({"status": "ok", "output": str(output), "message": "Mem0 stub wrote an empty dump."}, ensure_ascii=False))
-    return 0
-
-
-def main() -> int:
-    args = sys.argv[1:]
-    if args and args[0] == "dump":
-        return _dump(args[1:])
-
-    print(
-        json.dumps(
-            {
-                "status": "disabled",
-                "message": "Mem0 bridge is not configured in this workspace yet.",
-            },
-            ensure_ascii=False,
-        )
-    )
-    return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-"""
-
-
 def scaffold_workspace(
     root: Path,
     *,
@@ -430,18 +342,6 @@ def scaffold_workspace(
     for path, content in base_files.items():
         _write_text(path, content, created=created, skipped=skipped, force=force)
 
-    json_files: dict[Path, Any] = {
-        resolved_root / "mem0-dump.json": {
-            "snapshot_type": "stub",
-            "total_memories": 0,
-            "collection_totals": {},
-            "collections": {},
-            "memories": [],
-        },
-    }
-    for path, payload in json_files.items():
-        _write_json(path, payload, created=created, skipped=skipped, force=force)
-
     for directory in (
         resolved_root / "chronicle-artifacts",
         resolved_root / "backups",
@@ -451,17 +351,8 @@ def scaffold_workspace(
         resolved_root / "runtime" / "launch-agents",
         resolved_root / "runtime" / "launchd",
         resolved_root / "workspaces",
-        resolved_root / "scripts",
     ):
         directory.mkdir(parents=True, exist_ok=True)
-
-    _write_executable(
-        resolved_root / "scripts" / "mem0_bridge.py",
-        _mem0_stub_template(),
-        created=created,
-        skipped=skipped,
-        force=force,
-    )
 
     config = default_config(
         manifest_path=resolved_root / "SSOT_MANIFEST.toml",

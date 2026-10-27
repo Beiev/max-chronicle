@@ -14,18 +14,16 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from .automation import AutomationConfig, ensure_automation_dirs, load_automation_config, load_env_file, repo_by_slug, repo_slug_for_path
-from .config import default_automation_path, feature_enabled, mem0_enabled
-from .runtime_context import expand_path, read_json, utc_now
+from .automation import AutomationConfig, ensure_automation_dirs, load_automation_config, repo_by_slug, repo_slug_for_path
+from .config import default_automation_path, feature_enabled
+from .runtime_context import expand_path, utc_now
 from .backup_retention import retention_report
-from .service import backfill_mem0_queue, build_freshness_audit, capture_runtime_snapshot, embed_backfill, record_event, repair_mem0_state, ENV_FEATURE_EVENT_EMBEDDINGS
+from .service import build_freshness_audit, capture_runtime_snapshot, embed_backfill, record_event, ENV_FEATURE_EVENT_EMBEDDINGS
 from .store import (
     config_from_manifest,
-    count_mem0_outbox,
     DEFAULT_STALE_RUN_TTL_HOURS,
     ensure_entity,
     fetch_automation_run,
@@ -36,7 +34,6 @@ from .store import (
     fetch_latest_curation_run,
     fetch_latest_projection_run,
     fetch_latest_snapshot,
-    fetch_mem0_outbox_entries,
     fingerprint_events_between,
     finish_automation_run,
     finish_backup_run,
@@ -51,7 +48,6 @@ from .store import (
     _atomic_write_text,
     store_artifact_from_path,
     store_artifact_text,
-    update_event_mem0_state,
     upsert_hook_event,
     upsert_relation,
 )
@@ -60,7 +56,6 @@ from .store import (
 LAUNCHD_JOB_SUFFIXES = {
     "daily_capture": "daily-capture",
     "daybook": "daybook",
-    "mem0_dump": "mem0-dump",
     "weekly_audit": "weekly-audit",
     "backup": "backup",
 }
@@ -77,20 +72,15 @@ def launchd_labels(automation) -> dict[str, str]:
 
 
 def _installed_jobs(manifest: dict[str, Any], automation) -> dict[str, str]:
-    """The launchd jobs this installation runs: without Mem0, no Mem0 dump.
+    """The launchd jobs this installation runs.
 
     None when the server's scheduler runs the jobs ([scheduler] enabled):
     launchd then keeps only the server alive.
     """
     if getattr(automation, "scheduler_enabled", False):
         return {}
-    labels = launchd_labels(automation)
-    if not mem0_enabled(manifest):
-        labels.pop("mem0_dump", None)
-    return labels
+    return launchd_labels(automation)
 
-MEM0_OUTBOX_PRUNE_AFTER_DAYS = 30
-MEM0_OUTBOX_PRUNE_BATCH = 5000
 WAL_CHECKPOINT_THRESHOLD_BYTES = 64 * 1024 * 1024
 DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
 # A daybook run also completes recent days whose daybook is missing or older
@@ -118,35 +108,6 @@ def _subprocess_timeout_seconds(automation: AutomationConfig | None = None) -> f
 def _backup_space_margin_bytes(automation: AutomationConfig) -> int:
     margin_mb = float(getattr(automation.guards, "backup_space_margin_mb", 512.0))
     return max(int(margin_mb * 1024 * 1024), 0)
-
-
-def _timeout_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").strip()
-    return value.strip()
-
-
-def _subprocess_timeout_result(
-    *,
-    command: list[str],
-    timeout_seconds: float,
-    exc: subprocess.TimeoutExpired,
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "status": "failed_soft",
-        "reason": "subprocess_timeout",
-        "command": command,
-        "timeout_seconds": timeout_seconds,
-        "stdout": _timeout_text(exc.stdout),
-        "stderr": _timeout_text(exc.stderr),
-        "error": f"subprocess_timeout after {timeout_seconds:.3g}s",
-    }
-    if extra:
-        payload.update(extra)
-    return payload
 
 
 def _backup_volume_root(backup_root: Path) -> Path | None:
@@ -234,126 +195,11 @@ def _local_day_bounds(config, target_date: str | None = None) -> tuple[datetime,
     return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
 
-def _maybe_load_env(automation: AutomationConfig) -> dict[str, str]:
-    return load_env_file(automation.env_file)
-
-
-def _compose_mem0_text(text: str, why: str | None) -> str:
-    return text if not why else f"{text} Reason: {why}"
-
-
-def _mem0_command(manifest: dict[str, Any]) -> list[str]:
-    status_root = _status_root(manifest)
-    wrapper = status_root / "scripts" / "mem0"
-    if wrapper.exists():
-        return [str(wrapper)]
-
-    bridge = expand_path(manifest["paths"]["mem0_bridge"])
-    mem0_python = status_root / ".venv-mem0" / "bin" / "python3"
-    if mem0_python.exists():
-        return [str(mem0_python), str(bridge)]
-    return [sys.executable, str(bridge)]
-
-
 def _script_runner(script_path: Path) -> list[str]:
     uv = shutil.which("uv")
     if uv:
         return [uv, "run", str(script_path)]
     return [sys.executable, str(script_path)]
-
-
-def _run_mem0_dump(
-    manifest: dict[str, Any],
-    automation: AutomationConfig,
-    *,
-    trigger_source: str,
-    automation_run_id: str | None = None,
-) -> dict[str, Any]:
-    if not mem0_enabled(manifest):
-        return {"status": "skipped", "reason": "[mem0] enabled = false", "trigger_source": trigger_source}
-    _maybe_load_env(automation)
-    config = config_from_manifest(manifest)
-    dump_path = expand_path(manifest["paths"]["mem0_dump"])
-    dump_path.parent.mkdir(parents=True, exist_ok=True)
-    command = _mem0_command(manifest) + ["dump", "--output", str(dump_path)]
-    timeout_seconds = _subprocess_timeout_seconds(automation)
-    try:
-        proc = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=os.environ.copy(),
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return _subprocess_timeout_result(
-            command=command,
-            timeout_seconds=timeout_seconds,
-            exc=exc,
-            extra={"dump_path": str(dump_path), "trigger_source": trigger_source},
-        )
-    stdout = (proc.stdout or "").strip()
-    stderr = (proc.stderr or "").strip()
-    if proc.returncode != 0:
-        return {
-            "status": "failed",
-            "command": command,
-            "dump_path": str(dump_path),
-            "error": stderr or stdout or f"exit_{proc.returncode}",
-            "trigger_source": trigger_source,
-        }
-
-    dump_payload = read_json(dump_path) or {}
-    memories = dump_payload.get("memories")
-    memory_count = dump_payload.get("total_memories")
-    if memory_count is None and isinstance(memories, list):
-        memory_count = len(memories)
-
-    observed_at_utc = utc_now()
-    artifact = store_artifact_from_path(
-        config,
-        source_path=dump_path,
-        artifact_type="mem0-dump",
-        observed_at_utc=observed_at_utc,
-        entity_type="system",
-        entity_name="mem0",
-        metadata={
-            "job_name": "mem0-dump",
-            "trigger_source": trigger_source,
-            "memory_count": memory_count,
-        },
-    )
-    latest_snapshot = fetch_latest_snapshot(config, domain="global") or fetch_latest_snapshot(config)
-    if artifact is not None and automation_run_id is not None:
-        link_artifact(
-            config,
-            artifact_id=artifact["id"],
-            target_type="automation_run",
-            target_id=automation_run_id,
-            link_role="documents",
-            metadata={"job_name": "mem0-dump"},
-        )
-    if artifact is not None and latest_snapshot is not None:
-        link_artifact(
-            config,
-            artifact_id=artifact["id"],
-            target_type="snapshot",
-            target_id=latest_snapshot["id"],
-            link_role="documents",
-            metadata={"job_name": "mem0-dump"},
-        )
-
-    return {
-        "status": "ok",
-        "command": command,
-        "dump_path": str(dump_path),
-        "artifact_id": artifact["id"] if artifact else None,
-        "snapshot_id": latest_snapshot["id"] if latest_snapshot else None,
-        "memory_count": memory_count,
-        "trigger_source": trigger_source,
-        "stdout": stdout,
-    }
 
 
 def _legacy_surface_findings(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -417,281 +263,6 @@ def _legacy_surface_findings(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         seen.add(key)
         unique.append(finding)
     return unique
-
-
-# Live Mem0 sync retry policy (best-effort; mem0_outbox is the real durability
-# net). Preserves the prior behaviour, which was borrowed from the now-removed
-# [minimax] config (max_retries=3, retry_base_delay=2.0, timeout=45s).
-_MEM0_MAX_RETRIES = 3
-_MEM0_RETRY_BASE_DELAY = 2.0
-_MEM0_TIMEOUT_SECONDS = 45.0
-
-
-def _add_to_live_mem0(
-    manifest: dict[str, Any],
-    automation: AutomationConfig,
-    *,
-    text: str,
-    category: str | None,
-    project: str | None,
-) -> dict[str, Any]:
-    _maybe_load_env(automation)
-    command = _mem0_command(manifest) + ["add", text]
-    if category:
-        command.extend(["--category", category])
-    if project:
-        command.extend(["--project", project])
-
-    env = os.environ.copy()
-    max_retries = _MEM0_MAX_RETRIES
-    retry_base_delay = _MEM0_RETRY_BASE_DELAY
-    timeout_seconds = _MEM0_TIMEOUT_SECONDS
-    last_error = ""
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            proc = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=env,
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            last_error = f"mem0 add timed out after {timeout_seconds:.0f}s"
-            if attempt == max_retries:
-                break
-            time.sleep(retry_base_delay * (2 ** (attempt - 1)))
-            continue
-        raw = (proc.stdout or "").strip()
-        error = (proc.stderr or raw or "").strip()
-        if proc.returncode == 0:
-            return {"ok": True, "raw": raw, "command": command, "attempts": attempt}
-
-        last_error = error
-        normalized = error.casefold()
-        transient = any(
-            marker in normalized
-            for marker in (
-                "503",
-                "unavailable",
-                "timeout",
-                "timed out",
-                "rate limit",
-                "temporar",
-                "connection reset",
-                "deadline exceeded",
-            )
-        )
-        if not transient or attempt == max_retries:
-            break
-        time.sleep(retry_base_delay * (2 ** (attempt - 1)))
-
-    return {"ok": False, "error": last_error, "command": command, "attempts": max_retries}
-
-
-def _add_to_live_mem0_batch(
-    manifest: dict[str, Any],
-    automation: AutomationConfig,
-    *,
-    items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not items:
-        return {"ok": True, "payload": {"status": "ok", "processed": []}}
-
-    _maybe_load_env(automation)
-    max_retries = _MEM0_MAX_RETRIES
-    retry_base_delay = _MEM0_RETRY_BASE_DELAY
-    timeout_seconds = _MEM0_TIMEOUT_SECONDS
-    batch_timeout_seconds = max(min(timeout_seconds * max(len(items), 1), 120.0), 30.0)
-
-    temp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
-            json.dump({"items": items}, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            temp_path = handle.name
-
-        command = _mem0_command(manifest) + [
-            "sync-batch",
-            "--input",
-            temp_path,
-            "--max-retries",
-            str(max_retries),
-            "--retry-base-delay",
-            str(retry_base_delay),
-        ]
-        try:
-            proc = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=os.environ.copy(),
-                timeout=batch_timeout_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "error": f"sync-batch timed out after {batch_timeout_seconds:.0f}s",
-                "command": command,
-            }
-        raw = (proc.stdout or "").strip()
-        error = (proc.stderr or raw or "").strip()
-        if proc.returncode != 0:
-            return {"ok": False, "error": error, "command": command, "raw": raw}
-        try:
-            payload = json.loads(raw or "{}")
-        except json.JSONDecodeError as exc:
-            return {
-                "ok": False,
-                "error": f"Invalid sync-batch JSON output: {exc}",
-                "command": command,
-                "raw": raw,
-            }
-        return {"ok": True, "payload": payload, "command": command, "raw": raw}
-    finally:
-        if temp_path:
-            Path(temp_path).unlink(missing_ok=True)
-
-
-def sync_mem0_outbox(
-    manifest: dict[str, Any],
-    automation: AutomationConfig,
-    *,
-    limit: int | None = None,
-    trigger_source: str = "manual",
-) -> dict[str, Any]:
-    config = config_from_manifest(manifest)
-    batch_limit = limit or automation.guards.mem0_sync_batch_size
-    if not mem0_enabled(manifest):
-        return {"status": "disabled", "reason": "[mem0] enabled = false", "trigger_source": trigger_source,
-                "requested_limit": batch_limit, "seen": 0, "synced": 0, "failed": 0, "skipped": 0, "processed": []}
-    entries = fetch_mem0_outbox_entries(config, limit=batch_limit)
-    synced = 0
-    failed = 0
-    skipped = 0
-    processed: list[dict[str, Any]] = []
-    batch_ready: list[dict[str, Any]] = []
-
-    for entry in entries:
-        memory_guard = entry.get("payload", {}).get("memory_guard")
-        if isinstance(memory_guard, dict) and memory_guard.get("verdict") == "local_only":
-            update_event_mem0_state(
-                config,
-                event_id=entry["event_id"],
-                mem0_status="skipped",
-                mem0_error="guarded_local_only",
-                attempted=False,
-            )
-            skipped += 1
-            processed.append({"event_id": entry["event_id"], "status": "skipped", "reason": "guarded_local_only"})
-            continue
-        text = _compose_mem0_text(entry.get("text") or "", entry.get("why"))
-        if not text.strip():
-            update_event_mem0_state(
-                config,
-                event_id=entry["event_id"],
-                mem0_status="skipped",
-                mem0_error="empty_text",
-                attempted=False,
-            )
-            skipped += 1
-            processed.append({"event_id": entry["event_id"], "status": "skipped", "reason": "empty_text"})
-            continue
-        batch_ready.append(
-            {
-                "event_id": entry["event_id"],
-                "text": text,
-                "category": entry.get("category"),
-                "project": entry.get("project"),
-            }
-        )
-
-    def handle_result(event_id: str, result: dict[str, Any]) -> None:
-        nonlocal synced, failed
-        if result.get("ok"):
-            update_event_mem0_state(
-                config,
-                event_id=event_id,
-                mem0_status="stored",
-                mem0_error=None,
-                mem0_raw=result.get("raw"),
-                mem0_synced_at=utc_now(),
-                attempted=True,
-            )
-            synced += 1
-            processed.append({"event_id": event_id, "status": "synced"})
-            return
-
-        update_event_mem0_state(
-            config,
-            event_id=event_id,
-            mem0_status="failed",
-            mem0_error=result.get("error"),
-            attempted=True,
-        )
-        failed += 1
-        processed.append(
-            {
-                "event_id": event_id,
-                "status": "failed",
-                "error": result.get("error"),
-            }
-        )
-
-    chunk_size = max(1, min(batch_limit, 5))
-    for offset in range(0, len(batch_ready), chunk_size):
-        chunk = batch_ready[offset : offset + chunk_size]
-        batch_result = _add_to_live_mem0_batch(
-            manifest,
-            automation,
-            items=chunk,
-        )
-        if batch_result["ok"]:
-            result_map = {
-                item.get("event_id"): item
-                for item in batch_result["payload"].get("processed", [])
-                if item.get("event_id")
-            }
-            for item in chunk:
-                event_id = item["event_id"]
-                result = result_map.get(event_id)
-                if result is None:
-                    handle_result(
-                        event_id,
-                        {
-                            "ok": False,
-                            "error": "sync-batch returned no result for event",
-                        },
-                    )
-                    continue
-                handle_result(event_id, result)
-            continue
-
-        for item in chunk:
-            result = _add_to_live_mem0(
-                manifest,
-                automation,
-                text=item["text"],
-                category=item.get("category"),
-                project=item.get("project"),
-            )
-            handle_result(item["event_id"], result)
-
-    return {
-        "status": "ok" if failed == 0 else "issues",
-        "trigger_source": trigger_source,
-        "requested_limit": batch_limit,
-        "seen": len(entries),
-        "synced": synced,
-        "failed": failed,
-        "skipped": skipped,
-        "processed": processed,
-        "remaining_pending": count_mem0_outbox(config, status="pending"),
-        "remaining_failed": count_mem0_outbox(config, status="failed"),
-    }
 
 
 def _git_root(path: Path) -> Path:
@@ -945,9 +516,6 @@ def run_git_commit_hook(
             "text": f"{resolved_slug} commit {commit_sha[:12]}: {summary}",
             "why": "A tracked repository recorded a new commit that should remain part of the Chronicle timeline.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="chronicle_hook.git_commit",
@@ -1181,9 +749,6 @@ def run_daybook(
                 "text": f"Chronicle daybook generated for {local_date}.",
                 "why": "Summarize the day's durable changes into a readable historical record.",
                 "source_files": [str(daybook_path)],
-                "mem0_status": "off",
-                "mem0_error": None,
-                "mem0_raw": None,
             },
             append_compat=True,
             source_kind=DAYBOOK_SOURCE_KIND,
@@ -1261,70 +826,6 @@ def _copy_tree_incremental(source_root: Path, target_root: Path) -> tuple[int, i
         copied_bytes += source_size
         strategy["copied"] += 1
     return copied_files, copied_bytes, strategy
-
-
-def _prune_mem0_outbox(config) -> dict[str, Any]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=MEM0_OUTBOX_PRUNE_AFTER_DAYS)
-    cutoff_utc = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-    with open_connection(config) as connection:
-        retained_pending = int(
-            connection.execute("SELECT COUNT(*) FROM mem0_outbox WHERE status = 'pending'").fetchone()[0]
-        )
-        retained_failed = int(
-            connection.execute("SELECT COUNT(*) FROM mem0_outbox WHERE status = 'failed'").fetchone()[0]
-        )
-        prunable_count = int(
-            connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM mem0_outbox
-                WHERE status IN ('synced', 'skipped')
-                  AND COALESCE(synced_at_utc, created_at_utc) < ?
-                """,
-                (cutoff_utc,),
-            ).fetchone()[0]
-        )
-
-        rows = connection.execute(
-            """
-            SELECT id, event_id, status
-            FROM mem0_outbox
-            WHERE status IN ('synced', 'skipped')
-              AND COALESCE(synced_at_utc, created_at_utc) < ?
-            ORDER BY COALESCE(synced_at_utc, created_at_utc) ASC
-            LIMIT ?
-            """,
-            (cutoff_utc, MEM0_OUTBOX_PRUNE_BATCH),
-        ).fetchall()
-        if not rows:
-            return {
-                "pruned": 0,
-                "cutoff_utc": cutoff_utc,
-                "skipped": False,
-                "reason": "nothing_to_prune",
-                "prunable": prunable_count,
-                "retained_pending": retained_pending,
-                "retained_failed": retained_failed,
-            }
-
-        with connection:
-            connection.executemany(
-                "DELETE FROM mem0_outbox WHERE id = ?",
-                ((row["id"],) for row in rows),
-            )
-
-    pruned_by_status = Counter(row["status"] for row in rows)
-    return {
-        "pruned": len(rows),
-        "cutoff_utc": cutoff_utc,
-        "skipped": False,
-        "reason": "pruned_retained_rows",
-        "prunable": prunable_count,
-        "retained_pending": retained_pending,
-        "retained_failed": retained_failed,
-        "pruned_by_status": dict(pruned_by_status),
-        "sample_event_ids": [row["event_id"] for row in rows[:5]],
-    }
 
 
 def _rotate_jsonl_if_needed(path: Path, *, cap_bytes: int) -> dict[str, Any]:
@@ -1657,7 +1158,6 @@ def _restore_check(source_db: Path, *, backup_path: Path | None = None,
             foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
             events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
             snapshots = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-            mem0_outbox = connection.execute("SELECT COUNT(*) FROM mem0_outbox").fetchone()[0]
             latest_snapshot = connection.execute(
                 "SELECT id FROM snapshots ORDER BY captured_at_utc DESC LIMIT 1"
             ).fetchone()
@@ -1762,7 +1262,6 @@ def _restore_check(source_db: Path, *, backup_path: Path | None = None,
             "foreign_key_violations": len(foreign_key_violations),
             "events": int(events),
             "snapshots": int(snapshots),
-            "mem0_outbox": int(mem0_outbox),
             "backup_runs_running": int(running_backup_runs),
             "latest_snapshot_id": latest_snapshot[0] if latest_snapshot else None,
             "latest_backup_run_id": latest_backup_run["id"] if latest_backup_run is not None else None,
@@ -1844,7 +1343,7 @@ def run_backup(
                 "last_backup": latest["started_at_utc"],
             }
 
-    maintenance = _prune_mem0_outbox(config)
+    maintenance: dict[str, Any] = {}
 
     # JSONL rotation: archive append-only compat logs when they exceed the cap.
     rotate_cap_bytes = int(getattr(automation.guards, "jsonl_rotate_mb", 25.0) * 1024 * 1024)
@@ -2154,15 +1653,6 @@ def _evaluate_audit(
     latest_backup = fetch_latest_backup_run(config, successful_only=True)
     backup_target_available = automation.backup_root.exists()
     freshness_audit = build_freshness_audit(manifest, domain_id="memory" if "memory" in manifest["domain_map"] else "global")
-    if mem0_enabled(manifest):
-        pending_mem0 = count_mem0_outbox(config, status="pending")
-        failed_mem0 = count_mem0_outbox(config, status="failed")
-        mem0_state_drift = repair_mem0_state(manifest, dry_run=True)
-        mem0_queue_backfill = backfill_mem0_queue(manifest, dry_run=True)
-    else:  # rows queued before Mem0 was switched off are no backlog
-        pending_mem0 = failed_mem0 = 0
-        mem0_state_drift = {"repaired_count": 0, "repaired": []}
-        mem0_queue_backfill = {"requeued_count": 0, "requeued": []}
     legacy_surface_findings = _legacy_surface_findings(manifest)
 
     if not latest_snapshot:
@@ -2189,15 +1679,6 @@ def _evaluate_audit(
         if latest_backup.get("restore_ok") == 0:
             issues.append({"severity": "critical", "kind": "restore_failed", "detail": "Latest backup restore check failed."})
 
-    if pending_mem0 or failed_mem0:
-        issues.append(
-            {
-                "severity": "warn",
-                "kind": "mem0_backlog",
-                "detail": f"mem0 backlog pending={pending_mem0} failed={failed_mem0}",
-            }
-        )
-
     for freshness_issue in freshness_audit["issues"]:
         issues.append(
             {
@@ -2206,32 +1687,6 @@ def _evaluate_audit(
                 "detail": freshness_issue["detail"],
                 "path": freshness_issue.get("path"),
                 "source_id": freshness_issue.get("source_id"),
-            }
-        )
-
-    if mem0_state_drift["repaired_count"]:
-        sample_ids = [item["id"] for item in mem0_state_drift["repaired"][:5]]
-        issues.append(
-            {
-                "severity": "critical",
-                "kind": "mem0_state_drift",
-                "detail": (
-                    "events.mem0_* drift from mem0_outbox for "
-                    f"{mem0_state_drift['repaired_count']} row(s); sample={sample_ids}"
-                ),
-            }
-        )
-
-    if mem0_queue_backfill["requeued_count"]:
-        sample_ids = [item["id"] for item in mem0_queue_backfill["requeued"][:5]]
-        issues.append(
-            {
-                "severity": "warn",
-                "kind": "mem0_queue_backfill",
-                "detail": (
-                    "Eligible MCP events are still skipped from semantic sync for "
-                    f"{mem0_queue_backfill['requeued_count']} row(s); sample={sample_ids}"
-                ),
             }
         )
 
@@ -2247,14 +1702,6 @@ def _evaluate_audit(
             }
         )
 
-    retention_status = _prune_mem0_outbox(config) if weekly else {
-        "pruned": 0,
-        "cutoff_utc": (datetime.now(timezone.utc) - timedelta(days=MEM0_OUTBOX_PRUNE_AFTER_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "skipped": True,
-        "reason": "audit_read_only",
-        "retained_pending": pending_mem0,
-        "retained_failed": failed_mem0,
-    }
     wal_checkpoint = _maybe_checkpoint_wal(config, reason="weekly_audit") if weekly else None
 
     # Artifact-store size guard (warn only — no deletion).
@@ -2294,9 +1741,6 @@ def _evaluate_audit(
         "latest_backup": latest_backup.get("started_at_utc") if latest_backup else None,
         "backup_target_root": str(automation.backup_root),
         "backup_target_available": backup_target_available,
-        "mem0_state_drift_count": mem0_state_drift["repaired_count"],
-        "mem0_state_drift_sample": mem0_state_drift["repaired"][:10],
-        "mem0_outbox_retention": retention_status,
         "wal_checkpoint": wal_checkpoint,
         "legacy_surface_findings": legacy_surface_findings,
         "artifact_store_bytes": artifact_store_bytes,
@@ -2399,9 +1843,6 @@ def run_audit(
                     "text": f"Chronicle audit {base_run_key}{' (forced)' if force else ''}: {len(issues)} issues detected.",
                     "why": json.dumps(counts, ensure_ascii=False),
                     "source_files": [],
-                    "mem0_status": "off",
-                    "mem0_error": None,
-                    "mem0_raw": None,
                 },
                 append_compat=True,
                 source_kind="chronicle_audit",
@@ -2528,12 +1969,6 @@ def run_automation_job(
                 append_compat=True,
                 render_generated=True,
             )
-            sync = sync_mem0_outbox(
-                manifest,
-                automation,
-                limit=automation.guards.mem0_sync_batch_size,
-                trigger_source=trigger_source,
-            )
             # Repair a bounded slice after an embedding outage. Local capture
             # remains successful even while the optional index is unavailable.
             embedding_repair = {"status": "disabled"}
@@ -2546,7 +1981,7 @@ def run_automation_job(
             # JSONL copy failed; the run says so instead of reporting ok (W2).
             errors = snapshot.get("side_effect_errors") or {}
             status = "failed_soft" if errors else "ok"
-            details = {"sync": sync, "embedding_repair": embedding_repair, "side_effect_errors": errors}
+            details = {"embedding_repair": embedding_repair, "side_effect_errors": errors}
             finish_automation_run(
                 config,
                 run_id=run_id,
@@ -2577,25 +2012,6 @@ def run_automation_job(
         # repeats and the DST fall-back hour.
         return _dispatch(daily_key if occurrence is not None else local_now.isoformat(timespec="microseconds"),
                          _daybook)
-
-    if job_name == "mem0-dump":
-        def _mem0_dump(run_id: str) -> dict[str, Any]:
-            result = _run_mem0_dump(
-                manifest,
-                automation,
-                trigger_source=trigger_source,
-                automation_run_id=run_id,
-            )
-            finish_automation_run(
-                config,
-                run_id=run_id,
-                status="ok" if result["status"] == "ok" else result["status"],
-                details=result,
-                snapshot_id=result.get("snapshot_id"),
-            )
-            return result | {"run_id": run_id}
-
-        return _dispatch(daily_key, _mem0_dump)
 
     if job_name == "weekly-audit":
         def _weekly_audit(run_id: str) -> dict[str, Any]:

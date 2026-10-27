@@ -82,8 +82,7 @@ identifier after a key (an SSH fingerprint, a random URL id) may be
 removed with it.
 Identifiers such as `request_id` and paths are left as given, the source file is
 never modified, and binary evidence is archived unchanged. `query_context`
-filters what it reads from status files and the Mem0 dump, and
-`search_mem0_live` what Mem0 returns. Not filtered yet: snapshot excerpts and
+filters what it reads from status files. Not filtered yet: snapshot excerpts and
 legacy imports. Time is linear in the
 input, so a hostile or huge text cannot stall the write path.
 

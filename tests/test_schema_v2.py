@@ -197,14 +197,14 @@ def test_revert_16_returns_the_schema_and_data_v023_reads(chronicle_sandbox, loa
     with connect(config.db_path) as connection:
         before = {table: [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
                   for table in ("events", "event_observations", "facts")}
-    archive = prepare_database(config, allow_upgrade=True).backup_path  # 0016 and 0017
+    archive = prepare_database(config, allow_upgrade=True).backup_path  # 0016, 0017 and 0018
     # Written by this code on the new schema, then quarantined: the way back must keep both.
     new = service.record_event(loaded_manifest, {
         "agent": "agent-a", "domain": "global", "project": "atlas", "task_id": "launch", "category": "decision",
         "text": "Atlas launches on Friday", "fact": {"slot": "launch.day", "value": "friday", "kind": "decision"}})
     service.guard_event(loaded_manifest, event_id=new["id"], verdict="local_only", reason="test", apply=True)
 
-    for revert in (["17", "--archive", str(archive)], ["16"]):  # the newest first
+    for revert in (["18", "--archive", str(archive)], ["17", "--archive", str(archive)], ["16"]):  # newest first
         monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
                                           "migrate", "--revert", *revert])
         assert cli.main() == 0
@@ -216,12 +216,14 @@ def test_revert_16_returns_the_schema_and_data_v023_reads(chronicle_sandbox, loa
     with open_connection(replace(_v15(config, tmp_path), db_path=fresh)) as connection:
         expected = _schema(connection)
         expected_facts = _xinfo(connection, "facts")
+        expected_events = _xinfo(connection, "events")
     with connect(config.db_path) as connection:
-        # Only the facts table's own DDL differs: re-added columns come last, and
+        # Only the facts and events DDL differ: re-added columns come last, and
         # relation, NOT NULL, can only come back with a default (v15 code always sets it).
-        assert {item for item in _schema(connection) ^ expected if item[1] != "facts"} == set()
+        assert {item for item in _schema(connection) ^ expected if item[1] not in {"facts", "events"}} == set()
         assert _xinfo(connection, "facts") ^ expected_facts == {
             ("relation", "TEXT", 1, None, 0, 0), ("relation", "TEXT", 1, "''", 0, 0)}
+        assert _xinfo(connection, "events") == expected_events
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 15
         for table, rows in before.items():
@@ -243,7 +245,7 @@ def test_revert_16_returns_the_schema_and_data_v023_reads(chronicle_sandbox, loa
     assert found == 1
 
     # And up again: the cycle repeats.
-    assert [item.version for item in prepare_database(config, allow_upgrade=True).applied] == [16, 17]
+    assert [item.version for item in prepare_database(config, allow_upgrade=True).applied] == [16, 17, 18]
     assert fetch_event(config, event_id=new["id"])["visibility"] == "raw_only"
 
 

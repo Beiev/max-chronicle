@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-import subprocess
 import unicodedata
 from typing import Any
 
@@ -14,16 +13,11 @@ from .config import (
     ACTIVATION_CONTRACT_NAME,
     ACTIVATION_CONTRACT_VERSION,
     DEFAULT_EVENT_DEDUP_WINDOW_HOURS,
-    DEFAULT_MEM0_LIVE_TIMEOUT_S,
     ENV_EVENT_DEDUP_WINDOW_HOURS,
     ENV_FEATURE_ENTITY_ALIASES,
     ENV_FEATURE_EVENT_HASH_DEDUP,
-    ENV_FEATURE_MEM0_LIVE_SEARCH,
-    ENV_MEM0_LIVE_TIMEOUT_S,
-    env_float,
     env_int,
     feature_enabled,
-    mem0_enabled,
 )
 from .db import database_summary
 from .identity import fold
@@ -35,13 +29,11 @@ from .runtime_context import (
     build_runtime_snapshot,
     expand_path,
     file_meta,
-    mem0_meta,
     normalize_heading,
     read_json,
     read_jsonl,
     read_source_content,
     render_activation_prompt,
-    search_mem0_dump,
     search_source_blocks,
     score_text,
     shorten,
@@ -72,6 +64,7 @@ from .store import (
     open_connection,
     persist_staged_artifact,
     quarantined_event_ids,
+    RETIRED_EVENT_KEYS,
     search_events,
     stage_artifact_from_path,
     start_ingest_run,
@@ -81,7 +74,6 @@ from .store import (
     store_projection_run,
     store_snapshot,
     timeline_state,
-    update_event_mem0_state,
     update_event_memory_guard,
     upsert_normalized_entity,
     write_transaction,
@@ -137,13 +129,6 @@ CATEGORY_ALIASES = {
     "block": "blocker",
     "status_change": "state_change",
 }
-MCP_MEM0_NOISE_CATEGORIES = frozenset(
-    {
-        "daily_summary",
-        "git_commit",
-        "maintenance",
-    }
-)
 MEMORY_GUARD_VERSION = "2026-03-22.v1"
 MEMORY_GUARD_SCOPED_CATEGORIES = frozenset({"note", "state_change", "maintenance", "observation"})
 MEMORY_GUARD_EVIDENCE_CATEGORIES = frozenset(
@@ -285,7 +270,7 @@ SOURCE_ROLE_QUESTIONS = {
     "memory_policy": {
         "can": [
             "What are the current memory rules and trust boundaries?",
-            "How should Chronicle and Mem0 be used?",
+            "How should Chronicle be used?",
         ],
         "cannot": [
             "Live system state or latest world events.",
@@ -379,20 +364,6 @@ def _projection_note(manifest: dict[str, Any], source_id: str) -> str | None:
     source = manifest.get("source_map", {}).get(source_id) or {}
     note = source.get("projection_note")
     return str(note).strip() or None if note else None
-
-
-def default_mem0_status(entry: dict[str, Any], *, source_kind: str, mem0: bool = True) -> str | None:
-    """The Mem0 state a new event starts in; "off" whenever the installation runs without Mem0."""
-    if not mem0:
-        return "off"
-    explicit = entry.get("mem0_status")
-    if explicit not in {None, "", "auto"}:
-        return str(explicit)
-    if source_kind != "chronicle_mcp":
-        return None
-    if entry.get("category") in MCP_MEM0_NOISE_CATEGORIES:
-        return "off"
-    return "queued"
 
 
 def _sha256_text(text: str) -> str:
@@ -533,7 +504,7 @@ _UNREDACTED_ENTRY_KEYS = frozenset(
     {
         "id", "request_id", "session_id", "agent", "domain", "category", "project",
         "task_id", "recorded_at", "occurred_at", "entity_id", "entity_type",
-        "source_files", "slot", "kind", "supersedes", "mem0_status", "memory_guard",
+        "source_files", "slot", "kind", "supersedes", "memory_guard",
         "content_hash", "skip_generic_source_archives", "agent_source",
     }
 )
@@ -546,7 +517,7 @@ def _redact_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]
 
 
 def _normalize_record_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(entry)
+    normalized = {key: value for key, value in entry.items() if key not in RETIRED_EVENT_KEYS}
     normalized["domain"] = str(normalized.get("domain") or "global").strip() or "global"
     normalized["category"] = _normalize_category(normalized.get("category"), fallback_sink=normalized)
     normalized["text"] = str(normalized.get("text") or "").strip()
@@ -760,8 +731,6 @@ def _source_questions(source: dict[str, Any] | None) -> tuple[list[str], list[st
 def _source_owner(source_class: str, source: dict[str, Any] | None = None) -> str:
     if source and source.get("owner"):
         return str(source["owner"]).strip()
-    if source_class == "semantic_recall":
-        return "mem0"
     if source_class == "runtime_evidence":
         return "chronicle"
     if source_class == "derived_projection":
@@ -921,20 +890,6 @@ def build_sources_audit(
     domain_id = _domain_id(manifest, domain_id)
     attach_catalog = _source_catalog(manifest, domain_id)
     runtime_catalog = _runtime_source_catalog(manifest)
-    mem0_entries = []
-    if mem0_enabled(manifest):
-        mem0_dump_path = _compat_path(manifest, "mem0_dump")
-        mem0_entries.append(_source_catalog_entry(
-            manifest,
-            source_id="mem0_dump",
-            source_class="semantic_recall",
-            label="Mem0 Dump",
-            path=str(mem0_dump_path),
-            trust_tier="semantic_recall",
-            freshness_policy=_source_freshness_policy(manifest, source_class="semantic_recall", source_id="mem0_dump"),
-            source={"id": "mem0_dump", "lane": "decisions"},
-            exists=mem0_dump_path.exists(),
-        ))
     latest_projection = _latest_projection_row(manifest)
     projection_entry = _source_catalog_entry(
         manifest,
@@ -954,7 +909,7 @@ def build_sources_audit(
 
     freshness = build_freshness_audit(manifest, domain_id=domain_id)
     lane_summary: dict[str, dict[str, Any]] = {}
-    all_entries = [*attach_catalog, *runtime_catalog, *mem0_entries, projection_entry]
+    all_entries = [*attach_catalog, *runtime_catalog, projection_entry]
     for entry in all_entries:
         lane_id = entry["lane"]
         lane_contract = _lane_contracts(manifest).get(lane_id, {"label": lane_id.replace("_", " ").title(), "sensitive": False})
@@ -979,7 +934,6 @@ def build_sources_audit(
     freshness_rows = [
         *freshness.get("attach_sources", []),
         *freshness.get("runtime_evidence", []),
-        freshness.get("mem0_dump", {}),
         freshness.get("latest_projection", {}),
     ]
     by_source_id = {entry["source_id"]: entry for entry in all_entries}
@@ -1190,16 +1144,6 @@ def build_freshness_audit(
         attach_sources.append(annotated)
 
     runtime_evidence = _runtime_evidence_rows(manifest)
-    mem0_dump = {"enabled": False} if not mem0_enabled(manifest) else _annotate_freshness_row(
-        mem0_meta(manifest),
-        source_class="semantic_recall",
-        trust_tier="semantic_recall",
-        freshness_thresholds=_freshness_thresholds(
-            manifest,
-            scope="semantic_recall",
-            item_id="mem0_dump",
-        ),
-    )
     latest_projection = _latest_projection_row(manifest)
     latest_snapshot = fetch_latest_snapshot(config, domain=domain_id) or fetch_latest_snapshot(config)
 
@@ -1281,33 +1225,6 @@ def build_freshness_audit(
                 )
             )
 
-    if mem0_dump.get("enabled") is False:
-        pass  # the installation runs without Mem0: no dump to expect
-    elif not mem0_dump.get("exists"):
-        issues.append(
-            _freshness_issue(
-                "warn",
-                "mem0_dump_missing",
-                "Mem0 dump is missing.",
-                source_id="mem0_dump",
-                label="Mem0 Dump",
-                path=mem0_dump.get("path"),
-            )
-        )
-    elif mem0_dump.get("freshness_status") in {"stale", "archival"}:
-        issues.append(
-            _freshness_issue(
-                "warn",
-                "mem0_dump_stale",
-                f"Mem0 dump is {mem0_dump['freshness_status']} (last updated {mem0_dump.get('mtime')}).",
-                source_id="mem0_dump",
-                label="Mem0 Dump",
-                path=mem0_dump.get("path"),
-                freshness_status=mem0_dump.get("freshness_status"),
-                observed_at_utc=mem0_dump.get("mtime"),
-            )
-        )
-
     if latest_projection.get("exists"):
         if latest_projection.get("target_exists") is False:
             issues.append(
@@ -1370,7 +1287,6 @@ def build_freshness_audit(
         "issues": issues,
         "attach_sources": attach_sources,
         "runtime_evidence": runtime_evidence,
-        "mem0_dump": mem0_dump,
         "latest_projection": latest_projection,
     }
 
@@ -1481,7 +1397,6 @@ def build_attach_bundle(
             "chronicle event stream",
             "runtime evidence",
             "status markdown",
-            "mem0 semantic recall",
         ],
     }
 
@@ -1609,14 +1524,10 @@ def _build_startup_entity_digest(
     return result
 
 
-# Mem0 sync bookkeeping: plumbing, not memory, so a startup bundle leaves it out.
-_SYNC_FIELDS = frozenset({"mem0_status", "mem0_error", "mem0_raw", "mem0_synced_at"})
-
-
 def _startup_event(event: dict[str, Any], *, shown_checkpoint: str | None) -> dict[str, Any]:
-    """An event as a startup bundle shows it: no sync bookkeeping, and no second
-    copy of the checkpoint that task_context already carries."""
-    trimmed = {key: value for key, value in event.items() if key not in _SYNC_FIELDS}
+    """An event as a startup bundle shows it: no second copy of the checkpoint
+    that task_context already carries."""
+    trimmed = dict(event)
     if shown_checkpoint is not None and trimmed.get("id") == shown_checkpoint:
         trimmed.pop("checkpoint", None)
     return trimmed
@@ -1744,11 +1655,7 @@ def build_startup_bundle(
                              [entity.get("canonical_name"), *entity.get("aliases", [])]
                          }]
 
-    # 8. Mem0 hits (from snapshot, no duplication)
-    mem0_dump_hits = {} if (focus or project or task_id or not mem0_enabled(manifest)) else snapshot.get(
-        "mem0_snapshot_hits", {})
-
-    # 9. DB summary
+    # 8. DB summary
     with open_connection(config) as connection:
         db_summary = database_summary(connection)
 
@@ -1771,7 +1678,6 @@ def build_startup_bundle(
         "source_health": source_health,
         "sources": sources,
         "recent_events": recent_events,
-        "mem0_dump_hits": mem0_dump_hits,
         "entity_digest": entity_digest,
         "db_summary": db_summary,
         "query_modes": list(QUERY_MODES),
@@ -1780,7 +1686,6 @@ def build_startup_bundle(
             "chronicle event stream",
             "runtime evidence",
             "status markdown",
-            "mem0 semantic recall",
         ],
     }
 
@@ -1912,7 +1817,6 @@ def build_normalized_entities(
     recent_events = fetch_recent_events(config, limit=event_limit, domain=domain_id)
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     work_enabled = _lane_enabled(manifest, "work")
-    agents_enabled = _lane_enabled(manifest, "agents")
     world_enabled = _lane_enabled(manifest, "world")
     companies_enabled = _lane_enabled(manifest, "companies")
     decisions_enabled = _lane_enabled(manifest, "decisions")
@@ -1952,22 +1856,12 @@ def build_normalized_entities(
                 metadata={"lane": "work"},
             )
 
-    for system_name in ("chronicle", "mem0"):
-        if system_name == "mem0" and not (agents_enabled and mem0_enabled(manifest)):
-            continue
-        if system_name == "chronicle" and not decisions_enabled:
-            continue
+    if decisions_enabled:
         add(
             "system",
-            system_name,
-            _source_ref("system", system_name, system_name),
-            metadata={
-                "lane": (
-                    "agents"
-                    if system_name == "mem0"
-                    else "decisions"
-                )
-            },
+            "chronicle",
+            _source_ref("system", "chronicle", "chronicle"),
+            metadata={"lane": "decisions"},
         )
 
     if resolved_snapshot:
@@ -2132,7 +2026,6 @@ def reconstruct_timeline(
         "chronicle event stream",
         "runtime evidence",
         "status markdown",
-        "mem0 semantic recall",
     ]
     return payload
 
@@ -2165,7 +2058,7 @@ def record_event(
     # Pop private test/injection keys before any serialization path sees them.
     _embed_fn_override = entry.pop("_embed_fn", None)
     # Redact before anything derives from the text: hashes, embeddings, the
-    # stored row, the Mem0 outbox, and compatibility ledgers.
+    # stored row, and compatibility ledgers.
     normalized_entry, redactions = _redact_entry(_normalize_record_entry(entry))
     from .memory import validate_entry, request_receipt, record_observation
     validate_entry(normalized_entry)
@@ -2180,16 +2073,8 @@ def record_event(
             for kind, count in found.items():
                 redactions[kind] = redactions.get(kind, 0) + count
     skip_generic_source_archives = bool(entry.get("skip_generic_source_archives"))
-    resolved_mem0_status = default_mem0_status(normalized_entry, source_kind=source_kind,
-                                               mem0=mem0_enabled(manifest))
-    if resolved_mem0_status is not None:
-        normalized_entry["mem0_status"] = resolved_mem0_status
-
     if source_kind == "chronicle_mcp" and not (normalized_entry.get("checkpoint") or normalized_entry.get("fact")):
-        memory_guard = evaluate_memory_guard(config, normalized_entry, source_kind=source_kind)
-        normalized_entry["memory_guard"] = memory_guard
-        if memory_guard["verdict"] == "local_only":
-            normalized_entry["mem0_status"] = "off"
+        normalized_entry["memory_guard"] = evaluate_memory_guard(config, normalized_entry, source_kind=source_kind)
 
     # v8: compute a stable content_hash so store_event persists it. The hash
     # omits timestamps on purpose — it represents the logical event, not the
@@ -2295,8 +2180,7 @@ def record_event(
             if existing_row is not None:
                 existing = fetch_event(config, event_id=existing_row["id"], connection=connection)
         stored = existing or store_event(config, normalized_entry, source_kind=source_kind,
-                                        imported_from=imported_from, connection=connection,
-                                        mem0=mem0_enabled(manifest))
+                                        imported_from=imported_from, connection=connection)
         if existing:
             stored["dedupe_status"] = "exact_duplicate" if dedupe else "content_hash_match"
             stored["dedupe_window_hours"] = dedupe_window_hours if dedupe else hash_dedup_window
@@ -2344,10 +2228,6 @@ def record_event(
     if append_compat and not existing and (manifest.get("paths") or {}).get("ledger_file"):
         ledger_row = dict(stored)
         ledger_row["source_files"] = entry.get("source_files") or []
-        # ledger_row keeps the state the event was stored in, not the caller's
-        # request: a replay of the ledger must not queue what Chronicle kept out of Mem0.
-        ledger_row["mem0_error"] = normalized_entry.get("mem0_error")
-        ledger_row["mem0_raw"] = normalized_entry.get("mem0_raw")
         try:
             append_jsonl(_compat_path(manifest, "ledger_file"), ledger_row)
         except OSError as exc:
@@ -2406,13 +2286,6 @@ def guard_event(
     updated = update_event_memory_guard(config, event_id=event_id, memory_guard=memory_guard)
     if not updated:
         raise ValueError(f"Failed to update event payload for {event_id}.")
-    update_event_mem0_state(
-        config,
-        event_id=event_id,
-        mem0_status="off",
-        mem0_error=None,
-        attempted=False,
-    )
     payload["event"] = fetch_event(config, event_id=event_id)
     return payload
 
@@ -2478,242 +2351,11 @@ def repair_event_categories(
                 ),
             )
 
-            outbox_row = connection.execute(
-                """
-                SELECT payload_json
-                FROM mem0_outbox
-                WHERE event_id = ?
-                LIMIT 1
-                """,
-                (row["id"],),
-            ).fetchone()
-            if outbox_row is None:
-                continue
-            outbox_payload = _json_loads(outbox_row["payload_json"])
-            outbox_payload["category"] = normalized_category
-            connection.execute(
-                """
-                UPDATE mem0_outbox
-                SET payload_json = ?
-                WHERE event_id = ?
-                """,
-                (
-                    json.dumps(outbox_payload, ensure_ascii=False, sort_keys=True),
-                    row["id"],
-                ),
-            )
-
     return {
         "status": "dry_run" if dry_run else "ok",
         "db_path": str(config.db_path),
         "repaired_count": len(repaired),
         "repaired": repaired,
-    }
-
-
-def repair_mem0_state(
-    manifest: dict[str, Any],
-    *,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    config = _config(manifest)
-    repaired: list[dict[str, Any]] = []
-    outbox_to_event = {
-        "synced": "stored",
-        "pending": "queued",
-        "failed": "failed",
-        "skipped": "skipped",
-    }
-
-    with open_connection(config) as connection, connection:
-        rows = connection.execute(
-            """
-            SELECT
-                e.id,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at_utc
-            FROM events AS e
-            JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
-            ORDER BY e.occurred_at_utc ASC, e.id ASC
-            """
-        ).fetchall()
-
-        for row in rows:
-            payload = _json_loads(row["payload_json"])
-            outbox_payload = _json_loads(row["outbox_payload_json"])
-            desired_status = outbox_to_event.get(row["outbox_status"], row["outbox_status"])
-            desired_error = row["outbox_last_error"] if row["outbox_last_error"] is not None else outbox_payload.get("mem0_error")
-            desired_raw = outbox_payload.get("mem0_raw")
-            desired_synced_at = row["outbox_synced_at_utc"] or outbox_payload.get("mem0_synced_at")
-            current_status = row["mem0_status"] or payload.get("mem0_status")
-            current_error = row["mem0_error"] if row["mem0_error"] is not None else payload.get("mem0_error")
-            current_raw = payload.get("mem0_raw")
-            current_synced_at = payload.get("mem0_synced_at")
-
-            if (
-                current_status == desired_status
-                and current_error == desired_error
-                and current_raw == desired_raw
-                and current_synced_at == desired_synced_at
-            ):
-                continue
-
-            repaired.append(
-                {
-                    "id": row["id"],
-                    "event_mem0_status": current_status,
-                    "outbox_status": row["outbox_status"],
-                    "desired_mem0_status": desired_status,
-                    "event_mem0_error": current_error,
-                    "desired_mem0_error": desired_error,
-                    "event_mem0_raw": current_raw,
-                    "desired_mem0_raw": desired_raw,
-                    "event_mem0_synced_at": current_synced_at,
-                    "desired_mem0_synced_at": desired_synced_at,
-                }
-            )
-            if dry_run:
-                continue
-
-            payload["mem0_status"] = desired_status
-            if desired_error is None:
-                payload.pop("mem0_error", None)
-            else:
-                payload["mem0_error"] = desired_error
-            if desired_raw is None:
-                payload.pop("mem0_raw", None)
-            else:
-                payload["mem0_raw"] = desired_raw
-            if desired_synced_at is None:
-                payload.pop("mem0_synced_at", None)
-            else:
-                payload["mem0_synced_at"] = desired_synced_at
-
-            connection.execute(
-                """
-                UPDATE events
-                SET mem0_status = ?, mem0_error = ?, payload_json = ?
-                WHERE id = ?
-                """,
-                (
-                    desired_status,
-                    desired_error,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    row["id"],
-                ),
-            )
-
-    return {
-        "status": "dry_run" if dry_run else "ok",
-        "db_path": str(config.db_path),
-        "repaired_count": len(repaired),
-        "repaired": repaired,
-    }
-
-
-def backfill_mem0_queue(
-    manifest: dict[str, Any],
-    *,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    config = _config(manifest)
-    requeued: list[dict[str, Any]] = []
-    if not mem0_enabled(manifest):
-        return {"status": "disabled", "dry_run": dry_run, "requeued_count": 0, "requeued": []}
-
-    with open_connection(config) as connection, connection:
-        rows = connection.execute(
-            """
-            SELECT
-                e.id,
-                e.recorded_at_utc,
-                e.category,
-                e.project,
-                e.source_kind,
-                e.mem0_status,
-                e.payload_json,
-                o.status AS outbox_status
-            FROM events AS e
-            JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
-            ORDER BY e.occurred_at_utc ASC, e.id ASC
-            """
-        ).fetchall()
-
-        for row in rows:
-            payload = _json_loads(row["payload_json"])
-            memory_guard = payload.get("memory_guard")
-            if isinstance(memory_guard, dict) and memory_guard.get("verdict") == "local_only":
-                continue
-            current_status = row["mem0_status"] or payload.get("mem0_status")
-            desired_status = default_mem0_status(
-                {"category": row["category"], "mem0_status": "auto"},
-                source_kind=row["source_kind"] or "",
-            )
-            if desired_status != "queued":
-                continue
-            if current_status not in {None, "", "off", "skipped"}:
-                continue
-            if row["outbox_status"] != "skipped":
-                continue
-
-            requeued.append(
-                {
-                    "id": row["id"],
-                    "recorded_at": row["recorded_at_utc"],
-                    "category": row["category"],
-                    "project": row["project"],
-                    "source_kind": row["source_kind"],
-                    "event_mem0_status": current_status,
-                    "outbox_status": row["outbox_status"],
-                    "desired_mem0_status": "queued",
-                }
-            )
-            if dry_run:
-                continue
-
-            payload["mem0_status"] = "queued"
-            payload.pop("mem0_error", None)
-            payload.pop("mem0_raw", None)
-            payload.pop("mem0_synced_at", None)
-
-            connection.execute(
-                """
-                UPDATE events
-                SET mem0_status = ?, mem0_error = ?, payload_json = ?
-                WHERE id = ?
-                """,
-                (
-                    "queued",
-                    None,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    row["id"],
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE mem0_outbox
-                SET status = 'pending',
-                    attempts = 0,
-                    last_attempt_at_utc = NULL,
-                    last_error = NULL,
-                    synced_at_utc = NULL
-                WHERE event_id = ? AND operation = 'add'
-                """,
-                (row["id"],),
-            )
-
-    return {
-        "status": "dry_run" if dry_run else "ok",
-        "db_path": str(config.db_path),
-        "requeued_count": len(requeued),
-        "requeued": requeued,
     }
 
 
@@ -3094,29 +2736,6 @@ def query_context(
     )
     status_hits = status_hits[:limit]
 
-    mem0_hits: list[dict[str, Any]] = []
-    mem0_meta = None
-    mem0_path = _compat_path(manifest, "mem0_dump") if mem0_enabled(manifest) else None
-    if mode != "truth_only" and mem0_path is not None and mem0_path.exists():
-        mem0_hits = search_mem0_dump(mem0_path, query, limit)
-        mem0_meta = {
-            "path": str(mem0_path),
-            "mtime": datetime.fromtimestamp(mem0_path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-    mem0_thresholds = _freshness_thresholds(
-        manifest,
-        scope="semantic_recall",
-        item_id="mem0_dump",
-    )
-    for hit in mem0_hits:
-        hit["source_class"] = "semantic_recall"
-        hit["trust_tier"] = "semantic_recall"
-        hit["freshness_thresholds_hours"] = mem0_thresholds
-        hit["freshness_status"] = _freshness_status((mem0_meta or {}).get("mtime"), thresholds=mem0_thresholds)
-        hit["freshness_rank"] = _freshness_rank((mem0_meta or {}).get("mtime"), thresholds=mem0_thresholds)
-        hit["source_mtime"] = (mem0_meta or {}).get("mtime")
-        hit["source_path"] = (mem0_meta or {}).get("path")
-
     normalized_entities = fetch_normalized_entities(config, limit=200)
     normalized_entity_hits: list[dict[str, Any]] = []
     # Situation models and lens runs are gone (W11, migration 0017).
@@ -3147,20 +2766,19 @@ def query_context(
         "ranking_basis": ["text_score", "freshness", "trust", "source_priority"],
         "freshness_audit": build_freshness_audit(manifest, domain_id=domain or "global"),
         "chronicle_hits": chronicle_hits,
-        # Status files and the Mem0 dump are read as they are on disk; stored
-        # events already passed the secret filter, these pass it here (FR-11).
+        # Status files are read as they are on disk; stored events already
+        # passed the secret filter, these pass it here (FR-11).
         "status_hits": redact_value(status_hits)[0],
         "normalized_entity_hits": redact_value(normalized_entity_hits)[0],
         "interpretation_hits": interpretation_hits[:limit],
         "scenario_hits": [],
         "forecast_review_hits": [],
         "briefing_hits": [],
-        "mem0_dump_hits": redact_value(mem0_hits)[0],
     }
 
 
 # ==========================================================================
-# v8 Phase 1 surface — entity aliases, entity merge, live Mem0 search,
+# v8 Phase 1 surface — entity aliases, entity merge,
 # entity resolution report, event content-hash. Every tool is gated behind an
 # environment flag (see config.ENV_FEATURE_*) so it can be disabled without
 # redeploying.
@@ -3223,20 +2841,6 @@ def compute_event_content_hash(
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _manifest_status_root(manifest: dict[str, Any]) -> Path:
-    """Resolve status root from a loaded manifest dict."""
-    raw = manifest.get("__path__") or manifest.get("__manifest_path__")
-    if raw:
-        return Path(raw).expanduser().resolve().parent
-    cfg = _config(manifest)
-    return Path(cfg.status_root)
-
-
-def _resolve_mem0_bridge_path(manifest: dict[str, Any]) -> Path:
-    """Locate ``scripts/mem0_bridge.py`` relative to the Chronicle status root."""
-    return _manifest_status_root(manifest) / "scripts" / "mem0_bridge.py"
 
 
 def add_entity_alias_service(
@@ -3324,109 +2928,6 @@ def entity_resolution_report_service(
     stats["status"] = "ok"
     stats["feature_enabled"] = feature_enabled(ENV_FEATURE_ENTITY_ALIASES)
     return stats
-
-
-def search_mem0_live_service(
-    manifest: dict[str, Any],
-    *,
-    query: str,
-    limit: int = 10,
-    collection: str = "personal",
-    category: str | None = None,
-    timeout_s: float | None = None,
-) -> dict[str, Any]:
-    """Wrap ``scripts/mem0_bridge.py search --json`` as an MCP tool.
-
-    Fail-closed: timeouts, non-zero exit, or unparseable output all return
-    ``{"status": "degraded", ...}`` with ``results=[]`` — never raises, so
-    callers can trust Chronicle's own answers regardless of Mem0 health.
-    """
-    if not mem0_enabled(manifest):
-        return {"status": "disabled", "reason": "[mem0] enabled = false", "results": []}
-    if not feature_enabled(ENV_FEATURE_MEM0_LIVE_SEARCH):
-        return {
-            "status": "disabled",
-            "reason": f"{ENV_FEATURE_MEM0_LIVE_SEARCH}=off",
-            "results": [],
-        }
-    if not query or not query.strip():
-        raise ValueError("query is required and must not be blank")
-    if collection not in {"personal", "digest", "both"}:
-        raise ValueError(f"invalid collection: {collection!r}")
-
-    bridge_path = _resolve_mem0_bridge_path(manifest)
-    if not bridge_path.exists():
-        return {
-            "status": "degraded",
-            "reason": f"mem0_bridge not found at {bridge_path}",
-            "results": [],
-        }
-
-    timeout = (
-        float(timeout_s)
-        if timeout_s is not None
-        else env_float(ENV_MEM0_LIVE_TIMEOUT_S, default=DEFAULT_MEM0_LIVE_TIMEOUT_S)
-    )
-    cmd = [
-        "uv", "run", str(bridge_path),
-        "search", query,
-        "--json",
-        "--limit", str(int(limit)),
-        "--collection", collection,
-    ]
-    if category:
-        cmd.extend(["--category", category])
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "degraded",
-            "reason": f"mem0 bridge timed out after {timeout}s",
-            "results": [],
-        }
-    except FileNotFoundError as exc:
-        return {
-            "status": "degraded",
-            "reason": f"mem0 bridge not runnable ({exc})",
-            "results": [],
-        }
-
-    if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] if proc.stderr else []
-        return {
-            "status": "degraded",
-            "reason": f"mem0 bridge exit={proc.returncode}: {''.join(stderr_tail)[:300]}",
-            "results": [],
-        }
-
-    stdout = (proc.stdout or "").strip()
-    if not stdout:
-        return {"status": "degraded", "reason": "empty stdout", "results": []}
-
-    last_line = stdout.splitlines()[-1]
-    try:
-        payload = json.loads(last_line)
-    except json.JSONDecodeError:
-        return {
-            "status": "degraded",
-            "reason": "unparseable JSON from mem0 bridge",
-            "results": [],
-        }
-
-    payload.setdefault("status", "ok")
-    payload.setdefault("results", [])
-    # Mem0 holds memories written before the secret filter existed (FR-11).
-    payload, redactions = redact_value(payload)
-    if redactions:
-        payload["redactions"] = dict(redactions)
-    return payload
 
 
 # ---------------------------------------------------------------------------

@@ -63,12 +63,11 @@ The default (`chronicler`) profile serves the six tools agents use
 
 | Admin tool | Purpose |
 | --- | --- |
-| `query_context` | Broader search through source documents and optional Mem0 dump. |
+| `query_context` | Broader search through source documents. |
 | `sources_audit` | Source coverage, freshness, and trust metadata. |
 | `capture_snapshot` | Archive runtime state and update readable projections. |
 | `entity_admin` | Report, normalize, alias, or merge entities. |
 | `activate_agent` | Deprecated alias of `startup_bundle`. |
-| `search_mem0_live` | Optional external semantic mirror through an operator-supplied bridge; absent without Mem0. |
 
 Failures set MCP `isError` and carry a JSON envelope with `error_type`,
 `retryable`, and `hint`; follow that hint. A committed snapshot can separately
@@ -203,8 +202,9 @@ serves a whole note; `chronicle notes status` counts what the index holds.
   newest migration N with its down script (`migrations/down/`), after an online backup
   (`chronicle.db.bak-prerevert-…`); install the previous release before the server
   restarts, or `--migrate` applies N again. A migration that dropped data reverts from
-  the copy taken before it: `--revert 17 --archive chronicle.db.bak-premigrate-v16-v17-…`.
-  Keep that copy outside the retention-pruned backup folders until the release has
+  the copy taken before it: `--revert 18 --archive chronicle.db.bak-premigrate-v17-v18-…`,
+  then `--revert 17 --archive chronicle.db.bak-premigrate-v16-v17-…` (one copy serves both
+  when 0017 and 0018 came in one upgrade). Keep that copy outside the retention-pruned backup folders until the release has
   proved itself. `CHRONICLE_REQUIRE_ROOT=1`
   makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
   instead of falling back to `~/.max-chronicle`.
@@ -242,23 +242,13 @@ serves a whole note; `chronicle notes status` counts what the index holds.
   ISO` runs a job as the occurrence it names.
 
 
-## Without Mem0
+## Mem0
 
-The Mem0 mirror is optional. It is on when the manifest names a bridge
-(`paths.mem0_bridge`), unless the manifest turns it off:
-
-```toml
-[mem0]
-enabled = false
-```
-
-Off, new events are not queued for Mem0, the daily capture syncs nothing, the
-`mem0-dump` job ends as `skipped` without calling the bridge, `query_context` and
-snapshots read no Mem0 dump, `search_mem0_live` is not offered, the MCP
-instructions do not mention Mem0, and audits report no Mem0 backlog or stale dump.
-`chronicle launchd install` and `chronicle launchd doctor` leave the `mem0-dump` job out. Rows
-queued before stay as they are. To keep what Mem0 held, export it as notes the
-index reads (FR-10).
+Chronicle mirrored events into Mem0 until 0.26; migration 0018 removed the
+mirror. A manifest or automation config from before may keep its Mem0 settings
+(`[mem0]`, `paths.mem0_dump`, `paths.mem0_bridge`, `mem0_queries`,
+`[jobs.mem0_dump]`, `mem0_sync_batch_size`): Chronicle ignores them and runs no
+job for them. To keep what Mem0 held, export it as notes the index reads (FR-10).
 
 
 ## CLI

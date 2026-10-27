@@ -44,8 +44,7 @@ import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .automation import AutomationConfig, JobSchedule
-from .config import mem0_enabled
+from .automation import JOB_NAMES, AutomationConfig, JobSchedule
 from .store import DEFAULT_STALE_RUN_TTL_HOURS, config_from_manifest, fetch_automation_run
 
 _LOGGER = logging.getLogger("max_chronicle.scheduler")
@@ -180,7 +179,7 @@ class Scheduler:
         decisions = []
         for key, schedule in sorted(automation.jobs.items()):
             job = job_name(key)
-            if job == "mem0-dump" and not mem0_enabled(manifest):
+            if job not in JOB_NAMES:
                 continue
             occurrence = due_occurrence(schedule, now)
             run_key = occurrence_key(job, occurrence)
