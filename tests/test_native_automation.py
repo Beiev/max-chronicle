@@ -1503,6 +1503,9 @@ def test_a_backup_with_pruning_on_keeps_what_the_policy_keeps(
 
 def _legacy_without_auto_vacuum(config) -> None:
     """The production database predates INCREMENTAL auto-vacuum."""
+    from max_chronicle.store import prepare_database
+
+    prepare_database(config, allow_upgrade=True)
     with sqlite3.connect(config.db_path) as connection:
         connection.execute("PRAGMA auto_vacuum = NONE")
         connection.execute("VACUUM")
@@ -1517,6 +1520,25 @@ def test_the_backup_skips_a_full_vacuum_when_little_is_free(loaded_manifest) -> 
     result = _vacuum_db(config)
 
     assert result["status"] == "skipped" and result["reason"] == "little_free_space"
+
+
+def test_the_backup_returns_every_free_page_of_an_incremental_file(loaded_manifest) -> None:
+    from max_chronicle.native_automation import _vacuum_db
+
+    config = config_from_manifest(loaded_manifest)
+    with sqlite3.connect(config.db_path) as connection:
+        connection.execute("CREATE TABLE scratch_fill(blob BLOB)")
+        connection.executemany("INSERT INTO scratch_fill VALUES (?)", [(os.urandom(4096),) for _ in range(200)])
+        connection.commit()
+        connection.execute("DROP TABLE scratch_fill")
+        connection.commit()
+        assert connection.execute("PRAGMA freelist_count").fetchone()[0] > 100
+
+    result = _vacuum_db(config)
+
+    assert (result["status"], result["mode"]) == ("ok", "incremental_vacuum")
+    with sqlite3.connect(config.db_path) as connection:
+        assert connection.execute("PRAGMA freelist_count").fetchone()[0] == 0
 
 
 def test_the_backup_still_vacuums_a_file_that_is_mostly_free(loaded_manifest) -> None:
@@ -1534,6 +1556,8 @@ def test_the_backup_still_vacuums_a_file_that_is_mostly_free(loaded_manifest) ->
     result = _vacuum_db(config)
 
     assert (result["status"], result["mode"]) == ("ok", "vacuum")
+    with sqlite3.connect(config.db_path) as connection:  # the next run is incremental
+        assert connection.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
 
 
 def test_launchd_backup_job_still_starts_when_its_disk_is_mounted(chronicle_sandbox, loaded_manifest, loaded_automation) -> None:

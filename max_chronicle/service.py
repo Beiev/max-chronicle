@@ -3119,8 +3119,7 @@ def query_context(
 
     normalized_entities = fetch_normalized_entities(config, limit=200)
     normalized_entity_hits: list[dict[str, Any]] = []
-    # Nothing writes situation models or lens runs any more; the last ones
-    # are months old, so they are history, not the current interpretation (W11).
+    # Situation models and lens runs are gone (W11, migration 0017).
     # The key stays for clients of the contract, like scenario_hits.
     interpretation_hits: list[dict[str, Any]] = []
 
@@ -3502,4 +3501,48 @@ def embed_backfill(
         "skipped": skipped,
         "failed": failed,
         "backend_unavailable": False,
+    }
+
+
+# Tables that keep vectors keyed by embedding model.
+_VECTOR_TABLES = ("event_vectors", "chunk_vectors")
+
+
+def embed_prune(
+    manifest: dict[str, Any],
+    *,
+    model_key: str,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Count, and with apply delete, the stored vectors of one embedding model.
+
+    Recall reads only the active profile's vectors, so another model's are dead
+    weight once nothing will switch back to it; switching back re-embeds with
+    embed-backfill. The active profile's own vectors are refused.
+    """
+    from .embeddings import active_profile
+
+    active_key = active_profile().key
+    # Active as this process sees it: run with the server's CHRONICLE_EMBED_MODEL.
+    if model_key == active_key:
+        raise ValueError(
+            f"{model_key} is the active embedding model (CHRONICLE_EMBED_MODEL); recall reads its vectors"
+        )
+    config = _config(manifest)
+    with open_connection(config) as connection, connection:
+        counts = {
+            table: int(connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE model_key = ?", (model_key,)
+            ).fetchone()[0])
+            for table in _VECTOR_TABLES
+        }
+        if apply:
+            for table in _VECTOR_TABLES:
+                connection.execute(f"DELETE FROM {table} WHERE model_key = ?", (model_key,))
+    return {
+        "model_key": model_key,
+        "active_model_key": active_key,
+        "vectors": counts,
+        "deleted": apply,
+        "next": None if apply else "Nothing deleted. Run again with --apply to delete these vectors.",
     }

@@ -36,14 +36,24 @@ def offline(monkeypatch):
     monkeypatch.setenv("CHRONICLE_FEATURE_EVENT_EMBEDDINGS", "0")
 
 
-def _v15(config, tmp_path: Path):
-    """*config* on the migrations up to 0015, the schema v0.23 runs."""
-    early = tmp_path / "migrations-v15"
-    early.mkdir(exist_ok=True)
-    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        if int(path.name[:4]) <= 15:
-            (early / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+def _upto(config, tmp_path: Path, version: int):
+    """*config* on the migrations up to *version*, with their down scripts."""
+    early = tmp_path / f"migrations-v{version}"
+    (early / "down").mkdir(parents=True, exist_ok=True)
+    for path in [*MIGRATIONS_DIR.glob("*.sql"), *(MIGRATIONS_DIR / "down").glob("*.sql")]:
+        if int(path.name[:4]) <= version:
+            (early / path.relative_to(MIGRATIONS_DIR)).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     return replace(config, migrations_dir=early)
+
+
+def _v15(config, tmp_path: Path):
+    """*config* on the schema v0.23 runs."""
+    return _upto(config, tmp_path, 15)
+
+
+def _v16(config, tmp_path: Path):
+    """*config* on the schema v0.24 runs: 0016 is the newest migration."""
+    return _upto(config, tmp_path, 16)
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -101,10 +111,10 @@ def test_0016_moves_every_value_into_its_column(loaded_manifest, tmp_path) -> No
     config = config_from_manifest(loaded_manifest)
     _seed_v15(_v15(config, tmp_path))
 
-    prepared = prepare_database(config, allow_upgrade=True)
+    prepared = prepare_database(_v16(config, tmp_path), allow_upgrade=True)
 
     assert [item.version for item in prepared.applied] == [16] and prepared.backup_path is not None
-    with open_connection(config) as connection:
+    with connect(config.db_path) as connection:
         assert EVENT_COLUMNS <= _columns(connection, "events") and not V15_COLUMNS & _columns(connection, "events")
         assert FACT_COLUMNS <= _columns(connection, "facts") and not DROPPED_FACT_COLUMNS & _columns(connection, "facts")
         events = {row["id"]: dict(row) for row in connection.execute(
@@ -187,17 +197,18 @@ def test_revert_16_returns_the_schema_and_data_v023_reads(chronicle_sandbox, loa
     with connect(config.db_path) as connection:
         before = {table: [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
                   for table in ("events", "event_observations", "facts")}
-    prepare_database(config, allow_upgrade=True)
+    archive = prepare_database(config, allow_upgrade=True).backup_path  # 0016 and 0017
     # Written by this code on the new schema, then quarantined: the way back must keep both.
     new = service.record_event(loaded_manifest, {
         "agent": "agent-a", "domain": "global", "project": "atlas", "task_id": "launch", "category": "decision",
         "text": "Atlas launches on Friday", "fact": {"slot": "launch.day", "value": "friday", "kind": "decision"}})
     service.guard_event(loaded_manifest, event_id=new["id"], verdict="local_only", reason="test", apply=True)
 
-    monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
-                                      "migrate", "--revert", "16"])
-    assert cli.main() == 0
-    receipt = json.loads(capsys.readouterr().out)
+    for revert in (["17", "--archive", str(archive)], ["16"]):  # the newest first
+        monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
+                                          "migrate", "--revert", *revert])
+        assert cli.main() == 0
+        receipt = json.loads(capsys.readouterr().out)
     assert receipt["schema_version"] == 15 and Path(receipt["backup_path"]).is_file()
 
     fresh = tmp_path / "fresh" / "chronicle.db"
@@ -232,7 +243,7 @@ def test_revert_16_returns_the_schema_and_data_v023_reads(chronicle_sandbox, loa
     assert found == 1
 
     # And up again: the cycle repeats.
-    assert [item.version for item in prepare_database(config, allow_upgrade=True).applied] == [16]
+    assert [item.version for item in prepare_database(config, allow_upgrade=True).applied] == [16, 17]
     assert fetch_event(config, event_id=new["id"])["visibility"] == "raw_only"
 
 

@@ -202,7 +202,10 @@ serves a whole note; `chronicle notes status` counts what the index holds.
   a server upgrades only with `--migrate`. `chronicle migrate --revert N` undoes the
   newest migration N with its down script (`migrations/down/`), after an online backup
   (`chronicle.db.bak-prerevert-…`); install the previous release before the server
-  restarts, or `--migrate` applies N again. `CHRONICLE_REQUIRE_ROOT=1`
+  restarts, or `--migrate` applies N again. A migration that dropped data reverts from
+  the copy taken before it: `--revert 17 --archive chronicle.db.bak-premigrate-v16-v17-…`.
+  Keep that copy outside the retention-pruned backup folders until the release has
+  proved itself. `CHRONICLE_REQUIRE_ROOT=1`
   makes a process without `CHRONICLE_ROOT`/`CHRONICLE_MANIFEST` exit with code 2
   instead of falling back to `~/.max-chronicle`.
 - **Read-only servers:** SQLite reads a WAL database through its `-wal` and `-shm`

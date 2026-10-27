@@ -682,408 +682,6 @@ def mark_missing_normalized_entities_inactive(
     return int(cursor.rowcount or 0)
 
 
-def _situation_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
-    payload = _load_json(row["payload_json"])
-    payload.setdefault("situation_id", row["id"])
-    payload.setdefault("id", row["id"])
-    payload.setdefault("domain", row["domain"])
-    payload.setdefault("snapshot_id", row["snapshot_id"])
-    payload.setdefault("valid_at", row["valid_at_utc"])
-    payload.setdefault("status", row["status"])
-    payload.setdefault("summary_text", row["summary_text"])
-    payload["derived_from"] = json.loads(row["derived_from_json"])
-    payload["created_at_utc"] = row["created_at_utc"]
-    payload["updated_at_utc"] = row["updated_at_utc"]
-    return payload
-
-
-def store_situation_model(
-    config: ChronicleConfig,
-    situation_model: dict[str, Any],
-) -> dict[str, Any]:
-    payload = dict(situation_model)
-    situation_id = payload.get("situation_id") or payload.get("id") or str(uuid.uuid4())
-    now = utc_now()
-    valid_at = payload.get("valid_at") or payload.get("valid_at_utc") or now
-    derived_from = payload.get("derived_from") or {}
-    summary_text = payload.get("summary_text")
-    with open_connection(config) as connection, connection:
-        connection.execute(
-            """
-            INSERT INTO situation_models(
-                id,
-                domain,
-                snapshot_id,
-                valid_at_utc,
-                status,
-                summary_text,
-                payload_json,
-                derived_from_json,
-                created_at_utc,
-                updated_at_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                domain = excluded.domain,
-                snapshot_id = excluded.snapshot_id,
-                valid_at_utc = excluded.valid_at_utc,
-                status = excluded.status,
-                summary_text = excluded.summary_text,
-                payload_json = excluded.payload_json,
-                derived_from_json = excluded.derived_from_json,
-                updated_at_utc = excluded.updated_at_utc
-            """,
-            (
-                situation_id,
-                payload.get("domain") or "global",
-                payload.get("snapshot_id"),
-                valid_at,
-                payload.get("status") or "active",
-                summary_text,
-                _json(payload),
-                _json(derived_from),
-                now,
-                now,
-            ),
-        )
-        row = connection.execute(
-            """
-            SELECT *
-            FROM situation_models
-            WHERE id = ?
-            LIMIT 1
-            """,
-            (situation_id,),
-        ).fetchone()
-    return _situation_row_to_entry(row)
-
-
-def fetch_latest_situation_model(
-    config: ChronicleConfig,
-    *,
-    domain: str = "global",
-    snapshot_id: str | None = None,
-) -> dict[str, Any] | None:
-    with open_connection(config) as connection:
-        row = connection.execute(
-            """
-            SELECT *
-            FROM situation_models
-            WHERE domain = ?
-              AND (? IS NULL OR snapshot_id = ?)
-            ORDER BY valid_at_utc DESC, updated_at_utc DESC
-            LIMIT 1
-            """,
-            (domain, snapshot_id, snapshot_id),
-        ).fetchone()
-    if not row:
-        return None
-    return _situation_row_to_entry(row)
-
-
-def fetch_situation_model(
-    config: ChronicleConfig,
-    *,
-    situation_id: str,
-) -> dict[str, Any] | None:
-    with open_connection(config) as connection:
-        row = connection.execute(
-            """
-            SELECT *
-            FROM situation_models
-            WHERE id = ?
-            LIMIT 1
-            """,
-            (situation_id,),
-        ).fetchone()
-    if not row:
-        return None
-    return _situation_row_to_entry(row)
-
-
-def _lens_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "run_id": row["id"],
-        "situation_id": row["situation_id"],
-        "lens": row["lens"],
-        "status": row["status"],
-        "confidence": float(row["confidence"]),
-        "summary_text": row["summary_text"],
-        "findings": json.loads(row["findings_json"]),
-        "evidence_refs": json.loads(row["evidence_refs_json"]),
-        "created_at_utc": row["created_at_utc"],
-        "updated_at_utc": row["updated_at_utc"],
-    }
-
-
-def store_lens_run(
-    config: ChronicleConfig,
-    lens_run: dict[str, Any],
-) -> dict[str, Any]:
-    payload = dict(lens_run)
-    run_id = payload.get("run_id") or payload.get("id") or str(uuid.uuid4())
-    now = utc_now()
-    with open_connection(config) as connection, connection:
-        connection.execute(
-            """
-            INSERT INTO lens_runs(
-                id,
-                situation_id,
-                lens,
-                status,
-                confidence,
-                summary_text,
-                findings_json,
-                evidence_refs_json,
-                created_at_utc,
-                updated_at_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(situation_id, lens) DO UPDATE SET
-                id = excluded.id,
-                status = excluded.status,
-                confidence = excluded.confidence,
-                summary_text = excluded.summary_text,
-                findings_json = excluded.findings_json,
-                evidence_refs_json = excluded.evidence_refs_json,
-                updated_at_utc = excluded.updated_at_utc
-            """,
-            (
-                run_id,
-                payload["situation_id"],
-                payload["lens"],
-                payload.get("status") or "completed",
-                float(payload.get("confidence", 0.0)),
-                payload.get("summary_text"),
-                _json(payload.get("findings") or []),
-                _json(payload.get("evidence_refs") or []),
-                now,
-                now,
-            ),
-        )
-        row = connection.execute(
-            """
-            SELECT *
-            FROM lens_runs
-            WHERE situation_id = ? AND lens = ?
-            LIMIT 1
-            """,
-            (payload["situation_id"], payload["lens"]),
-        ).fetchone()
-    return _lens_row_to_entry(row)
-
-
-def fetch_lens_runs(
-    config: ChronicleConfig,
-    *,
-    situation_id: str,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    with open_connection(config) as connection:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM lens_runs
-            WHERE situation_id = ?
-            ORDER BY updated_at_utc DESC, lens ASC
-            LIMIT ?
-            """,
-            (situation_id, limit),
-        ).fetchall()
-    return [_lens_row_to_entry(row) for row in rows]
-
-
-def _scenario_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
-    payload = _load_json(row["payload_json"])
-    payload.setdefault("scenario_id", row["id"])
-    payload.setdefault("id", row["id"])
-    payload.setdefault("situation_id", row["situation_id"])
-    payload.setdefault("scenario_name", row["scenario_name"])
-    payload.setdefault("status", row["status"])
-    payload.setdefault("confidence", float(row["confidence"]))
-    payload.setdefault("review_due_at", row["review_due_at_utc"])
-    payload.setdefault("summary_text", row["summary_text"])
-    payload["assumptions"] = json.loads(row["assumptions_json"])
-    payload["changed_variables"] = json.loads(row["changed_variables_json"])
-    payload["expected_outcomes"] = json.loads(row["expected_outcomes_json"])
-    payload["failure_modes"] = json.loads(row["failure_modes_json"])
-    payload["created_at_utc"] = row["created_at_utc"]
-    payload["updated_at_utc"] = row["updated_at_utc"]
-    return payload
-
-
-def store_scenario_run(
-    config: ChronicleConfig,
-    scenario_run: dict[str, Any],
-) -> dict[str, Any]:
-    payload = dict(scenario_run)
-    run_id = payload.get("scenario_id") or payload.get("id") or str(uuid.uuid4())
-    now = utc_now()
-    with open_connection(config) as connection, connection:
-        connection.execute(
-            """
-            INSERT INTO scenario_runs(
-                id,
-                situation_id,
-                scenario_name,
-                status,
-                confidence,
-                review_due_at_utc,
-                summary_text,
-                assumptions_json,
-                changed_variables_json,
-                expected_outcomes_json,
-                failure_modes_json,
-                payload_json,
-                created_at_utc,
-                updated_at_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                status = excluded.status,
-                confidence = excluded.confidence,
-                review_due_at_utc = excluded.review_due_at_utc,
-                summary_text = excluded.summary_text,
-                assumptions_json = excluded.assumptions_json,
-                changed_variables_json = excluded.changed_variables_json,
-                expected_outcomes_json = excluded.expected_outcomes_json,
-                failure_modes_json = excluded.failure_modes_json,
-                payload_json = excluded.payload_json,
-                updated_at_utc = excluded.updated_at_utc
-            """,
-            (
-                run_id,
-                payload["situation_id"],
-                payload["scenario_name"],
-                payload.get("status") or "active",
-                float(payload.get("confidence", 0.0)),
-                payload.get("review_due_at"),
-                payload.get("summary_text"),
-                _json(payload.get("assumptions") or []),
-                _json(payload.get("changed_variables") or {}),
-                _json(payload.get("expected_outcomes") or []),
-                _json(payload.get("failure_modes") or []),
-                _json(payload),
-                now,
-                now,
-            ),
-        )
-        row = connection.execute(
-            """
-            SELECT *
-            FROM scenario_runs
-            WHERE id = ?
-            LIMIT 1
-            """,
-            (run_id,),
-        ).fetchone()
-    return _scenario_row_to_entry(row)
-
-
-def fetch_scenario_runs(
-    config: ChronicleConfig,
-    *,
-    situation_id: str | None = None,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    with open_connection(config) as connection:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM scenario_runs
-            WHERE (? IS NULL OR situation_id = ?)
-            ORDER BY updated_at_utc DESC, created_at_utc DESC
-            LIMIT ?
-            """,
-            (situation_id, situation_id, limit),
-        ).fetchall()
-    return [_scenario_row_to_entry(row) for row in rows]
-
-
-def _forecast_review_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
-    payload = _load_json(row["payload_json"])
-    payload.setdefault("review_id", row["id"])
-    payload.setdefault("id", row["id"])
-    payload.setdefault("scenario_id", row["scenario_id"])
-    payload.setdefault("outcome_event_id", row["outcome_event_id"])
-    payload.setdefault("status", row["status"])
-    payload.setdefault("review_summary", row["review_summary"])
-    payload["created_at_utc"] = row["created_at_utc"]
-    payload["updated_at_utc"] = row["updated_at_utc"]
-    return payload
-
-
-def store_forecast_review(
-    config: ChronicleConfig,
-    review: dict[str, Any],
-) -> dict[str, Any]:
-    payload = dict(review)
-    review_id = payload.get("review_id") or payload.get("id") or str(uuid.uuid4())
-    now = utc_now()
-    with open_connection(config) as connection, connection:
-        connection.execute(
-            """
-            INSERT INTO forecast_reviews(
-                id,
-                scenario_id,
-                outcome_event_id,
-                status,
-                review_summary,
-                payload_json,
-                created_at_utc,
-                updated_at_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                outcome_event_id = excluded.outcome_event_id,
-                status = excluded.status,
-                review_summary = excluded.review_summary,
-                payload_json = excluded.payload_json,
-                updated_at_utc = excluded.updated_at_utc
-            """,
-            (
-                review_id,
-                payload["scenario_id"],
-                payload.get("outcome_event_id"),
-                payload["status"],
-                payload.get("review_summary"),
-                _json(payload),
-                now,
-                now,
-            ),
-        )
-        row = connection.execute(
-            """
-            SELECT *
-            FROM forecast_reviews
-            WHERE id = ?
-            LIMIT 1
-            """,
-            (review_id,),
-        ).fetchone()
-    return _forecast_review_row_to_entry(row)
-
-
-def fetch_forecast_reviews(
-    config: ChronicleConfig,
-    *,
-    scenario_id: str | None = None,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    with open_connection(config) as connection:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM forecast_reviews
-            WHERE (? IS NULL OR scenario_id = ?)
-            ORDER BY updated_at_utc DESC, created_at_utc DESC
-            LIMIT ?
-            """,
-            (scenario_id, scenario_id, limit),
-        ).fetchall()
-    return [_forecast_review_row_to_entry(row) for row in rows]
-
-
 def fetch_event(
     config: ChronicleConfig,
     *,
@@ -1581,6 +1179,7 @@ def store_snapshot(
     payload.setdefault("timezone", config.timezone)
 
     with open_connection(config) as connection, connection:
+        stored = snapshot_payload_to_store(connection, payload)
         connection.execute(
             """
             INSERT INTO snapshots(
@@ -1620,10 +1219,38 @@ def store_snapshot(
                 payload.get("focus"),
                 payload.get("label"),
                 snapshot_summary(payload),
-                _json(payload),
+                _json(stored),
             ),
         )
     return payload
+
+
+def snapshot_payload_to_store(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    """The payload as a snapshot row keeps it: recent_ledger holds event ids, not copies.
+
+    A reader takes each event as it is now (_snapshot_row_to_entry), so an
+    event quarantined after the capture stays out. Only an entry with the id of
+    an event in this database becomes that id; anything else is kept as it is.
+    """
+    ledger = payload.get("recent_ledger")
+    if not isinstance(ledger, list):
+        return payload
+    ids = [entry.get("id") for entry in ledger if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
+    known = {
+        row[0]
+        for row in connection.execute(
+            "SELECT id FROM events WHERE id IN (" + ", ".join("?" for _ in ids) + ")", ids
+        )
+    } if ids else set()
+    return {**payload, "recent_ledger": [
+        entry["id"] if isinstance(entry, dict) and _ledger_id(entry) in known else entry for entry in ledger
+    ]}
+
+
+def _ledger_id(entry: dict[str, Any]) -> str | None:
+    """The event id a ledger copy names, if it names one."""
+    event_id = entry.get("id")
+    return event_id if isinstance(event_id, str) else None
 
 
 def _event_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
@@ -1686,42 +1313,45 @@ _EVENT_ROW_SQL = """
 def _snapshot_row_to_entry(
     connection: sqlite3.Connection, row: sqlite3.Row, *, visibility: str = "default"
 ) -> dict[str, Any]:
-    """A snapshot as readers get it: its recent_ledger holds only events visible now.
+    """A snapshot as readers get it: its recent_ledger holds the events, as they are now.
 
     Every reader of a snapshot payload goes through here. The ledger holds
-    copies of the events, or their ids; an id becomes the event as it is now.
-    An event quarantined after the capture leaves the ledger with it.
+    event ids (0.25 on), or copies of the events; an id becomes the event as it
+    is now. Unless visibility is raw, an event quarantined after the capture
+    leaves the ledger with it.
     """
     payload = _load_json(row["payload_json"])
     payload.setdefault("id", row["id"])
     payload.setdefault("captured_at_utc", row["captured_at_utc"])
     ledger = payload.get("recent_ledger")
-    if isinstance(ledger, list) and visibility != "raw":
-        payload["recent_ledger"] = _visible_ledger(connection, ledger)
+    if isinstance(ledger, list):
+        payload["recent_ledger"] = _resolve_ledger(connection, ledger, include_quarantined=visibility == "raw")
     return payload
 
 
-def _visible_ledger(connection: sqlite3.Connection, ledger: list[Any]) -> list[dict[str, Any]]:
-    ids = [entry if isinstance(entry, str) else entry.get("id") for entry in ledger if isinstance(entry, (str, dict))]
-    ids = [event_id for event_id in ids if isinstance(event_id, str)]
+def _resolve_ledger(connection: sqlite3.Connection, ledger: list[Any], *, include_quarantined: bool) -> list[Any]:
+    ids = [entry if isinstance(entry, str) else _ledger_id(entry) for entry in ledger if isinstance(entry, (str, dict))]
+    ids = [event_id for event_id in ids if event_id is not None]
     rows = {
         row["id"]: row
         for row in connection.execute(
             _EVENT_ROW_SQL + " WHERE e.id IN (" + ", ".join("?" for _ in ids) + ")", ids
         )
     } if ids else {}
-    visible: list[dict[str, Any]] = []
+    visible: list[Any] = []
     for entry in ledger:
-        if isinstance(entry, str):
-            row = rows.get(entry)
-            if row is not None and row["visibility"] != "raw_only":
+        if isinstance(entry, str) and entry in rows:
+            row = rows[entry]
+            if include_quarantined or row["visibility"] != "raw_only":
                 visible.append(_event_row_to_entry(row))
         elif isinstance(entry, dict):
-            row = rows.get(entry.get("id"))
+            row = rows.get(_ledger_id(entry))
             # A copy of an event this database no longer holds keeps the guard it was captured with.
             hidden = row["visibility"] if row is not None else guard_visibility(entry.get("memory_guard"))
-            if hidden != "raw_only":
+            if include_quarantined or hidden != "raw_only":
                 visible.append(entry)
+        elif include_quarantined:  # a raw read keeps what it cannot resolve, as stored
+            visible.append(entry)
     return visible
 
 

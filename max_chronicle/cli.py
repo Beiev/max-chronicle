@@ -51,6 +51,7 @@ from .service import (
     build_startup_bundle,
     capture_runtime_snapshot,
     embed_backfill,
+    embed_prune,
     guard_event,
     materialize_normalized_entities,
     project_state,
@@ -138,7 +139,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     if args.revert is not None:
         with _connection(config) as connection:
-            reverted = revert_migration(connection, config, args.revert)
+            reverted = revert_migration(connection, config, args.revert, archive=args.archive)
         return _print_json({
             "db_path": str(config.db_path),
             "reverted": {"version": reverted.version, "script": str(reverted.script)},
@@ -156,6 +157,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             for item in prepared.applied
         ],
         "backup_path": str(prepared.backup_path) if prepared.backup_path else None,
+        "compaction": prepared.compaction,
         "summary": summary,
     }
     return _print_json(payload)
@@ -781,8 +783,17 @@ def cmd_sync_mem0(args: argparse.Namespace) -> int:
 
 
 def cmd_embed_backfill(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
+    manifest = _with_db(load_manifest(args.manifest), args.db)
     payload = embed_backfill(manifest, limit=args.limit)
+    return _print_json(payload)
+
+
+def cmd_embed_prune(args: argparse.Namespace) -> int:
+    manifest = _with_db(load_manifest(args.manifest), args.db)
+    try:
+        payload = embed_prune(manifest, model_key=args.model, apply=args.apply)
+    except ValueError as exc:
+        return _print_error(exc, exit_code=EXIT_CONFIG_ERROR)
     return _print_json(payload)
 
 
@@ -971,6 +982,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_migrate.add_argument(
         "--revert", type=int, metavar="VERSION",
         help="Undo the newest migration VERSION with its down script (backs up first)",
+    )
+    p_migrate.add_argument(
+        "--archive", type=Path, metavar="PATH",
+        help="With --revert: the copy taken before that migration (chronicle.db.bak-premigrate-…), "
+             "for a down script that restores what it dropped",
     )
     p_migrate.set_defaults(handler=cmd_migrate)
 
@@ -1245,6 +1261,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum events to embed in this run (default: all missing)",
     )
     p_embed_backfill.set_defaults(handler=cmd_embed_backfill)
+
+    p_embed_prune = sub.add_parser(
+        "embed-prune",
+        help="Count, and with --apply delete, the stored vectors of an embedding model recall no longer reads",
+    )
+    p_embed_prune.add_argument("--model", required=True, help="Model key of the vectors, e.g. nomic-embed-text")
+    p_embed_prune.add_argument("--apply", action="store_true", help="Delete them (default: only count)")
+    p_embed_prune.set_defaults(handler=cmd_embed_prune)
 
     p_notes = sub.add_parser("notes", help="Index notes written on purpose (FR-10): sync, status, show")
     notes_sub = p_notes.add_subparsers(dest="notes_command", required=True)
