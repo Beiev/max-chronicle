@@ -67,16 +67,21 @@ def test_replacing_through_an_old_spelling_retires_before_it_inserts(loaded_mani
     assert [fact["value"] for fact in facts if fact["slot"] == "deploy.target"] == ["canary"]
 
 
-def _before_0015(config, tmp_path):
-    """*config* on the migrations before 0015."""
+def _upto(config, tmp_path, version: int):
+    """*config* on the migrations up to *version*."""
     from max_chronicle.config import MIGRATIONS_DIR
 
-    early = tmp_path / "migrations"
+    early = tmp_path / f"migrations-v{version}"
     early.mkdir()
     for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        if int(path.name[:4]) <= 14:
+        if int(path.name[:4]) <= version:
             (early / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     return replace(config, migrations_dir=early)
+
+
+def _before_0015(config, tmp_path):
+    """*config* on the migrations before 0015."""
+    return _upto(config, tmp_path, 14)
 
 
 def test_the_migration_retires_all_but_the_newest_active_value(chronicle_sandbox, loaded_manifest, tmp_path) -> None:
@@ -140,10 +145,11 @@ def test_the_migration_is_one_pass(loaded_manifest, tmp_path, slots, own_domains
                          f"2026-09-01T00:00:{index % 2:02d}.000Z", f"domain-{slot}" if own_domains else "global")
         connection.commit()
 
+    through_0015 = _upto(config, tmp_path, 15)  # 0015 alone: the later migrations are not its cost
     started = time.monotonic()
-    prepare_database(config, allow_upgrade=True)
+    prepare_database(through_0015, allow_upgrade=True)
     elapsed = time.monotonic() - started
 
-    with open_connection(config) as connection:
+    with open_connection(through_0015) as connection:
         active = connection.execute("SELECT count(*) FROM facts WHERE status = 'active'").fetchone()[0]
     assert active == slots and elapsed < 3
