@@ -88,6 +88,8 @@ class SchemaPreparation:
     state_before: SchemaState
     applied: tuple[MigrationFile, ...]
     backup_path: Path | None
+    # How the space an applied migration freed went back, or why it did not.
+    compaction: str | None = None
 
 
 def utc_now() -> str:
@@ -122,7 +124,8 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
 
     A read-only connection, and any connection to another application's file
     (refused by the schema check right after), leaves the file as found: no
-    auto_vacuum or journal-mode switch. Read-only connections also refuse writes.
+    journal-mode switch. Read-only connections also refuse writes. A new file
+    gets auto_vacuum=INCREMENTAL from ensure_schema, once initialised.
     """
     if read_only and not db_path.exists():
         raise FileNotFoundError(f"No database at {db_path}")
@@ -138,15 +141,6 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     application_id, has_objects, has_history = _schema_markers(connection)
     if _is_foreign(application_id, has_objects=has_objects, has_history=has_history):
         return connection
-    # A brand-new database can pick its auto_vacuum mode for free; an existing
-    # one needs a full VACUUM to flip it. INCREMENTAL lets maintenance reclaim
-    # space with cheap non-exclusive incremental_vacuum steps instead of a full
-    # VACUUM that fights the live MCP daemon for an exclusive lock.
-    try:
-        if connection.execute("PRAGMA page_count").fetchone()[0] == 0:
-            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
-    except sqlite3.OperationalError:
-        pass
     # Switching a fresh DB to WAL needs a brief exclusive lock, and SQLite returns
     # SQLITE_BUSY *immediately* (it bypasses the busy handler here to avoid a
     # deadlock) when a peer holds the database open. Two processes cold-starting at
@@ -284,11 +278,52 @@ def _prepare_migration_v16(connection: sqlite3.Connection) -> None:
         )
 
 
+SQLITE_JSON_ARROW = (3, 38, 0)
+
+
+def _prepare_migration_v17(connection: sqlite3.Connection) -> None:
+    """Refuse 0017_dead_weight on a SQLite without the -> operator its ledger rewrite uses."""
+    if sqlite3.sqlite_version_info < SQLITE_JSON_ARROW:
+        raise MigrationError(
+            f"migration 0017 needs SQLite {'.'.join(map(str, SQLITE_JSON_ARROW))} or newer "
+            f"(the JSON -> operator); this Python has {sqlite3.sqlite_version}"
+        )
+
+
 _MIGRATION_PREHOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _prepare_migration_v8,
     14: _prepare_migration_v14,
     16: _prepare_migration_v16,
+    17: _prepare_migration_v17,
 }
+
+# Migrations that free a lot of pages. A full VACUUM returns them, and is the
+# only way to switch an existing database to auto_vacuum=INCREMENTAL; after
+# that the backup job reclaims space with incremental_vacuum alone, without a
+# full VACUUM's exclusive lock. A new database is switched the same way once
+# initialised: SQLite 3.53 cannot checkpoint a new INCREMENTAL file that
+# creates and drops tables in one transaction, as initialising through 0017
+# does ("database disk image is malformed").
+_COMPACT_AFTER = frozenset({17})
+
+
+def _compact(connection: sqlite3.Connection) -> str:
+    """Return free pages to the file system after a committed upgrade; never raises.
+
+    The upgrade has committed by now, so a busy or full disk only leaves the
+    pages for the backup job's maintenance to take later.
+    """
+    try:
+        if connection.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:  # INCREMENTAL already
+            # Each step frees one page. execute() steps it once on Python 3.11
+            # (and fetchall() gets no rows there); executescript() runs it to the end.
+            connection.executescript("PRAGMA incremental_vacuum;")
+            return "incremental_vacuum"
+        connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        connection.execute("VACUUM")
+        return "vacuum, auto_vacuum=incremental"
+    except sqlite3.Error as exc:
+        return f"skipped: {type(exc).__name__}: {exc}"
 
 
 def _begin_immediate_with_retry(connection: sqlite3.Connection) -> None:
@@ -509,7 +544,12 @@ def ensure_schema(
         if backup_path is not None:
             backup_path.unlink(missing_ok=True)
         raise
-    return SchemaPreparation(state_before=state, applied=tuple(applied), backup_path=backup_path)
+    compaction = (
+        _compact(connection) if state.fresh or any(item.version in _COMPACT_AFTER for item in applied) else None
+    )
+    return SchemaPreparation(
+        state_before=state, applied=tuple(applied), backup_path=backup_path, compaction=compaction
+    )
 
 
 @dataclass(frozen=True)
@@ -522,34 +562,120 @@ class SchemaRevert:
     backup_path: Path
 
 
-def revert_migration(connection: sqlite3.Connection, config: ChronicleConfig, version: int) -> SchemaRevert:
+# A down script that reads `archive.<table>` restores what its migration dropped
+# from the copy taken before it, which the runner attaches under this name.
+_ARCHIVE_SCHEMA = "archive"
+_READS_ARCHIVE_RE = re.compile(rf"\b{_ARCHIVE_SCHEMA}\.\w")
+
+
+def _check_revert_archive(archive: Path, version: int) -> None:
+    """Refuse an archive that cannot be the copy taken before migration `version`."""
+    if not archive.is_file():
+        raise MigrationError(f"no archive at {archive}")
+    try:
+        copy = connect(archive, read_only=True)
+        try:
+            application_id, has_objects, has_history = _schema_markers(copy)
+            applied = (
+                {int(row[0]) for row in copy.execute("SELECT version FROM schema_migrations")}
+                if has_history else set()
+            )
+        finally:
+            copy.close()
+    except sqlite3.Error as exc:
+        raise MigrationError(f"cannot read the archive {archive}: {exc}") from exc
+    if _is_foreign(application_id, has_objects=has_objects, has_history=has_history) or not applied:
+        raise MigrationError(f"{archive} is not a Chronicle database")
+    if version in applied:
+        raise MigrationError(
+            f"{archive} already has migration {version:04d}; pass the copy taken before it "
+            f"(chronicle.db.bak-premigrate-v{version - 1}-v{version}-…)"
+        )
+
+
+# The copy the upgrade took is of this database: nothing it holds has gone since
+# (no code path deletes events or snapshots), and it is empty only if this
+# database was empty then too.
+_ARCHIVE_MATCHES = (
+    ("events in the copy that this database lacks",
+     "SELECT COUNT(*) FROM archive.events WHERE id NOT IN (SELECT id FROM main.events)"),
+    ("snapshots in the copy that this database lacks",
+     "SELECT COUNT(*) FROM archive.snapshots WHERE id NOT IN (SELECT id FROM main.snapshots)"),
+    ("events this database recorded before the migration, while the copy has none",
+     "SELECT COUNT(*) FROM main.events WHERE NOT EXISTS (SELECT 1 FROM archive.events) AND recorded_at_utc < "
+     "(SELECT applied_at_utc FROM main.schema_migrations WHERE version = ?)"),
+)
+
+
+def _require_archive_of_this_database(connection: sqlite3.Connection, archive: Path, version: int) -> None:
+    for label, sql in _ARCHIVE_MATCHES:
+        count = int(connection.execute(sql, (version,) if "?" in sql else ()).fetchone()[0])
+        if count:
+            raise MigrationError(
+                f"{archive} is not the copy taken before migration {version:04d} of this database: "
+                f"{count} {label}"
+            )
+
+
+def _require_newest(state: SchemaState, config: ChronicleConfig, version: int) -> None:
+    if state.foreign:
+        raise MigrationError(f"{config.db_path} is not a Chronicle database; refusing to modify it.")
+    if state.current_version != version:
+        raise MigrationError(
+            f"only the newest migration reverts: {config.db_path} is at v{state.current_version}, not v{version}"
+        )
+
+
+def revert_migration(
+    connection: sqlite3.Connection,
+    config: ChronicleConfig,
+    version: int,
+    *,
+    archive: Path | None = None,
+) -> SchemaRevert:
     """Undo the newest migration with its down script, after an online backup.
 
     Only the newest applied migration reverts, and only one that ships a script
-    in migrations/down/. Install the code of the earlier version before anything
-    opens the database with --migrate again: this code would re-apply it.
+    in migrations/down/. A script that restores dropped data reads it from
+    `archive`, the copy the upgrade took before that migration. Install the code
+    of the earlier version before anything opens the database with --migrate
+    again: this code would re-apply it.
     """
-    _begin_immediate_with_retry(connection)
-    try:
-        state = read_schema_state(connection, config)
-        if state.foreign:
-            raise MigrationError(f"{config.db_path} is not a Chronicle database; refusing to modify it.")
-        if state.current_version != version:
+    _require_newest(read_schema_state(connection, config), config, version)
+    scripts = sorted((config.migrations_dir / "down").glob(f"{version:04d}_*.sql"))
+    if len(scripts) != 1:
+        raise MigrationError(f"migration {version:04d} has no down script in {config.migrations_dir / 'down'}")
+    script_sql = scripts[0].read_text(encoding="utf-8")
+    attached = False
+    if _READS_ARCHIVE_RE.search(script_sql):
+        if archive is None:
             raise MigrationError(
-                f"only the newest migration reverts: {config.db_path} is at v{state.current_version}, not v{version}"
+                f"migration {version:04d} reverts from the copy taken before it: pass --archive with "
+                f"chronicle.db.bak-premigrate-v{version - 1}-v{version}-…"
             )
-        scripts = sorted((config.migrations_dir / "down").glob(f"{version:04d}_*.sql"))
-        if len(scripts) != 1:
-            raise MigrationError(f"migration {version:04d} has no down script in {config.migrations_dir / 'down'}")
-        backup_path = _backup_database(config.db_path, label=f"prerevert-v{version}")
-        _execute_sql_script_in_transaction(connection, scripts[0].read_text(encoding="utf-8"))
-        connection.execute("DELETE FROM schema_migrations WHERE version = ?", (version,))
-        schema_version = max(state.applied - {version}, default=0)
-        connection.execute(f"PRAGMA user_version = {schema_version}")
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
+        _check_revert_archive(archive, version)
+        # ATTACH cannot run inside a transaction.
+        connection.execute(f"ATTACH DATABASE ? AS {_ARCHIVE_SCHEMA}", (str(archive),))
+        attached = True
+    try:
+        _begin_immediate_with_retry(connection)
+        try:
+            state = read_schema_state(connection, config)
+            _require_newest(state, config, version)  # again, under the write lock
+            if attached:
+                _require_archive_of_this_database(connection, archive, version)
+            backup_path = _backup_database(config.db_path, label=f"prerevert-v{version}")
+            _execute_sql_script_in_transaction(connection, script_sql)
+            connection.execute("DELETE FROM schema_migrations WHERE version = ?", (version,))
+            schema_version = max(state.applied - {version}, default=0)
+            connection.execute(f"PRAGMA user_version = {schema_version}")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        if attached:
+            connection.execute(f"DETACH DATABASE {_ARCHIVE_SCHEMA}")
     return SchemaRevert(version=version, script=scripts[0], schema_version=schema_version, backup_path=backup_path)
 
 
@@ -585,10 +711,6 @@ def database_summary(connection: sqlite3.Connection) -> dict[str, object]:
         "curation_runs": table_count(connection, "curation_runs"),
         "event_external_refs": table_count(connection, "event_external_refs"),
         "normalized_entities": table_count(connection, "normalized_entities"),
-        "situation_models": table_count(connection, "situation_models"),
-        "lens_runs": table_count(connection, "lens_runs"),
-        "scenario_runs": table_count(connection, "scenario_runs"),
-        "forecast_reviews": table_count(connection, "forecast_reviews"),
     }
 
     latest_event = connection.execute(

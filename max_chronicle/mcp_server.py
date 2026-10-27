@@ -1414,11 +1414,12 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
         set_read_only_process(True)
     if prepared.applied:
         _LOGGER.warning(
-            "chronicle-mcp migrated %s from v%d to v%d; backup=%s",
+            "chronicle-mcp migrated %s from v%d to v%d; backup=%s; compaction=%s",
             config.db_path,
             prepared.state_before.current_version,
             max(item.version for item in prepared.applied),
             prepared.backup_path,
+            prepared.compaction,
         )
     server = build_server(manifest_path, profile=args.profile)
     endpoint = args.transport

@@ -16,6 +16,7 @@ from .store import (
     _parse_iso,
     _slugify,
     guard_visibility,
+    snapshot_payload_to_store,
     to_local_iso as _to_local_iso,
 )
 
@@ -324,7 +325,8 @@ def import_legacy_snapshots(
                     row.get("focus"),
                     row.get("label"),
                     _snapshot_summary(row),
-                    _json(row),
+                    # The ledger was imported first, so its events become ids.
+                    _json(snapshot_payload_to_store(connection, row)),
                 ),
             )
             imported += 1

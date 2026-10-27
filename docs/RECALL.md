@@ -20,7 +20,9 @@ what never gets stored, and how to measure recall on your own corpus.
   model's context is embedded from its start instead of failing. Scope and
   visibility are checked before ranking. `vector_coverage` discloses gaps, and
   an active model with no index at all degrades the channel
-  (`embedding_index_empty`). `chronicle embed-backfill` fills the active index.
+  (`embedding_index_empty`). `chronicle embed-backfill` fills the active index;
+  `chronicle embed-prune --model KEY` counts another model's vectors, and with
+  `--apply` deletes them (never the active model's).
   If native scheduling is enabled, daily capture also retries up to 10 missing
   or incompatible embeddings per run. Disabling event embeddings disables this repair.
 - **Recency:** breaks ties between equally relevant candidates; it never supplies

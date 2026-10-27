@@ -16,9 +16,9 @@ The core storage model:
 
 Current operational database version:
 
-- `PRAGMA user_version = 16`
-- latest applied migration: `0016_schema_v2_columns.sql`
-- next migration number: `0017`
+- `PRAGMA user_version = 17`
+- latest applied migration: `0017_dead_weight.sql`
+- next migration number: `0018`
 
 Migration `0007` adds the missing hot-path indexes for recent-event reads, outbox scans, latest situation lookup, and latest snapshot lookup.
 Migration `0008` (memory v3) adds `entity_aliases`, the facts/episodes layer (`facts`, `episodes`, `fact_transactions`, `facts_fts`), `llm_calls`, and `recall_outbox`.
@@ -28,6 +28,7 @@ Migration `0012` replaces `event_embeddings` with `event_vectors`, keyed by (eve
 Migration `0013` adds the note index (FR-10): `documents`, `document_chunks`, `document_chunks_fts` and `chunk_vectors`; `0014` adds `documents.index_version`.
 Migration `0015` adds a unique index that holds each fact slot to one active value (W8); a database that already held several keeps the newest and retires the rest, with a transaction and a mutation log entry.
 Migration `0016` names columns after what they hold. In `events`, `title` becomes `project`, `circumstances` `domain` and `imported_from` `written_by`; `task_id` and `visibility` (`default` or `raw_only`, the quarantine) become columns. `event_observations` gets `visibility`. `facts` gets `project`, `task_id`, `kind`, `event_id` and `observation_id`, and drops `relation` (it repeated `slot_key`), `confidence`, `reference_time_utc` and `group_id`; `facts_fts` indexes `slot_key`. The unused `v_chronicle_timeline` view goes. A pre-hook refuses a database whose dropped columns hold anything the others cannot give back. `payload_json.memory_guard` and `attributes_json` are still written, so `chronicle migrate --revert 16` (`migrations/down/0016_schema_v2_columns.sql`) returns to schema 15 without losing what was written since (a NULL `group_id` comes back as `[null,null]`, the same scope to every v15 reader).
+Migration `0017` drops what nothing reads: `llm_calls`, `recall_outbox`, `reconciliation_runs` and `session_messages` (never written), the situation layer (`situation_models`, `lens_runs`, `scenario_runs`, `forecast_reviews`), `snapshots_fts` with its triggers, and two duplicate indexes. A snapshot's `recent_ledger` keeps the ids of the events it saw instead of copies; readers take each event as it is now, so one quarantined since stays out. An entry without the id of an event in the database stays a copy. `mem0_snapshot_hits` goes; `mem0_dump` stays. After the upgrade a full VACUUM returns the freed pages and switches the file to `auto_vacuum = INCREMENTAL`, so maintenance reclaims space with `incremental_vacuum`; a new database is switched the same way once initialised. `chronicle migrate --revert 17 --archive chronicle.db.bak-premigrate-v16-v17-…` (`migrations/down/0017_dead_weight.sql`) restores the tables, the index, and the snapshot payloads from the copy taken before the upgrade; nothing else changed, so nothing written since is lost.
 
 ## Core Tables
 
@@ -128,40 +129,24 @@ Schema v1 now also carries derived analytical tables without changing the truth 
 
 Canonical alias groups for companies, projects, systems, topics, and later people.
 
-### `situation_models`
-
-Read-only derived state models linked to a Chronicle snapshot.
-
-### `lens_runs`
-
-Evidence-linked fixed analytical lenses over one `situation_model`.
-
-### `scenario_runs`
-
-Conditional what-if branches with explicit assumptions and expected outcomes.
-
-### `forecast_reviews`
-
-Replay/eval records that compare scenario expectations to later truth.
+`situation_models`, `lens_runs`, `scenario_runs` and `forecast_reviews` held
+derived state models, lenses, what-if branches and their reviews; nothing wrote
+or read them any more, and migration `0017` dropped them.
 
 ## Search Layer
 
 Schema v1 creates:
 
 - `events_fts`
-- `snapshots_fts`
+- `snapshots_fts` (dropped in `0017`: nothing queried it)
 
 This keeps semantic lookup local and inspectable even without live Mem0.
 
 ## Timeline View
 
-`v_chronicle_timeline` combines events and snapshots into one ordered query surface.
-
-It is a convenience view for:
-
-- timeline reconstruction
-- operator inspection
-- MCP adapters later
+`v_chronicle_timeline` combined events and snapshots into one ordered query
+surface. Nothing read it, and migration `0016` dropped it; `state_at` and the
+timeline commands query the tables.
 
 ## Invariants
 
@@ -223,5 +208,5 @@ observations, decisions, and assumptions.
 
 Events, observations, fact mutations, and artifact links share one transaction.
 Lexical/vector recall excludes superseded fact events, while historical reads
-retain them. Legacy analytical tables are retained for historical compatibility;
-the current tool surface does not produce speculative scenarios.
+retain them. The legacy analytical tables went in `0017`; the current tool
+surface does not produce speculative scenarios.

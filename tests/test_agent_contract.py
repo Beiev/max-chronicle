@@ -1727,18 +1727,6 @@ def test_mcp_capture_snapshot_returns_a_receipt_not_the_whole_snapshot(
     assert set(payload["normalized_entities"]) == {"count", "ids"}
 
 
-def test_query_context_leaves_old_situation_models_out(loaded_manifest) -> None:
-    from max_chronicle.store import store_situation_model
-
-    store_situation_model(config_from_manifest(loaded_manifest), {
-        "domain": "global", "status": "active", "summary_text": "Quarantine drill is the current focus",
-        "valid_at_utc": "2026-06-04T00:20:00Z"})
-
-    payload = query_context(loaded_manifest, query="Quarantine drill", domain="global", limit=5)
-
-    assert payload["interpretation_hits"] == []
-
-
 def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sandbox) -> None:
     async def collect() -> dict[str, Any]:
         server = _sandbox_mcp_server(chronicle_sandbox.manifest_path, profile="admin")

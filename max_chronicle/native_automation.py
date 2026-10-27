@@ -1392,7 +1392,9 @@ def _vacuum_db(config) -> dict[str, Any]:
             free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
             total_pages = int(connection.execute("PRAGMA page_count").fetchone()[0]) or 1
             if auto_vacuum_mode == 2:  # INCREMENTAL
-                connection.execute("PRAGMA incremental_vacuum")
+                # Each step frees one page. execute() steps it once on Python 3.11
+                # (and fetchall() gets no rows there); executescript() runs it to the end.
+                connection.executescript("PRAGMA incremental_vacuum;")
                 mode = "incremental_vacuum"
             elif free_pages / total_pages < VACUUM_MIN_FREE_RATIO:
                 # A full VACUUM takes the database's exclusive lock and rewrites
@@ -1403,6 +1405,8 @@ def _vacuum_db(config) -> dict[str, Any]:
             else:
                 # Legacy fallback for DBs not yet flipped to INCREMENTAL: full
                 # VACUUM needs an exclusive lock and rewrites the whole file.
+                # It also flips the file to INCREMENTAL, so it is the last one.
+                connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 connection.execute("VACUUM")
                 mode = "vacuum"
         return {"status": "ok", "mode": mode}
