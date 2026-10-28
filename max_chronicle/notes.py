@@ -664,6 +664,10 @@ def embed_chunks(manifest: dict[str, Any], *, limit: int | None = None) -> dict[
             (profile.key, limit) if limit else (profile.key,),
         ).fetchall()
     embedded = failed = 0
+    if rows and not embeddings.ensure_backend(embeddings.embedder_settings(manifest),
+                                              wait_s=embeddings.BACKGROUND_START_WAIT_S).up:
+        # Down: a call would only wait for its timeout. The next sync retries.
+        return {"model_key": profile.key, "missing": len(rows), "embedded": 0, "failed": len(rows)}
     for start in range(0, len(rows), EMBED_BATCH):
         batch = rows[start:start + EMBED_BATCH]
         vectors = embeddings.embed_documents([f"{row['heading']}\n{row['text']}" for row in batch],

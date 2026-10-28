@@ -54,7 +54,8 @@ The generated workspace is intentionally additive and local. It does not modify 
 
 These are not required for the core system to work:
 
-- local vector recall through Ollama: `ollama pull qwen3-embedding:0.6b`, then `chronicle embed-backfill`
+- local vector recall through Ollama: `ollama pull qwen3-embedding:0.6b`, then `chronicle embed-backfill`;
+  `[embedder] start_command` lets Chronicle start Ollama when it is down ([OPERATIONS](docs/OPERATIONS.md))
 - launchd scheduling
 - external digest feeds
 - repo hook automation

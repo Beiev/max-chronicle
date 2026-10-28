@@ -35,7 +35,14 @@ CHRONICLE_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "max_chronicle"
 @pytest.fixture(autouse=True)
 def _offline_embeddings(monkeypatch):
     """Tests opt into explicit fake vectors; never contact an operator's Ollama."""
+    from max_chronicle import embeddings
+
     monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr("max_chronicle.embeddings.embed_documents", lambda *args, **kwargs: None)
+    # Ollama answers as up with the model loaded, so nothing waits or starts it.
+    monkeypatch.setattr("max_chronicle.embeddings.probe_backend",
+                        lambda *args, **kwargs: embeddings.BackendState(up=True, loaded=True))
+    embeddings.reset_start_state()
 
 
 @pytest.fixture(autouse=True)

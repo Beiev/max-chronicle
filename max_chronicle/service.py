@@ -1590,8 +1590,9 @@ def build_startup_bundle(
     recall_status = None
     if focus:
         # The bundle shows events only, so its confidence must come from events too.
+        # A capture holds the write slot: its recall must not wait for Ollama to start.
         recall = query_memory(manifest, query=focus, domain=domain_id, project=project,
-                              task_id=task_id, limit=limit, include_notes=False)
+                              task_id=task_id, limit=limit, include_notes=False, wait_for_backend=not capture)
         recall_status = {key: recall[key] for key in (
             "degraded", "channel_errors", "vector_coverage", "relaxed", "no_confident_match", "hint",
         ) if key in recall}
@@ -2943,21 +2944,40 @@ def embed_backfill(
     manifest: dict[str, Any],
     *,
     limit: int | None = None,
+    lazy: bool = False,
 ) -> dict[str, Any]:
     """Embed every event the active profile's index lacks.
 
     Returns counts: {embedded, skipped, failed}, the index's model key, and the
     model's dimension (None while the backend is unavailable).
     Best-effort — individual failures do not abort the run, but an unavailable
-    backend (the dimension probe fails) ends it at once with backend_unavailable.
+    backend (down, or the dimension probe fails) ends it at once with
+    backend_unavailable. Ollama is started first when it is down and the manifest says how.
+
+    With ``lazy`` (the server's background sweep), an index that lacks no event
+    returns without calling Ollama, so an idle server lets it unload the model.
+    A vector of another dimension is then found by the next sweep that has work.
     """
-    from .embeddings import BACKFILL_TIMEOUT_S, DIMENSION_PROBE_TEXT, active_profile, embed_document, event_embedding_text
+    from .embeddings import (
+        BACKFILL_TIMEOUT_S,
+        BACKGROUND_START_WAIT_S,
+        DIMENSION_PROBE_TEXT,
+        active_profile,
+        embed_document,
+        embedder_settings,
+        ensure_backend,
+        event_embedding_text,
+    )
 
     config = _config(manifest)
     model_key = active_profile().key
+    if lazy and not fetch_event_ids_without_embedding(config, model_key=model_key):
+        return {"model_key": model_key, "dim": None, "total_without_embedding": 0,
+                "embedded": 0, "skipped": 0, "failed": 0, "backend_unavailable": False}
+    backend = ensure_backend(embedder_settings(manifest), wait_s=BACKGROUND_START_WAIT_S)
     # The model's current dimension: a stored vector of another one (the model
     # behind the key changed) is replaced. Unknown while the backend is down.
-    probe = embed_document(DIMENSION_PROBE_TEXT, timeout=BACKFILL_TIMEOUT_S)
+    probe = embed_document(DIMENSION_PROBE_TEXT, timeout=BACKFILL_TIMEOUT_S) if backend.up else None
     dim = len(probe) if probe is not None else None
     event_ids = fetch_event_ids_without_embedding(config, model_key=model_key, dim=dim)
     # The whole backlog, before the limit: a caller that loops while events
