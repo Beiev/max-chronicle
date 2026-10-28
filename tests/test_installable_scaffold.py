@@ -35,7 +35,6 @@ def test_scaffold_workspace_creates_portable_install_root(tmp_path) -> None:
 
     manifest_path = root / "SSOT_MANIFEST.toml"
     automation_path = root / "CHRONICLE_AUTOMATION.toml"
-    mem0_dump_path = root / "mem0-dump.json"
 
     assert payload["status"] == "ok"
     assert payload["root"] == str(root)
@@ -44,7 +43,8 @@ def test_scaffold_workspace_creates_portable_install_root(tmp_path) -> None:
     assert (root / "chronicle.db").exists()
     assert str(root) in manifest_path.read_text(encoding="utf-8")
     assert str(root) in automation_path.read_text(encoding="utf-8")
-    assert json.loads(mem0_dump_path.read_text(encoding="utf-8"))["total_memories"] == 0
+    assert not (root / "mem0-dump.json").exists() and not (root / "scripts" / "mem0_bridge.py").exists()
+    assert "mem0" not in (manifest_path.read_text(encoding="utf-8") + automation_path.read_text(encoding="utf-8"))
 
 
 def test_default_config_prefers_chronicle_root_env(monkeypatch, tmp_path) -> None:

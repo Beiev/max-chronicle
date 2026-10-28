@@ -297,14 +297,14 @@ _MIGRATION_PREHOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     17: _prepare_migration_v17,
 }
 
-# Migrations that free a lot of pages. A full VACUUM returns them, and is the
+# Migrations that free pages. A full VACUUM returns them, and is the
 # only way to switch an existing database to auto_vacuum=INCREMENTAL; after
 # that the backup job reclaims space with incremental_vacuum alone, without a
 # full VACUUM's exclusive lock. A new database is switched the same way once
 # initialised: SQLite 3.53 cannot checkpoint a new INCREMENTAL file that
 # creates and drops tables in one transaction, as initialising through 0017
 # does ("database disk image is malformed").
-_COMPACT_AFTER = frozenset({17})
+_COMPACT_AFTER = frozenset({17, 18})
 
 
 def _compact(connection: sqlite3.Connection) -> str:
@@ -703,7 +703,6 @@ def database_summary(connection: sqlite3.Connection) -> dict[str, object]:
         "artifact_links": table_count(connection, "artifact_links"),
         "relations": table_count(connection, "relations"),
         "ingest_runs": table_count(connection, "ingest_runs"),
-        "mem0_outbox": table_count(connection, "mem0_outbox"),
         "projection_runs": table_count(connection, "projection_runs"),
         "automation_runs": table_count(connection, "automation_runs"),
         "backup_runs": table_count(connection, "backup_runs"),

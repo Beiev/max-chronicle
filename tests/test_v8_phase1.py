@@ -1,4 +1,4 @@
-"""Chronicle v8 Phase 1 — entity aliases, merge, Mem0 live, resolution, dedup.
+"""Chronicle v8 Phase 1 — entity aliases, merge, resolution, dedup.
 
 All tests run against the isolated `chronicle_sandbox` fixture from conftest.py,
 so no live DB is touched. The sandbox applies migrations 0001..0008 on
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -689,116 +688,6 @@ class TestEventContentHashDedup:
         assert n == 1
 
 
-class TestSearchMem0Live:
-    def test_disabled_flag_returns_empty(
-        self, loaded_manifest, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("CHRONICLE_ENABLE_MEM0_LIVE_SEARCH", "0")
-        out = service.search_mem0_live_service(
-            loaded_manifest, query="anything"
-        )
-        assert out["status"] == "disabled"
-        assert out["results"] == []
-
-    def test_blank_query_raises(self, loaded_manifest) -> None:
-        with pytest.raises(ValueError, match="blank"):
-            service.search_mem0_live_service(loaded_manifest, query="")
-
-    def test_bridge_missing_is_degraded(
-        self, loaded_manifest, monkeypatch, tmp_path
-    ) -> None:
-        """Point the mem0_bridge resolver at a nonexistent path."""
-        monkeypatch.setenv("CHRONICLE_ENABLE_MEM0_LIVE_SEARCH", "1")
-        missing = tmp_path / "missing.py"
-        monkeypatch.setattr(
-            service, "_resolve_mem0_bridge_path", lambda _m: missing
-        )
-        out = service.search_mem0_live_service(
-            loaded_manifest, query="x", timeout_s=5
-        )
-        assert out["status"] == "degraded"
-        assert "not found" in out["reason"]
-        assert out["results"] == []
-
-    def test_bridge_nonzero_is_degraded(
-        self, loaded_manifest, monkeypatch, tmp_path
-    ) -> None:
-        """Stub subprocess.run to simulate a bridge that exits nonzero."""
-        monkeypatch.setenv("CHRONICLE_ENABLE_MEM0_LIVE_SEARCH", "1")
-        fake_bridge = tmp_path / "bridge.py"
-        fake_bridge.write_text("# stub")
-        monkeypatch.setattr(
-            service, "_resolve_mem0_bridge_path", lambda _m: fake_bridge
-        )
-
-        class _FakeProc:
-            returncode = 1
-            stdout = ""
-            stderr = "boom\n"
-
-        monkeypatch.setattr(service.subprocess, "run", lambda *a, **k: _FakeProc())
-        out = service.search_mem0_live_service(
-            loaded_manifest, query="x", timeout_s=5
-        )
-        assert out["status"] == "degraded"
-        assert "exit=1" in out["reason"]
-        assert out["results"] == []
-
-    def test_bridge_timeout_is_degraded(
-        self, loaded_manifest, monkeypatch, tmp_path
-    ) -> None:
-        monkeypatch.setenv("CHRONICLE_ENABLE_MEM0_LIVE_SEARCH", "1")
-        fake_bridge = tmp_path / "bridge.py"
-        fake_bridge.write_text("# stub")
-        monkeypatch.setattr(
-            service, "_resolve_mem0_bridge_path", lambda _m: fake_bridge
-        )
-
-        def _raise_timeout(*_a, **_k):
-            raise subprocess.TimeoutExpired(cmd="x", timeout=0.1)
-
-        monkeypatch.setattr(service.subprocess, "run", _raise_timeout)
-        out = service.search_mem0_live_service(
-            loaded_manifest, query="x", timeout_s=0.1
-        )
-        assert out["status"] == "degraded"
-        assert "timed out" in out["reason"]
-
-    def test_bridge_parses_json_payload(
-        self, loaded_manifest, monkeypatch, tmp_path
-    ) -> None:
-        monkeypatch.setenv("CHRONICLE_ENABLE_MEM0_LIVE_SEARCH", "1")
-        fake_bridge = tmp_path / "bridge.py"
-        fake_bridge.write_text("# stub")
-        monkeypatch.setattr(
-            service, "_resolve_mem0_bridge_path", lambda _m: fake_bridge
-        )
-
-        class _FakeProc:
-            returncode = 0
-            stdout = (
-                'some stderr-like log line\n'
-                '{"query":"x","collection":"personal","results":'
-                '[{"id":"m-1","memory":"hi","score":0.42,"metadata":{}}],'
-                '"count":1}\n'
-            )
-            stderr = ""
-
-        monkeypatch.setattr(service.subprocess, "run", lambda *a, **k: _FakeProc())
-        out = service.search_mem0_live_service(
-            loaded_manifest, query="x", timeout_s=5
-        )
-        assert out["status"] == "ok"
-        assert out["count"] == 1
-        assert out["results"][0]["id"] == "m-1"
-
-    def test_invalid_collection_raises(self, loaded_manifest) -> None:
-        with pytest.raises(ValueError, match="collection"):
-            service.search_mem0_live_service(
-                loaded_manifest, query="x", collection="bogus"
-            )
-
-
 # --------------------------------------------------------------------------
 # MCP server registration — make sure the 4 v8 tools are exposed.
 # --------------------------------------------------------------------------
@@ -817,7 +706,7 @@ class TestMCPServerRegistration:
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
         # v8 quartet consolidated into entity_admin (15->10 tool-surface simplification)
-        assert {"entity_admin", "search_mem0_live"}.issubset(names)
+        assert "entity_admin" in names
         assert "add_entity_alias" not in names
         assert "merge_entities" not in names
         assert "entity_resolution_report" not in names
@@ -832,6 +721,5 @@ class TestMCPServerRegistration:
         )
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
-        # Entity admin + mem0 live search are chronicler-only.
+        # Entity admin is admin-only.
         assert "entity_admin" not in names
-        assert "search_mem0_live" not in names

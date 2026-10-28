@@ -33,14 +33,24 @@ def offline(monkeypatch):
     monkeypatch.setenv("CHRONICLE_FEATURE_EVENT_EMBEDDINGS", "0")
 
 
-def _v16(config, tmp_path: Path):
-    """*config* on the schema v0.24 runs: 0016 is the newest migration."""
-    early = tmp_path / "migrations-v16"
+def _upto(config, tmp_path: Path, version: int):
+    """*config* on the migrations up to *version*, with their down scripts."""
+    early = tmp_path / f"migrations-v{version}"
     (early / "down").mkdir(parents=True, exist_ok=True)
     for path in [*MIGRATIONS_DIR.glob("*.sql"), *(MIGRATIONS_DIR / "down").glob("*.sql")]:
-        if int(path.name[:4]) <= 16:
+        if int(path.name[:4]) <= version:
             (early / path.relative_to(MIGRATIONS_DIR)).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     return replace(config, migrations_dir=early)
+
+
+def _v16(config, tmp_path: Path):
+    """*config* on the schema v0.24 runs: 0016 is the newest migration."""
+    return _upto(config, tmp_path, 16)
+
+
+def _v17(config, tmp_path: Path):
+    """*config* on the schema v0.25 runs: 0017 is the newest migration."""
+    return _upto(config, tmp_path, 17)
 
 
 def _insert_event(connection, event_id: str) -> None:
@@ -95,6 +105,11 @@ def _objects(connection) -> set[str]:
     return {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
 
 
+def _xinfo(connection, table: str) -> set[tuple]:
+    """Each column as name, type, not null, default, primary key, hidden: everything but its position."""
+    return {tuple(row)[1:] for row in connection.execute(f"PRAGMA table_xinfo({table})")}
+
+
 def _schema(connection) -> set[tuple[str, str, str]]:
     return {(row[0], row[1], " ".join((row[2] or "").split()))
             for row in connection.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
@@ -116,6 +131,7 @@ def test_0017_drops_what_nothing_reads_and_keeps_ids(loaded_manifest, tmp_path) 
     prepare_database(_v16(config, tmp_path), allow_upgrade=True)
     _seed_v16(config)
     _legacy_auto_vacuum(config)
+    config = _v17(config, tmp_path)
 
     prepared = prepare_database(config, allow_upgrade=True)
 
@@ -213,10 +229,12 @@ def test_revert_17_brings_back_what_it_dropped_from_the_archive(chronicle_sandbo
     store_snapshot(config, {"id": "s-plain", "captured_at_utc": "2026-10-20T09:00:00Z", "domain": "global",
                             "title": "Stored again", "recent_ledger": []})
 
-    monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
-                                      "migrate", "--revert", "17", "--archive", str(archive)])
-    assert cli.main() == 0
-    receipt = json.loads(capsys.readouterr().out)
+    # 0017 and 0018 came in one upgrade, so one copy serves both ways back, the newest first.
+    for version in ("18", "17"):
+        monkeypatch.setattr(sys, "argv", ["chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
+                                          "migrate", "--revert", version, "--archive", str(archive)])
+        assert cli.main() == 0
+        receipt = json.loads(capsys.readouterr().out)
 
     assert receipt["schema_version"] == 16 and Path(receipt["backup_path"]).is_file()
     assert _sha256(archive) == archive_sha
@@ -224,8 +242,11 @@ def test_revert_17_brings_back_what_it_dropped_from_the_archive(chronicle_sandbo
     fresh.parent.mkdir()
     with open_connection(replace(v16, db_path=fresh)) as connection:
         expected = _schema(connection)
+        expected_events = _xinfo(connection, "events")
     with connect(config.db_path) as connection:
-        assert _schema(connection) == expected
+        # Only the events DDL differs: the two Mem0 columns came back last.
+        assert {item for item in _schema(connection) ^ expected if item[1] != "events"} == set()
+        assert _xinfo(connection, "events") == expected_events
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16
         assert [row[1] for row in connection.execute("PRAGMA database_list")] == ["main"]
@@ -247,11 +268,11 @@ def test_revert_17_brings_back_what_it_dropped_from_the_archive(chronicle_sandbo
     assert new_ledger == [new["id"]] and [tuple(row) for row in indexed] == [("s-new",)]
     assert restored_again["title"] == "Stored again"
     # And up again.
-    assert [item.version for item in prepare_database(config, allow_upgrade=True).applied] == [17]
+    assert [item.version for item in prepare_database(config, allow_upgrade=True).applied] == [17, 18]
 
 
 def test_revert_17_refuses_without_the_right_archive(loaded_manifest, tmp_path) -> None:
-    config = config_from_manifest(loaded_manifest)
+    config = _v17(config_from_manifest(loaded_manifest), tmp_path)
     prepare_database(config, allow_upgrade=True)
     stranger = tmp_path / "other.db"
     sqlite3.connect(stranger).execute("CREATE TABLE notes(text TEXT)").connection.close()
@@ -274,6 +295,7 @@ def test_revert_17_refuses_the_copy_of_another_database(loaded_manifest, tmp_pat
     config = config_from_manifest(loaded_manifest)
     prepare_database(_v16(config, tmp_path), allow_upgrade=True)
     _seed_v16(config)
+    config = _v17(config, tmp_path)
     prepare_database(config, allow_upgrade=True)
     empty = replace(_v16(config, tmp_path), db_path=tmp_path / "empty" / "chronicle.db")
     other = replace(empty, db_path=tmp_path / "other" / "chronicle.db")

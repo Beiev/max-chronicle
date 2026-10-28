@@ -38,7 +38,6 @@ from .config import (
     default_automation_path,
     default_manifest_path,
     feature_enabled,
-    mem0_enabled,
 )
 from .db import MigrationError
 from .runtime_context import load_manifest, load_manifest_cached, parse_when
@@ -53,7 +52,6 @@ from .service import (
     build_startup_bundle,
     capture_runtime_snapshot,
     current_state,
-    default_mem0_status,
     embed_backfill,
     entity_resolution_report_service,
     materialize_normalized_entities,
@@ -63,7 +61,6 @@ from .service import (
     query_memory,
     record_event,
     reconstruct_timeline,
-    search_mem0_live_service,
 )
 from .store import (
     digest_snapshot,
@@ -163,7 +160,7 @@ TIMELINE_MODE_ARG = Annotated[
         "the timestamp, plus the facts current then."
     )),
 ]
-QUERY_ARG = Annotated[str, Field(description="Search string matched across Chronicle events, status markdown sections and the Mem0 dump.")]
+QUERY_ARG = Annotated[str, Field(description="Search string matched across Chronicle events and status markdown sections.")]
 RECALL_QUERY_ARG = Annotated[str, Field(description="What to recall: words or a question, in any language.")]
 DETAIL_ARG = Annotated[
     Literal["index", "full"],
@@ -176,8 +173,8 @@ IDS_ARG = Annotated[
 QUERY_MODE_ARG = Annotated[
     QUERY_CONTEXT_MODE,
     Field(description=(
-        "truth_only: Chronicle events and status sources only. The other modes add the Mem0 dump and "
-        "matching entities; their interpretation and scenario layers are retired and stay empty."
+        "truth_only: Chronicle events and status sources only. The other modes add matching "
+        "entities; their interpretation and scenario layers are retired and stay empty."
     )),
 ]
 TEXT_ARG = Annotated[str, Field(description="Durable event text to write into Chronicle.")]
@@ -402,13 +399,6 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
     def manifest() -> dict:
         return load_manifest_cached(resolved_manifest_path)
 
-    # Whether Mem0 shows in the tools and instructions is decided when the
-    # server is built; the services check the manifest on every call.
-    try:
-        mem0_on = mem0_enabled(manifest())
-    except OSError:
-        mem0_on = True
-
     # Identity per live session object (a WeakKeyDictionary, pruned when a
     # transport drops its session). Writes no longer depend on it: the startup
     # gate that refused writes until startup_bundle was called in the same MCP
@@ -482,7 +472,6 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "A record is an attributed assertion, not proof: check its evidence and kind. A weak or empty "
             "recall does not prove the memory is absent. A failing tool raises with a JSON envelope after "
             "the prefix (parse from the first '{'): follow its `hint`."
-            + (" `search_mem0_live` queries the external Mem0 stack." if mem0_on and admin else "")
         ),
         log_level="INFO",
     )
@@ -834,8 +823,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "(nearest snapshots + events in a window). Use for 'what was happening on <date>'; "
             "for topic search use query_memory. mode='as_of' answers 'what did we know then': "
             "only snapshots taken by then, events of the window before it that had been recorded "
-            "by then (without their Mem0 sync state), and the facts current then. Snapshots come back digested — their "
-            "capture-time copies of the ledger and of semantic recall are replaced by a "
+            "by then, and the facts current then. Snapshots come back digested — their "
+            "capture-time copies of the ledger and of source excerpts are replaced by a "
             "count, since live recall serves those better; pass detail=\"full\" to get the "
             "stored payload verbatim (tens of KB per snapshot)."
         ),
@@ -866,8 +855,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         admin_only=True,
         name="query_context",
         description=(
-            "Broad context sweep: searches Chronicle events PLUS status-markdown sections and the "
-            "mem0 dump, with truth-layer ordering. Use when you need document/status context around "
+            "Broad context sweep: searches Chronicle events PLUS status-markdown sections, "
+            "with truth-layer ordering. Use when you need document/status context around "
             "a topic; for pure event recall query_memory is faster and ranks better."
         ),
     )
@@ -1035,13 +1024,6 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                 "text": text,
                 "why": why,
                 "source_files": source_files or [],
-                "mem0_status": default_mem0_status(
-                    {"category": category},
-                    source_kind="chronicle_mcp",
-                    mem0=mem0_enabled(manifest()),
-                ),
-                "mem0_error": None,
-                "mem0_raw": None,
             },
             append_compat=True,
             dedupe=True,
@@ -1176,34 +1158,6 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             )
             return {**result, "action": "merge"}
         raise ValueError(f"Unknown entity_admin action: {action}")
-
-    if mem0_on:  # the live Mem0 search exists only while the installation runs Mem0
-        @register_tool(
-            writes=False,
-            admin_only=True,
-            open_world=True,
-            name="search_mem0_live",
-            description=(
-                "Live semantic search over the external Mem0 stack through the bridge script the manifest names. "
-                "Fail-closed: timeouts, non-zero exits, or unparseable output return status='degraded' with "
-                "results=[] instead of raising, so Chronicle stays usable when Mem0 is down."
-            ),
-        )
-        def tool_search_mem0_live(
-            query: Annotated[str, Field(description="Semantic query text.")],
-            limit: Annotated[int, Field(ge=1, le=100, description="Max results (1–100, default 10).")] = 10,
-            collection: Annotated[Literal["personal", "digest", "both"], Field(description="Which Mem0 collection to query.")] = "personal",
-            category: Annotated[str | None, Field(description="Optional metadata.category filter.")] = None,
-            timeout_s: Annotated[float | None, Field(gt=0, le=120, description="Override bridge timeout (seconds, at most 120).")] = None,
-        ) -> dict:
-            return search_mem0_live_service(
-                manifest(),
-                query=query,
-                limit=limit,
-                collection=collection,
-                category=category,
-                timeout_s=timeout_s,
-            )
 
     @register_prompt(
         name="continue_work",

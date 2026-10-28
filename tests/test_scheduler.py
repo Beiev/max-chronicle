@@ -283,7 +283,9 @@ def test_retiring_unloads_every_job_agent_by_label(chronicle_sandbox, loaded_man
         log_dir=chronicle_sandbox.root / "logs", load_jobs=True)
 
     booted_out = {args[-1].rsplit("/", 1)[-1] for args in calls if args[:2] == ["launchctl", "bootout"]}
-    assert booted_out == set(native_automation.launchd_labels(loaded_automation).values())
+    assert booted_out == {*native_automation.launchd_labels(loaded_automation).values(),
+                          *native_automation.launchd_labels(loaded_automation,
+                                                            native_automation.RETIRED_JOB_SUFFIXES).values()}
 
 
 def test_a_scheduler_that_cannot_be_built_does_not_stop_the_server(loaded_automation, monkeypatch) -> None:

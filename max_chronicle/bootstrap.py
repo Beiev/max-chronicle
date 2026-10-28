@@ -15,6 +15,7 @@ from .store import (
     _json,
     _parse_iso,
     _slugify,
+    RETIRED_EVENT_KEYS,
     guard_visibility,
     snapshot_payload_to_store,
     to_local_iso as _to_local_iso,
@@ -71,7 +72,6 @@ def _snapshot_summary(snapshot: dict) -> str:
 def import_legacy_ledger(
     connection: sqlite3.Connection,
     config: ChronicleConfig,
-    queue_mem0: bool = False,
 ) -> dict[str, int]:
     ledger_rows = _read_jsonl(config.ledger_path)
     run_id = str(uuid.uuid4())
@@ -102,7 +102,7 @@ def import_legacy_ledger(
             started_at,
             str(config.ledger_path),
             source_hash,
-            _json({"queue_mem0": queue_mem0}),
+            _json({}),
         ),
     )
 
@@ -150,11 +150,9 @@ def import_legacy_ledger(
                     source_path,
                     source_hash,
                     payload_json,
-                    written_by,
-                    mem0_status,
-                    mem0_error
+                    written_by
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -176,49 +174,11 @@ def import_legacy_ledger(
                     "legacy_jsonl",
                     str(config.ledger_path),
                     source_hash,
-                    _json(row),
+                    _json({key: value for key, value in row.items() if key not in RETIRED_EVENT_KEYS}),
                     "ssot-ledger.jsonl",
-                    row.get("mem0_status"),
-                    row.get("mem0_error"),
                 ),
             )
 
-            # A row Chronicle kept out of Mem0 (skipped or off) stays out on a replay.
-            if queue_mem0 and row.get("category") and row.get("mem0_status") not in {"off", "skipped"}:
-                outbox_status = "synced" if row.get("mem0_status") == "stored" else "pending"
-                payload = {
-                    "text": row.get("text") or "",
-                    "why": row.get("why"),
-                    "category": row.get("category"),
-                    "project": row.get("project"),
-                }
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO mem0_outbox(
-                        id,
-                        event_id,
-                        collection_name,
-                        operation,
-                        status,
-                        attempts,
-                        last_attempt_at_utc,
-                        last_error,
-                        payload_json,
-                        created_at_utc,
-                        synced_at_utc
-                    )
-                    VALUES (?, ?, ?, 'add', ?, 0, NULL, NULL, ?, ?, ?)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        event_id,
-                        config.mem0_collection,
-                        outbox_status,
-                        _json(payload),
-                        started_at,
-                        started_at if outbox_status == "synced" else None,
-                    ),
-                )
             imported += 1
 
         connection.execute(
@@ -363,8 +323,7 @@ def import_legacy_snapshots(
 def bootstrap_legacy(
     connection: sqlite3.Connection,
     config: ChronicleConfig,
-    queue_mem0: bool = False,
 ) -> dict[str, dict[str, int]]:
-    ledger = import_legacy_ledger(connection, config, queue_mem0=queue_mem0)
+    ledger = import_legacy_ledger(connection, config)
     snapshots = import_legacy_snapshots(connection, config)
     return {"ledger": ledger, "snapshots": snapshots}

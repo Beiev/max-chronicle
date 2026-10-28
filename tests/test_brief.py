@@ -123,7 +123,7 @@ def test_warnings_cover_a_stale_capture_and_recent_job_failures_only(loaded_mani
             "INSERT INTO snapshots(id, captured_at_utc, captured_at_local, timezone, payload_json) VALUES ('s1', ?, ?, 'UTC', '{}')",
             ("2026-09-21T10:00:00Z", "2026-09-21T10:00:00Z"),
         )
-        for job, status, started in (("mem0-dump", "failed", "2026-09-24T05:00:00Z"),
+        for job, status, started in (("backup", "failed", "2026-09-24T05:00:00Z"),
                                      ("retired-job", "failed", "2026-06-04T05:00:00Z"),
                                      ("daybook", "ok", "2026-09-23T21:00:00Z")):
             connection.execute(
@@ -134,7 +134,7 @@ def test_warnings_cover_a_stale_capture_and_recent_job_failures_only(loaded_mani
     warnings = [line for line in _brief(loaded_manifest)["text"].splitlines() if line.startswith("- ") and "job" in line or "capture" in line]
 
     assert any("The last daily capture is 3d 2h old" in line for line in warnings)
-    assert any("mem0-dump: failed" in line for line in warnings)
+    assert any("backup: failed" in line for line in warnings)
     assert not any("retired-job" in line or "daybook" in line for line in warnings)
 
 

@@ -77,10 +77,10 @@ Arguments: `domain`, `limit`.
 
 ### `state_at`
 
-Timeline archaeology: reconstruct what was true around an ISO timestamp (nearest snapshots + events in a window). Use for 'what was happening on <date>'; for topic search use query_memory. mode='as_of' answers 'what did we know then': only snapshots taken by then, events of the window before it that had been recorded by then (without their Mem0 sync state), and the facts current then. Snapshots come back digested — their capture-time copies of the ledger and of semantic recall are replaced by a count, since live recall serves those better; pass detail="full" to get the stored payload verbatim (tens of KB per snapshot).
+Timeline archaeology: reconstruct what was true around an ISO timestamp (nearest snapshots + events in a window). Use for 'what was happening on <date>'; for topic search use query_memory. mode='as_of' answers 'what did we know then': only snapshots taken by then, events of the window before it that had been recorded by then, and the facts current then. Snapshots come back digested — their capture-time copies of the ledger and of source excerpts are replaced by a count, since live recall serves those better; pass detail="full" to get the stored payload verbatim (tens of KB per snapshot).
 
 Arguments: `timestamp` (required), `domain`, `window_hours`, `limit`, `detail`, `mode`.
 
 ## Other profiles
 
-`--profile admin` adds the maintenance tools: `activate_agent`, `capture_snapshot`, `entity_admin`, `query_context`, `search_mem0_live` (with the optional Mem0 mirror), `sources_audit`, and the legacy resources. `--profile readonly` (`chronicle-mcp-readonly`) drops `record_event`.
+`--profile admin` adds the maintenance tools: `activate_agent`, `capture_snapshot`, `entity_admin`, `query_context`, `sources_audit`, and the legacy resources. `--profile readonly` (`chronicle-mcp-readonly`) drops `record_event`.

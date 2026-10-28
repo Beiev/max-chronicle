@@ -108,21 +108,6 @@ def test_as_of_compares_to_the_millisecond(loaded_manifest) -> None:
     assert (before["target_utc"], _texts(before), before["facts"]) == ("2026-09-10T12:00:00.100Z", [], [])
     assert _texts(after) == ["Received just after"] and [f["value"] for f in after["facts"]] == ["production"]
 
-
-def test_as_of_leaves_out_the_mem0_sync_state(loaded_manifest) -> None:
-    from max_chronicle.store import update_event_mem0_state
-
-    stored = _record(loaded_manifest, "Synced the next day", "2026-09-10T11:00:00Z", "2026-09-10T11:00:00Z")
-    update_event_mem0_state(config_from_manifest(loaded_manifest), event_id=stored["id"], mem0_status="stored",
-                            mem0_raw="response of the next day", mem0_synced_at="2026-09-11T15:00:00Z")
-
-    [then] = service.reconstruct_timeline(loaded_manifest, timestamp=T, as_of=True)["events"]
-    [around] = service.reconstruct_timeline(loaded_manifest, timestamp=T)["events"]
-
-    assert not {"mem0_status", "mem0_raw", "mem0_synced_at", "mem0_error"} & set(then)
-    assert around["mem0_raw"] == "response of the next day"
-
-
 def test_as_of_knows_a_legacy_import_from_the_import_on(loaded_manifest, monkeypatch) -> None:
     from max_chronicle import bootstrap
 

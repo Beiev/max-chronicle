@@ -14,14 +14,11 @@ import pytest
 
 from mcp.server.mcpserver.exceptions import ToolError
 from max_chronicle.mcp_server import _gate_session, build_server
-from max_chronicle.runtime_context import load_manifest, search_mem0_dump
+from max_chronicle.runtime_context import load_manifest
 from max_chronicle.service import (
-    backfill_mem0_queue,
     build_activation,
     build_sources_audit,
     build_startup_bundle,
-    default_mem0_status,
-    guard_event,
     materialize_normalized_entities,
     query_context,
     record_event,
@@ -144,9 +141,6 @@ def test_query_context_annotates_sources_and_returns_chronicle_hits(loaded_manif
             "text": "Chronicle test attach contract query regression.",
             "why": "Need a canonical event hit for query contract coverage.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="pytest",
@@ -178,9 +172,6 @@ def test_chronicle_cli_activate_startup_and_query_use_native_service(chronicle_s
             "text": "Chronicle CLI native contract test.",
             "why": "Need direct CLI coverage for activate/startup/query.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="pytest",
@@ -234,9 +225,6 @@ def test_chronicle_cli_query_handles_domain_like_tokens(chronicle_sandbox, loade
             "text": "Portfolio shipped to production on example.com.",
             "why": "FTS query should not crash on domain-like tokens with dots.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="pytest",
@@ -343,7 +331,7 @@ def test_mcp_tool_input_schemas_include_param_descriptions_and_query_mode_enum(c
 
     query_props = admin_schemas["query_context"]["properties"]
     assert query_props["query"]["description"] == (
-        "Search string matched across Chronicle events, status markdown sections and the Mem0 dump."
+        "Search string matched across Chronicle events and status markdown sections."
     )
     assert query_props["mode"]["description"].startswith("truth_only: Chronicle events and status sources only.")
     assert query_props["mode"]["enum"] == [
@@ -394,12 +382,9 @@ def test_mcp_chronicler_record_event_needs_no_startup(chronicle_sandbox, loaded_
     with open_connection(config) as connection:
         event_count = connection.execute(
             "SELECT COUNT(*) FROM events WHERE text = ?", ("MCP write before any startup.",)).fetchone()[0]
-        outbox_count = connection.execute("SELECT COUNT(*) FROM mem0_outbox WHERE event_id = ?",
-                                          (stored["id"],)).fetchone()[0]
         snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
 
     assert event_count == 1
-    assert outbox_count == 1
     assert snapshot_count == 0
 
 
@@ -619,9 +604,6 @@ def test_query_context_truth_only_filters_derived_layers(loaded_manifest) -> Non
             "text": "Decision substrate query mode test.",
             "why": "Need truth_only filtering coverage.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="pytest",
@@ -636,7 +618,6 @@ def test_query_context_truth_only_filters_derived_layers(loaded_manifest) -> Non
     )
 
     assert payload["query_mode"] == "truth_only"
-    assert payload["mem0_dump_hits"] == []
     assert payload["normalized_entity_hits"] == []
     assert payload["interpretation_hits"] == []
     assert payload["scenario_hits"] == []
@@ -726,47 +707,12 @@ def test_query_context_memory_domain_uses_only_canonical_memory_sources(loaded_m
     assert "ecosystem" not in source_ids
 
 
-def test_search_mem0_dump_dedupes_unified_collection_duplicates(tmp_path) -> None:
-    dump_path = tmp_path / "mem0-dump.json"
-    dump_path.write_text(
-        json.dumps(
-            {
-                "snapshot_type": "unified",
-                "memories": [
-                    {
-                        "id": "personal-1",
-                        "memory": "Portfolio V1 shipped to production on example.com",
-                        "metadata": {"project": "portfolio", "category": "milestone"},
-                        "source_collection": "personal",
-                        "source_collection_name": "chronicle_personal",
-                    },
-                    {
-                        "id": "digest-1",
-                        "memory": "Portfolio V1 shipped to production on example.com",
-                        "metadata": {"project": "portfolio", "category": "milestone"},
-                        "source_collection": "digest",
-                        "source_collection_name": "chronicle_digest",
-                    },
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    hits = search_mem0_dump(dump_path, "portfolio shipped production", limit=5)
-    assert len(hits) == 1
-    assert hits[0]["duplicate_count"] == 2
-    assert set(hits[0]["source_collections"]) == {"personal", "digest"}
-    assert set(hits[0]["source_collection_names"]) == {"chronicle_personal", "chronicle_digest"}
-
-
 def test_freshness_audit_surfaces_stale_inputs_and_prompt_warnings(chronicle_sandbox, loaded_manifest) -> None:
     status_path = Path(loaded_manifest["source_map"]["status"]["path"])
-    mem0_dump_path = Path(loaded_manifest["paths"]["mem0_dump"])
+    priorities_path = Path(loaded_manifest["source_map"]["priorities"]["path"])
     status_path.unlink()
     stale_ts = datetime(2026, 3, 1, 12, 0, 0).timestamp()
-    os.utime(mem0_dump_path, (stale_ts, stale_ts))
+    os.utime(priorities_path, (stale_ts, stale_ts))
 
     activation = build_activation(
         loaded_manifest,
@@ -781,7 +727,7 @@ def test_freshness_audit_surfaces_stale_inputs_and_prompt_warnings(chronicle_san
     issue_kinds = {item["kind"] for item in audit["issues"]}
     assert audit["status"] == "critical"
     assert "attach_source_missing" in issue_kinds
-    assert "mem0_dump_stale" in issue_kinds
+    assert "attach_source_stale" in issue_kinds
     assert "Freshness warnings:" in activation["prompt"]
     assert "Attach source `Status` is missing." in activation["prompt"]
 
@@ -819,9 +765,6 @@ def test_record_event_falls_back_on_unknown_category(loaded_manifest) -> None:
             "text": "Unknown category falls back to note",
             "why": "Soft validation stores the event instead of bouncing the write.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
         },
     )
     assert stored["chronicle_status"] == "stored"
@@ -841,9 +784,6 @@ def test_record_event_accepts_insight_and_constraint(loaded_manifest) -> None:
                 "text": f"Category {category} is a first-class lane now",
                 "why": "Agents used these names in the wild; they used to bounce.",
                 "source_files": [],
-                "mem0_status": "off",
-                "mem0_error": None,
-                "mem0_raw": None,
             },
         )
         assert stored["chronicle_status"] == "stored"
@@ -863,61 +803,8 @@ def test_record_event_still_rejects_malformed_category(loaded_manifest) -> None:
                 "text": "Regex-invalid category must still bounce",
                 "why": "Soft fallback only covers well-formed names.",
                 "source_files": [],
-                "mem0_status": "off",
-                "mem0_error": None,
-                "mem0_raw": None,
             },
         )
-
-
-@pytest.mark.parametrize(
-    ("category", "expected_event_mem0_status", "expected_outbox_status"),
-    [
-        ("decision", "queued", "pending"),
-        ("git_commit", "skipped", "skipped"),
-    ],
-)
-def test_chronicle_mcp_record_event_uses_mem0_policy(
-    chronicle_sandbox,
-    loaded_manifest,
-    category,
-    expected_event_mem0_status,
-    expected_outbox_status,
-) -> None:
-    stored = record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "global",
-            "category": category,
-            "project": "status",
-            "text": f"MCP policy test for {category}",
-            "why": "Need deterministic default Mem0 policy coverage.",
-            "source_files": [],
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-        append_compat=True,
-        source_kind="chronicle_mcp",
-        imported_from="tests.test_agent_contract.mcp_policy",
-    )
-
-    assert stored["mem0_status"] == expected_event_mem0_status
-
-    config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
-    with open_connection(config) as connection:
-        outbox_row = connection.execute(
-            "SELECT status FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
-    assert outbox_row["status"] == expected_outbox_status
-
-
-def test_default_mem0_status_prefers_explicit_override_and_mcp_noise_filter() -> None:
-    assert default_mem0_status({"category": "decision"}, source_kind="chronicle_mcp") == "queued"
-    assert default_mem0_status({"category": "git_commit"}, source_kind="chronicle_mcp") == "off"
-    assert default_mem0_status({"category": "decision", "mem0_status": "off"}, source_kind="chronicle_mcp") == "off"
-    assert default_mem0_status({"category": "decision"}, source_kind="chronicle_cli") is None
 
 
 def test_chronicle_mcp_record_event_local_only_guard_hides_noise_from_attach_and_query(chronicle_sandbox, loaded_manifest) -> None:
@@ -931,8 +818,6 @@ def test_chronicle_mcp_record_event_local_only_guard_hides_noise_from_attach_and
             "text": "## Protocol Update\nOld flow: max-chronicle activate.\nNew flow: chronicle-mcp-chronicler only.\nDO NOT use the old shell path.",
             "why": None,
             "source_files": [],
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="chronicle_mcp",
@@ -946,17 +831,6 @@ def test_chronicle_mcp_record_event_local_only_guard_hides_noise_from_attach_and
         "negative_mirror_instruction",
         "markdown_prompt_chatter",
     }
-    assert stored["mem0_status"] == "skipped"
-
-    config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
-    with open_connection(config) as connection:
-        outbox_row = connection.execute(
-            "SELECT status, payload_json FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
-    outbox_payload = json.loads(outbox_row["payload_json"])
-    assert outbox_row["status"] == "skipped"
-    assert outbox_payload["memory_guard"]["verdict"] == "local_only"
 
     recent = _chronicle_cli(chronicle_sandbox.manifest_path, "recent", "--format", "json")
     recent_payload = json.loads(recent.stdout)
@@ -1001,8 +875,6 @@ def test_chronicle_mcp_record_event_keeps_high_signal_decision_durable(chronicle
             "text": "Adopt a soft Chronicle memory guardrail for noisy MCP protocol chatter.",
             "why": "Preserve append-only truth while keeping low-signal protocol chatter out of derived recall.",
             "source_files": [str(evidence_path)],
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="chronicle_mcp",
@@ -1011,15 +883,6 @@ def test_chronicle_mcp_record_event_keeps_high_signal_decision_durable(chronicle
 
     assert stored["memory_guard"]["verdict"] == "durable"
     assert stored["memory_guard"]["visibility"] == "default"
-    assert stored["mem0_status"] == "queued"
-
-    config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
-    with open_connection(config) as connection:
-        outbox_row = connection.execute(
-            "SELECT status FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
-    assert outbox_row["status"] == "pending"
 
 
 def test_recent_near_duplicate_signal_does_not_force_local_only_without_other_risks(loaded_manifest) -> None:
@@ -1033,8 +896,6 @@ def test_recent_near_duplicate_signal_does_not_force_local_only_without_other_ri
             "text": "Keep recruiter intro concise and concrete.",
             "why": None,
             "source_files": [],
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="chronicle_mcp",
@@ -1051,8 +912,6 @@ def test_recent_near_duplicate_signal_does_not_force_local_only_without_other_ri
             "text": "Keep recruiter intro concise concrete and focused.",
             "why": None,
             "source_files": [],
-            "mem0_error": None,
-            "mem0_raw": None,
         },
         append_compat=True,
         source_kind="chronicle_mcp",
@@ -1075,8 +934,6 @@ def test_chronicle_cli_record_uses_governance_and_dedupe(chronicle_sandbox) -> N
         "status",
         "--why",
         "CLI should not create exact duplicates.",
-        "--mem0-status",
-        "off",
     )
     second = _chronicle_cli(
         chronicle_sandbox.manifest_path,
@@ -1088,8 +945,6 @@ def test_chronicle_cli_record_uses_governance_and_dedupe(chronicle_sandbox) -> N
         "status",
         "--why",
         "CLI should not create exact duplicates.",
-        "--mem0-status",
-        "off",
     )
 
     first_payload = json.loads(first.stdout)
@@ -1153,19 +1008,13 @@ def test_chronicle_cli_guard_event_marks_existing_event_local_only(chronicle_san
     config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
     with open_connection(config) as connection:
         event_row = connection.execute(
-            "SELECT mem0_status, payload_json FROM events WHERE id = ?",
-            (event_id,),
-        ).fetchone()
-        outbox_row = connection.execute(
-            "SELECT status, payload_json FROM mem0_outbox WHERE event_id = ?",
+            "SELECT visibility, payload_json FROM events WHERE id = ?",
             (event_id,),
         ).fetchone()
     event_payload = json.loads(event_row["payload_json"])
-    outbox_payload = json.loads(outbox_row["payload_json"])
-    assert event_row["mem0_status"] == "skipped"
-    assert outbox_row["status"] == "skipped"
+    assert event_row["visibility"] == "raw_only"
     assert event_payload["memory_guard"]["verdict"] == "local_only"
-    assert outbox_payload["memory_guard"]["source"] == "manual_operator_guard"
+    assert event_payload["memory_guard"]["source"] == "manual_operator_guard"
 
 
 def test_render_projections_marks_generated_status_as_canonical(chronicle_sandbox, loaded_manifest) -> None:
@@ -1200,9 +1049,6 @@ def test_chronicle_cli_repair_categories_normalizes_legacy_null_category(chronic
             "text": "Legacy null category repair target",
             "why": "Need a deterministic repair command regression test.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
         },
     )
 
@@ -1212,21 +1058,11 @@ def test_chronicle_cli_repair_categories_normalizes_legacy_null_category(chronic
             "SELECT payload_json FROM events WHERE id = ?",
             (stored["id"],),
         ).fetchone()
-        outbox_row = connection.execute(
-            "SELECT payload_json FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
         event_payload = json.loads(event_row["payload_json"])
-        outbox_payload = json.loads(outbox_row["payload_json"])
         event_payload.pop("category", None)
-        outbox_payload.pop("category", None)
         connection.execute(
             "UPDATE events SET category = '', payload_json = ? WHERE id = ?",
             (json.dumps(event_payload, ensure_ascii=False, sort_keys=True), stored["id"]),
-        )
-        connection.execute(
-            "UPDATE mem0_outbox SET payload_json = ? WHERE event_id = ?",
-            (json.dumps(outbox_payload, ensure_ascii=False, sort_keys=True), stored["id"]),
         )
 
     dry_run = _chronicle_cli(chronicle_sandbox.manifest_path, "repair-categories", "--dry-run")
@@ -1243,179 +1079,9 @@ def test_chronicle_cli_repair_categories_normalizes_legacy_null_category(chronic
             "SELECT category, payload_json FROM events WHERE id = ?",
             (stored["id"],),
         ).fetchone()
-        repaired_outbox = connection.execute(
-            "SELECT payload_json FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
     repaired_payload = json.loads(repaired_row["payload_json"])
-    repaired_outbox_payload = json.loads(repaired_outbox["payload_json"])
     assert repaired_row["category"] == "note"
     assert repaired_payload["category"] == "note"
-    assert repaired_outbox_payload["category"] == "note"
-
-
-def test_chronicle_cli_repair_mem0_state_reconciles_events_from_outbox(chronicle_sandbox, loaded_manifest) -> None:
-    stored = record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "global",
-            "category": "note",
-            "project": "status",
-            "text": "Mem0 drift repair target",
-            "why": "Need deterministic mem0 reconciliation coverage.",
-            "source_files": [],
-            "mem0_status": "queued",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-    )
-
-    config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
-    with open_connection(config) as connection, connection:
-        event_row = connection.execute(
-            "SELECT payload_json FROM events WHERE id = ?",
-            (stored["id"],),
-        ).fetchone()
-        outbox_row = connection.execute(
-            "SELECT payload_json FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
-        event_payload = json.loads(event_row["payload_json"])
-        outbox_payload = json.loads(outbox_row["payload_json"])
-        event_payload["mem0_status"] = "queued"
-        event_payload["mem0_error"] = "stale"
-        outbox_payload["mem0_raw"] = "stored raw"
-        outbox_payload["mem0_synced_at"] = "2026-03-16T10:00:00Z"
-        connection.execute(
-            "UPDATE events SET mem0_status = 'queued', mem0_error = 'stale', payload_json = ? WHERE id = ?",
-            (json.dumps(event_payload, ensure_ascii=False, sort_keys=True), stored["id"]),
-        )
-        connection.execute(
-            "UPDATE mem0_outbox SET status = 'synced', last_error = NULL, synced_at_utc = '2026-03-16T10:00:00Z', payload_json = ? WHERE event_id = ?",
-            (json.dumps(outbox_payload, ensure_ascii=False, sort_keys=True), stored["id"]),
-        )
-
-    dry_run = _chronicle_cli(chronicle_sandbox.manifest_path, "repair-mem0-state", "--dry-run")
-    apply_run = _chronicle_cli(chronicle_sandbox.manifest_path, "repair-mem0-state", "--apply")
-    dry_payload = json.loads(dry_run.stdout)
-    apply_payload = json.loads(apply_run.stdout)
-    assert dry_payload["status"] == "dry_run"
-    assert dry_payload["repaired_count"] == 1
-    assert apply_payload["status"] == "ok"
-    assert apply_payload["repaired_count"] == 1
-
-    with open_connection(config) as connection:
-        repaired_row = connection.execute(
-            "SELECT mem0_status, mem0_error, payload_json FROM events WHERE id = ?",
-            (stored["id"],),
-        ).fetchone()
-    repaired_payload = json.loads(repaired_row["payload_json"])
-    assert repaired_row["mem0_status"] == "stored"
-    assert repaired_row["mem0_error"] is None
-    assert repaired_payload["mem0_status"] == "stored"
-    assert repaired_payload["mem0_raw"] == "stored raw"
-    assert repaired_payload["mem0_synced_at"] == "2026-03-16T10:00:00Z"
-
-
-def test_backfill_mem0_queue_requeues_eligible_mcp_events(chronicle_sandbox, loaded_manifest) -> None:
-    stored = record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "career",
-            "category": "milestone",
-            "project": "demo-portfolio",
-            "text": "Legacy MCP milestone that should have reached Mem0.",
-            "why": "Simulate historical hardcoded mem0_status=off rows before policy fix.",
-            "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-        source_kind="chronicle_mcp",
-        imported_from="tests.test_agent_contract.backfill_mem0",
-    )
-
-    dry_run = backfill_mem0_queue(loaded_manifest, dry_run=True)
-    apply_run = _chronicle_cli(chronicle_sandbox.manifest_path, "backfill-mem0-queue", "--apply")
-    apply_payload = json.loads(apply_run.stdout)
-    assert dry_run["status"] == "dry_run"
-    assert dry_run["requeued_count"] == 1
-    assert apply_payload["status"] == "ok"
-    assert apply_payload["requeued_count"] == 1
-
-    config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
-    with open_connection(config) as connection:
-        event_row = connection.execute(
-            "SELECT mem0_status, payload_json FROM events WHERE id = ?",
-            (stored["id"],),
-        ).fetchone()
-        outbox_row = connection.execute(
-            "SELECT status, attempts, last_error, synced_at_utc FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
-    event_payload = json.loads(event_row["payload_json"])
-    assert event_row["mem0_status"] == "queued"
-    assert event_payload["mem0_status"] == "queued"
-    assert outbox_row["status"] == "pending"
-    assert outbox_row["attempts"] == 0
-    assert outbox_row["last_error"] is None
-    assert outbox_row["synced_at_utc"] is None
-
-
-def test_backfill_mem0_queue_skips_local_only_guarded_events(chronicle_sandbox, loaded_manifest) -> None:
-    stored = record_event(
-        loaded_manifest,
-        {
-            "agent": "pytest",
-            "domain": "global",
-            "category": "state_change",
-            "project": "status",
-            "text": "Noisy MCP protocol chatter",
-            "why": "Create a skipped MCP event that should stay local_only and never be requeued.",
-            "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
-        },
-        source_kind="chronicle_mcp",
-        imported_from="tests.test_agent_contract.backfill_mem0.local_only",
-    )
-
-    guard_payload = guard_event(
-        loaded_manifest,
-        event_id=stored["id"],
-        verdict="local_only",
-        reason="Operator review: noisy protocol chatter.",
-        apply=True,
-    )
-    assert guard_payload["status"] == "ok"
-
-    dry_run = backfill_mem0_queue(loaded_manifest, dry_run=True)
-    apply_run = _chronicle_cli(chronicle_sandbox.manifest_path, "backfill-mem0-queue", "--apply")
-    apply_payload = json.loads(apply_run.stdout)
-    assert dry_run["status"] == "dry_run"
-    assert dry_run["requeued_count"] == 0
-    assert apply_payload["status"] == "ok"
-    assert apply_payload["requeued_count"] == 0
-
-    config = config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))
-    with open_connection(config) as connection:
-        event_row = connection.execute(
-            "SELECT mem0_status, payload_json FROM events WHERE id = ?",
-            (stored["id"],),
-        ).fetchone()
-        outbox_row = connection.execute(
-            "SELECT status, payload_json FROM mem0_outbox WHERE event_id = ?",
-            (stored["id"],),
-        ).fetchone()
-    event_payload = json.loads(event_row["payload_json"])
-    outbox_payload = json.loads(outbox_row["payload_json"])
-    assert event_row["mem0_status"] == "skipped"
-    assert outbox_row["status"] == "skipped"
-    assert event_payload["memory_guard"]["verdict"] == "local_only"
-    assert outbox_payload["memory_guard"]["verdict"] == "local_only"
 
 
 def test_reconstruct_timeline_filters_by_domain(loaded_manifest) -> None:
@@ -1429,9 +1095,6 @@ def test_reconstruct_timeline_filters_by_domain(loaded_manifest) -> None:
             "text": "Global timeline event",
             "why": "Need domain-specific timeline coverage.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
             "recorded_at": "2026-03-15T12:00:00Z",
         },
         append_compat=True,
@@ -1448,9 +1111,6 @@ def test_reconstruct_timeline_filters_by_domain(loaded_manifest) -> None:
             "text": "Memory timeline event",
             "why": "Need domain-specific timeline coverage.",
             "source_files": [],
-            "mem0_status": "off",
-            "mem0_error": None,
-            "mem0_raw": None,
             "recorded_at": "2026-03-15T12:00:00Z",
         },
         append_compat=True,
@@ -1661,7 +1321,7 @@ def test_mcp_activate_agent_does_not_return_the_full_document_bundle(
     assert payload["prompt"]
     assert payload["deprecated"]["superseded_by"] == "startup_bundle"
     assert "freshness_audit" in payload
-    for bulk_key in ("recent_ledger", "mem0_snapshot_hits", "source_excerpts"):
+    for bulk_key in ("recent_ledger", "source_excerpts"):
         assert bulk_key not in payload["snapshot"]
 
 
@@ -1722,7 +1382,7 @@ def test_mcp_capture_snapshot_returns_a_receipt_not_the_whole_snapshot(
     assert payload["chronicle_status"] == "stored"
     assert payload["id"]
     assert payload["projection_runs"]
-    for bulk_key in ("recent_ledger", "mem0_snapshot_hits", "source_excerpts"):
+    for bulk_key in ("recent_ledger", "source_excerpts"):
         assert bulk_key not in payload
     assert set(payload["normalized_entities"]) == {"count", "ids"}
 
@@ -1740,67 +1400,27 @@ def test_tools_say_what_a_call_may_change_and_bound_their_numbers(chronicle_sand
     assert hints["record_event"] == (False, False, False)
     assert hints["startup_bundle"] == (False, False, False)  # capture=true writes a snapshot
     assert hints["entity_admin"] == (False, True, False)
-    assert hints.get("search_mem0_live", (True, None, True)) == (True, None, True)
     recall_query = tools["query_memory"].input_schema["properties"]["query"]["description"]
     assert "Mem0" not in recall_query and "status" not in recall_query
     window = tools["state_at"].input_schema["properties"]["window_hours"]
     assert (window["minimum"], window["maximum"]) == (1, 720)
 
 
-def _mem0_key() -> str:
+def _secret_key() -> str:
     import secrets
 
     return "sk-" + "proj-" + secrets.token_urlsafe(36)
 
 
-def test_query_context_filters_the_mem0_dump_and_status_files(chronicle_sandbox, loaded_manifest) -> None:
-    key, other = _mem0_key(), _mem0_key()
-    (chronicle_sandbox.status_root / "mem0-dump.json").write_text(json.dumps({"memories": [
-        {"id": "m-1", "memory": f"Marmoset gateway credentials: {key}", "metadata": {}}]}), encoding="utf-8")
+def test_query_context_filters_the_status_files(chronicle_sandbox, loaded_manifest) -> None:
+    key = _secret_key()
     status = chronicle_sandbox.status_root / "status.md"
-    status.write_text(status.read_text(encoding="utf-8") + f"\n## Marmoset gateway\nThe marmoset key is {other}\n",
+    status.write_text(status.read_text(encoding="utf-8") + f"\n## Marmoset gateway\nThe marmoset key is {key}\n",
                       encoding="utf-8")
 
     payload = query_context(loaded_manifest, query="marmoset gateway", domain="global", limit=5,
                             mode="truth_plus_interpretation")
 
     text = json.dumps(payload)
-    assert payload["mem0_dump_hits"] and payload["status_hits"]
-    assert key not in text and other not in text and "[REDACTED:" in text
-
-
-def test_live_mem0_results_pass_the_secret_filter(loaded_manifest, monkeypatch) -> None:
-    import max_chronicle.service as service_module
-
-    key = _mem0_key()
-
-    class _Bridge:
-        returncode, stderr = 0, ""
-        stdout = json.dumps({"results": [{"id": "m-1", "memory": f"API key {key}", "metadata": {}}], "count": 1})
-
-    monkeypatch.setattr(service_module.subprocess, "run", lambda *args, **kwargs: _Bridge())
-    monkeypatch.setenv("CHRONICLE_FEATURE_SEARCH_MEM0_LIVE", "1")
-
-    out = service_module.search_mem0_live_service(loaded_manifest, query="api key", timeout_s=5)
-
-    assert key not in json.dumps(out) and out["redactions"]
-
-
-def test_mem0_metadata_keeps_a_secret_name_through_lists_and_encoded_json(loaded_manifest, monkeypatch) -> None:
-    import max_chronicle.service as service_module
-
-    password = "Pw-" + _mem0_key()[3:19]
-    metadata = {"password": [password],
-                "twice_encoded": json.dumps({"nested": json.dumps({"password": password})})}
-
-    class _Bridge:
-        returncode, stderr = 0, ""
-        stdout = json.dumps({"results": [{"id": "m-1", "memory": "deployment", "metadata": metadata}], "count": 1})
-
-    monkeypatch.setattr(service_module.subprocess, "run", lambda *args, **kwargs: _Bridge())
-    monkeypatch.setenv("CHRONICLE_FEATURE_SEARCH_MEM0_LIVE", "1")
-
-    out = service_module.search_mem0_live_service(loaded_manifest, query="deployment", timeout_s=5)
-
-    assert password not in json.dumps(out)
-    assert out["results"][0]["metadata"]["password"] == ["[REDACTED:assigned_secret]"]
+    assert payload["status_hits"]
+    assert key not in text and "[REDACTED:" in text

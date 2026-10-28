@@ -16,7 +16,6 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .config import (
-    DEFAULT_MEM0_COLLECTION,
     ENV_CHRONICLE_AUTO_MIGRATE,
     ChronicleConfig,
     default_config,
@@ -75,7 +74,6 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
     config = default_config(db_path, status_root=status_root)
     settings = manifest.get("settings", {})
     timezone_name = settings.get("timezone") or config.timezone
-    mem0_collection = str(settings.get("mem0_collection") or config.mem0_collection)
     operator_label = str(settings.get("operator") or config.operator_label)
     artifact_dir = paths.get("chronicle_artifact_dir")
     configured_extensions = artifact_settings.get("allowed_extensions") or config.artifact_allowed_extensions
@@ -101,7 +99,6 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
         or artifact_settings.get("pointer_only_enabled") is not None
         or artifact_settings.get("pointer_only_disallowed") is not None
         or artifact_settings.get("follow_symlinks") is not None
-        or mem0_collection != config.mem0_collection
         or operator_label != config.operator_label
     ):
         config = replace(
@@ -119,7 +116,6 @@ def config_from_manifest(manifest: dict[str, Any]) -> ChronicleConfig:
             artifact_follow_symlinks=bool(
                 artifact_settings.get("follow_symlinks", config.artifact_follow_symlinks)
             ),
-            mem0_collection=mem0_collection,
             operator_label=operator_label,
         )
     return replace(config, identities=Registry.from_manifest(manifest))
@@ -701,16 +697,8 @@ def fetch_event(
                 e.project,
                 e.task_id,
                 e.visibility,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at
+                e.payload_json
             FROM events AS e
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
             WHERE e.id = ?
             LIMIT 1
     """
@@ -766,34 +754,6 @@ def snapshot_summary(snapshot: dict[str, Any]) -> str:
     return " | ".join(lines)
 
 
-def _outbox_status(mem0_status: str | None) -> str:
-    if mem0_status in {"stored", "synced"}:
-        return "synced"
-    if mem0_status == "failed":
-        return "failed"
-    if mem0_status in {"off", "skipped"}:
-        return "skipped"
-    return "pending"
-
-
-def _attempt_count(mem0_status: str | None) -> int:
-    if mem0_status in {"stored", "failed"}:
-        return 1
-    return 0
-
-
-def _event_mem0_status(mem0_status: str | None) -> str | None:
-    if mem0_status in {"stored", "synced"}:
-        return "stored"
-    if mem0_status == "pending":
-        return "queued"
-    if mem0_status in {"failed", "queued"}:
-        return mem0_status
-    if mem0_status in {"off", "skipped"}:
-        return "skipped"
-    return mem0_status
-
-
 def _normalize_event_visibility(visibility: str | None) -> str:
     normalized = str(visibility or "default").strip().casefold()
     if normalized not in {"default", "raw"}:
@@ -813,8 +773,15 @@ def guard_visibility(memory_guard: Any) -> str:
     return "raw_only" if visibility == "raw_only" else "default"
 
 
+# Event keys of the Mem0 mirror, removed in 0.26 (migration 0018). An old client
+# may still send them; no event keeps them.
+RETIRED_EVENT_KEYS = frozenset({"mem0_status", "mem0_error", "mem0_raw", "mem0_synced_at"})
+# And of a snapshot (migrations 0017 and 0018): a legacy import may still carry them.
+RETIRED_SNAPSHOT_KEYS = frozenset({"mem0_dump", "mem0_snapshot_hits"})
+
+
 def _event_payload(entry: dict[str, Any]) -> dict[str, Any]:
-    payload = dict(entry)
+    payload = {key: value for key, value in entry.items() if key not in RETIRED_EVENT_KEYS}
     payload.setdefault("recorded_at", utc_now())
     return payload
 
@@ -987,66 +954,6 @@ def _store_artifact_record(
     ).fetchone()
 
 
-def _upsert_mem0_outbox(
-    connection: sqlite3.Connection,
-    event_id: str,
-    payload: dict[str, Any],
-    created_at_utc: str,
-    mem0_status: str | None,
-    mem0_error: str | None,
-    *,
-    attempts: int | None = None,
-    last_attempt_at_utc: str | None = None,
-    synced_at_utc: str | None = None,
-    collection_name: str = DEFAULT_MEM0_COLLECTION,
-) -> None:
-    sync_status = _outbox_status(mem0_status)
-    if attempts is None:
-        attempts = _attempt_count(mem0_status)
-    if last_attempt_at_utc is None and attempts:
-        last_attempt_at_utc = created_at_utc
-    if synced_at_utc is None and sync_status == "synced":
-        synced_at_utc = created_at_utc
-
-    connection.execute(
-        """
-        INSERT INTO mem0_outbox(
-            id,
-            event_id,
-            collection_name,
-            operation,
-            status,
-            attempts,
-            last_attempt_at_utc,
-            last_error,
-            payload_json,
-            created_at_utc,
-            synced_at_utc
-        )
-        VALUES (?, ?, ?, 'add', ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(event_id, operation) DO UPDATE SET
-            status = excluded.status,
-            attempts = excluded.attempts,
-            last_attempt_at_utc = excluded.last_attempt_at_utc,
-            last_error = excluded.last_error,
-            payload_json = excluded.payload_json,
-            synced_at_utc = excluded.synced_at_utc
-        """,
-        (
-            str(uuid.uuid4()),
-            event_id,
-            collection_name,
-            sync_status,
-            attempts,
-            last_attempt_at_utc,
-            mem0_error,
-            _json(payload),
-            created_at_utc,
-            synced_at_utc,
-        ),
-    )
-
-
 def _event_scope(config: ChronicleConfig, alias: str = "e", **names: str | None) -> tuple[str, tuple[str, ...]]:
     """SQL keeping events in a scope, whichever spelling each name was written in (FR-14)."""
     return config.identities.scope(**names).where(
@@ -1060,13 +967,10 @@ def store_event(
     source_kind: str = "agent_command",
     imported_from: str = "chronicle.record",
     connection: sqlite3.Connection | None = None,
-    mem0: bool = True,
 ) -> dict[str, Any]:
-    """Store one event; *mem0* False (an installation without Mem0) writes no mem0_outbox row."""
     payload = _event_payload(entry)
     event_id = payload.get("id") or str(uuid.uuid4())
     recorded_at_utc = payload.get("recorded_at") or utc_now()
-    payload["mem0_status"] = _event_mem0_status(payload.get("mem0_status"))
     payload["id"] = event_id
     payload["recorded_at"] = recorded_at_utc
 
@@ -1104,11 +1008,9 @@ def store_event(
                 source_hash,
                 payload_json,
                 written_by,
-                mem0_status,
-                mem0_error,
                 content_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -1132,30 +1034,9 @@ def store_event(
                 None,
                 _json(payload),
                 imported_from,
-                payload.get("mem0_status"),
-                payload.get("mem0_error"),
                 payload.get("content_hash"),
             ),
         )
-
-        outbox_payload = {
-            "text": payload.get("text") or "",
-            "why": payload.get("why"),
-            "category": payload.get("category"),
-            "project": payload.get("project"),
-        }
-        if payload.get("memory_guard") is not None:
-            outbox_payload["memory_guard"] = payload["memory_guard"]
-        if mem0:
-            _upsert_mem0_outbox(
-                active_connection,
-                event_id,
-                outbox_payload,
-                recorded_at_utc,
-                payload.get("mem0_status"),
-                payload.get("mem0_error"),
-                collection_name=config.mem0_collection,
-            )
 
     if connection is not None:
         _store(connection)
@@ -1231,7 +1112,9 @@ def snapshot_payload_to_store(connection: sqlite3.Connection, payload: dict[str,
     A reader takes each event as it is now (_snapshot_row_to_entry), so an
     event quarantined after the capture stays out. Only an entry with the id of
     an event in this database becomes that id; anything else is kept as it is.
+    What the Mem0 mirror added to a capture (RETIRED_SNAPSHOT_KEYS) is left out.
     """
+    payload = {key: value for key, value in payload.items() if key not in RETIRED_SNAPSHOT_KEYS}
     ledger = payload.get("recent_ledger")
     if not isinstance(ledger, list):
         return payload
@@ -1255,25 +1138,6 @@ def _ledger_id(entry: dict[str, Any]) -> str | None:
 
 def _event_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
     payload = _load_json(row["payload_json"])
-    outbox_payload = _load_json(row["outbox_payload_json"]) if "outbox_payload_json" in row.keys() else {}
-    outbox_status = row["outbox_status"] if "outbox_status" in row.keys() else None
-    if outbox_status == "synced":
-        mem0_status = "stored"
-    elif outbox_status:
-        mem0_status = outbox_status
-    else:
-        mem0_status = row["mem0_status"]
-
-    if "outbox_status" in row.keys() and row["outbox_status"] is not None:
-        mem0_error = row["outbox_last_error"] if row["outbox_last_error"] is not None else outbox_payload.get("mem0_error")
-    else:
-        mem0_error = row["mem0_error"]
-    mem0_synced_at = (
-        row["outbox_synced_at"]
-        if "outbox_synced_at" in row.keys() and row["outbox_synced_at"] is not None
-        else outbox_payload.get("mem0_synced_at", payload.get("mem0_synced_at"))
-    )
-
     return {
         "id": row["id"],
         "task_id": row["task_id"],
@@ -1289,12 +1153,8 @@ def _event_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
         "text": row["text"],
         "why": row["why"],
         "source_files": payload.get("source_files") or [],
-        "mem0_status": mem0_status,
-        "mem0_error": mem0_error,
-        "mem0_raw": outbox_payload.get("mem0_raw", payload.get("mem0_raw")),
-        "mem0_synced_at": mem0_synced_at,
         "entity_id": row["entity_id"],
-        "memory_guard": payload.get("memory_guard", outbox_payload.get("memory_guard")),
+        "memory_guard": payload.get("memory_guard"),
         "visibility": row["visibility"],
     }
 
@@ -1302,11 +1162,8 @@ def _event_row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
 # One event row as _event_row_to_entry reads it; the caller adds WHERE.
 _EVENT_ROW_SQL = """
     SELECT e.id, e.occurred_at_utc, e.actor, e.category, e.entity_id, e.text, e.why,
-           e.domain, e.project, e.task_id, e.visibility, e.mem0_status, e.mem0_error, e.payload_json,
-           o.status AS outbox_status, o.last_error AS outbox_last_error,
-           o.payload_json AS outbox_payload_json, o.synced_at_utc AS outbox_synced_at
+           e.domain, e.project, e.task_id, e.visibility, e.payload_json
     FROM events AS e
-    LEFT JOIN mem0_outbox AS o ON o.event_id = e.id AND o.operation = 'add'
 """
 
 
@@ -1380,16 +1237,8 @@ def fetch_recent_events(
                 e.project,
                 e.task_id,
                 e.visibility,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at
+                e.payload_json
             FROM events AS e
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND """ + scope_sql + """
             ORDER BY e.occurred_at_utc DESC
@@ -1452,16 +1301,8 @@ def fetch_project_events(
                 e.project,
                 e.task_id,
                 e.visibility,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at
+                e.payload_json
             FROM events AS e
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND (e.entity_id IN (""" + ", ".join("?" for _ in entity_ids) + """) OR """ + project_sql + """)
             ORDER BY e.occurred_at_utc DESC
@@ -1514,19 +1355,11 @@ def search_events(
                     e.project,
                     e.task_id,
                     e.visibility,
-                    e.mem0_status,
-                    e.mem0_error,
                     e.payload_json,
-                    o.status AS outbox_status,
-                    o.last_error AS outbox_last_error,
-                    o.payload_json AS outbox_payload_json,
-                    o.synced_at_utc AS outbox_synced_at,
                     bm25(events_fts) AS rank
                 FROM events_fts
                 JOIN events AS e
                     ON e.id = events_fts.event_id
-                LEFT JOIN mem0_outbox AS o
-                    ON o.event_id = e.id AND o.operation = 'add'
                 WHERE (? = 'raw' OR e.visibility != 'raw_only')
                   AND events_fts MATCH ?
                   AND """ + scope_sql + """
@@ -1642,16 +1475,8 @@ def fetch_events_between(
                 e.project,
                 e.task_id,
                 e.visibility,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at
+                e.payload_json
             FROM events AS e
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND e.occurred_at_utc >= ?
               AND e.occurred_at_utc <= ?
@@ -2918,86 +2743,6 @@ def link_event_external_ref(
     return ref_id
 
 
-def count_mem0_outbox(
-    config: ChronicleConfig,
-    *,
-    status: str | None = None,
-) -> int:
-    with open_connection(config) as connection:
-        row = connection.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM mem0_outbox
-            WHERE (? IS NULL OR status = ?)
-            """,
-            (status, status),
-        ).fetchone()
-    return int(row["count"])
-
-
-def fetch_mem0_outbox_entries(
-    config: ChronicleConfig,
-    *,
-    statuses: tuple[str, ...] = ("pending", "failed"),
-    limit: int = 25,
-) -> list[dict[str, Any]]:
-    placeholders = ", ".join("?" for _ in statuses)
-    query = f"""
-        SELECT
-            o.id,
-            o.event_id,
-            o.collection_name,
-            o.operation,
-            o.status,
-            o.attempts,
-            o.last_attempt_at_utc,
-            o.last_error,
-            o.payload_json,
-            o.created_at_utc,
-            o.synced_at_utc,
-            e.payload_json AS event_payload_json,
-            e.text AS event_text,
-            e.why AS event_why,
-            e.category AS event_category,
-            e.entity_id
-        FROM mem0_outbox AS o
-        JOIN events AS e
-            ON e.id = o.event_id
-        WHERE o.status IN ({placeholders})
-          AND o.operation = 'add'
-        ORDER BY CASE WHEN o.status = 'pending' THEN 0 ELSE 1 END, o.created_at_utc ASC
-        LIMIT ?
-    """
-    with open_connection(config) as connection:
-        rows = connection.execute(query, (*statuses, limit)).fetchall()
-
-    entries: list[dict[str, Any]] = []
-    for row in rows:
-        payload = _load_json(row["payload_json"])
-        event_payload = _load_json(row["event_payload_json"])
-        project = event_payload.get("project") or _project_from_entity_id(row["entity_id"])
-        entries.append(
-            {
-                "id": row["id"],
-                "event_id": row["event_id"],
-                "collection_name": row["collection_name"],
-                "operation": row["operation"],
-                "status": row["status"],
-                "attempts": row["attempts"],
-                "last_attempt_at_utc": row["last_attempt_at_utc"],
-                "last_error": row["last_error"],
-                "created_at_utc": row["created_at_utc"],
-                "synced_at_utc": row["synced_at_utc"],
-                "payload": payload,
-                "text": payload.get("text") or row["event_text"],
-                "why": payload.get("why") or row["event_why"],
-                "category": payload.get("category") or row["event_category"],
-                "project": payload.get("project") or project,
-            }
-        )
-    return entries
-
-
 def has_snapshot_for_local_date(
     config: ChronicleConfig,
     *,
@@ -3018,12 +2763,12 @@ def has_snapshot_for_local_date(
     return row is not None
 
 
-# A snapshot payload embeds copies of the ledger and of semantic recall as they
-# stood at capture time. Those three keys are ~23 KB of a ~24 KB snapshot, and
-# they answer questions that the live tools answer better and more currently.
+# A snapshot payload embeds the ledger and source excerpts as they stood at
+# capture time. Those keys are most of a snapshot, and they answer questions
+# that the live tools answer better and more currently.
 # Replaying them verbatim made a two-snapshot state_at call 62 KB — enough to
 # crowd out an agent's working context for an archaeology lookup.
-_SNAPSHOT_BULK_KEYS = ("recent_ledger", "mem0_snapshot_hits", "source_excerpts")
+_SNAPSHOT_BULK_KEYS = ("recent_ledger", "source_excerpts")
 
 
 def digest_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3063,8 +2808,7 @@ def timeline_state(
     side. As of: snapshots taken by then, events of the window before it that
     the server had received by then (their first observation), and the facts
     that were current then, retired since or not. As of compares to the
-    millisecond, hides the facts of quarantined events as it hides the events,
-    and leaves out the Mem0 sync state, which is not kept per moment.
+    millisecond, and hides the facts of quarantined events as it hides the events.
     """
     if detail not in ("digest", "full"):
         raise ValueError(f"detail must be 'digest' or 'full', got {detail!r}")
@@ -3123,16 +2867,8 @@ def timeline_state(
                 e.project,
                 e.task_id,
                 e.visibility,
-                e.mem0_status,
-                e.mem0_error,
-                e.payload_json,
-                o.status AS outbox_status,
-                o.last_error AS outbox_last_error,
-                o.payload_json AS outbox_payload_json,
-                o.synced_at_utc AS outbox_synced_at
+                e.payload_json
             FROM events AS e
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
             WHERE (? = 'raw' OR e.visibility != 'raw_only')
               AND """ + window_sql + """
               AND """ + scope_sql + """
@@ -3159,15 +2895,8 @@ def timeline_state(
         "events": [_event_row_to_entry(row) for row in event_rows],
     }
     if as_of:
-        for event in payload["events"]:
-            for key in _MEM0_SYNC_KEYS:
-                event.pop(key, None)
         payload["facts"] = fact_rows
     return payload
-
-
-# Mem0 sync state is overwritten in place, so as_of cannot tell what it was then.
-_MEM0_SYNC_KEYS = ("mem0_status", "mem0_error", "mem0_raw", "mem0_synced_at")
 
 
 def _utc_stamp(moment: datetime) -> str:
@@ -3223,12 +2952,8 @@ def update_event_memory_guard(
     with open_connection(config) as connection, connection:
         row = connection.execute(
             """
-            SELECT
-                e.payload_json,
-                o.payload_json AS outbox_payload_json
+            SELECT e.payload_json
             FROM events AS e
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
             WHERE e.id = ?
             LIMIT 1
             """,
@@ -3246,121 +2971,6 @@ def update_event_memory_guard(
             WHERE id = ?
             """,
             (_json(event_payload), guard_visibility(memory_guard), event_id),
-        )
-
-        if row["outbox_payload_json"] is not None:
-            outbox_payload = _load_json(row["outbox_payload_json"])
-            outbox_payload["memory_guard"] = memory_guard
-            connection.execute(
-                """
-                UPDATE mem0_outbox
-                SET payload_json = ?
-                WHERE event_id = ? AND operation = 'add'
-                """,
-                (_json(outbox_payload), event_id),
-            )
-    return True
-
-
-def update_event_mem0_state(
-    config: ChronicleConfig,
-    *,
-    event_id: str,
-    mem0_status: str,
-    mem0_error: str | None = None,
-    mem0_raw: str | None = None,
-    mem0_synced_at: str | None = None,
-    attempted: bool = True,
-) -> bool:
-    update_time_utc = utc_now()
-    synced_at = mem0_synced_at or (update_time_utc if mem0_status in {"stored", "synced"} else None)
-    event_status = _event_mem0_status(mem0_status)
-
-    with open_connection(config) as connection, connection:
-        row = connection.execute(
-            """
-            SELECT
-                e.occurred_at_utc,
-                e.payload_json,
-                o.attempts AS outbox_attempts,
-                o.created_at_utc AS outbox_created_at_utc,
-                o.last_attempt_at_utc AS outbox_last_attempt_at_utc,
-                o.synced_at_utc AS outbox_synced_at_utc,
-                o.payload_json AS outbox_payload_json
-            FROM events AS e
-            LEFT JOIN mem0_outbox AS o
-                ON o.event_id = e.id AND o.operation = 'add'
-            WHERE e.id = ?
-            """,
-            (event_id,),
-        ).fetchone()
-        if not row:
-            return False
-
-        payload = _load_json(row["payload_json"])
-        if mem0_raw is not None:
-            payload["mem0_raw"] = mem0_raw
-        if mem0_error is not None:
-            payload["mem0_error"] = mem0_error
-        else:
-            payload.pop("mem0_error", None)
-        payload["mem0_status"] = event_status
-        if synced_at is not None:
-            payload["mem0_synced_at"] = synced_at
-        else:
-            payload.pop("mem0_synced_at", None)
-
-        connection.execute(
-            """
-            UPDATE events
-            SET mem0_status = ?, mem0_error = ?, payload_json = ?
-            WHERE id = ?
-            """,
-            (
-                event_status,
-                mem0_error,
-                _json(payload),
-                event_id,
-            ),
-        )
-
-        outbox_payload = _load_json(row["outbox_payload_json"])
-        outbox_payload.update(
-            {
-                "text": payload.get("text") or "",
-                "why": payload.get("why"),
-                "category": payload.get("category"),
-                "project": payload.get("project"),
-            }
-        )
-        if mem0_raw is not None:
-            outbox_payload["mem0_raw"] = mem0_raw
-        if mem0_error is not None:
-            outbox_payload["mem0_error"] = mem0_error
-        else:
-            outbox_payload.pop("mem0_error", None)
-        if synced_at is not None:
-            outbox_payload["mem0_synced_at"] = synced_at
-        else:
-            outbox_payload.pop("mem0_synced_at", None)
-
-        current_attempts = row["outbox_attempts"] or 0
-        attempts = current_attempts + 1 if attempted else current_attempts or _attempt_count(mem0_status)
-        last_attempt_at_utc = update_time_utc if attempted else row["outbox_last_attempt_at_utc"]
-        created_at_utc = row["outbox_created_at_utc"] or row["occurred_at_utc"]
-        if synced_at is None and not attempted:
-            synced_at = row["outbox_synced_at_utc"]
-
-        _upsert_mem0_outbox(
-            connection,
-            event_id,
-            outbox_payload,
-            created_at_utc,
-            mem0_status,
-            mem0_error,
-            attempts=attempts,
-            last_attempt_at_utc=last_attempt_at_utc,
-            synced_at_utc=synced_at,
         )
     return True
 

@@ -22,7 +22,7 @@ from urllib.request import urlopen
 
 from . import __version__
 from .brief import _read_only
-from .config import mem0_enabled
+from .automation import JOB_NAMES
 from .store import config_from_manifest, target_schema_version
 
 SERVER_TIMEOUT_S = 2.0
@@ -106,8 +106,8 @@ def runtime_component(manifest: dict[str, Any], automation: Any, *, server_url: 
             last_backup = connection.execute(
                 "SELECT MAX(started_at_utc) FROM backup_runs WHERE status = 'ok'").fetchone()[0]
             # The configured jobs only: retired ones keep their old rows forever.
-            configured = sorted(key.replace("_", "-") for key in automation.jobs
-                                if key != "mem0_dump" or mem0_enabled(manifest))
+            configured = sorted(job for job in (key.replace("_", "-") for key in automation.jobs)
+                                if job in JOB_NAMES)
             latest = {row["job_name"]: dict(row) for row in connection.execute(
                 """SELECT job_name, status, started_at_utc FROM automation_runs r
                 WHERE started_at_utc = (SELECT MAX(started_at_utc) FROM automation_runs WHERE job_name = r.job_name)""")}

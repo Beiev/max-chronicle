@@ -122,7 +122,6 @@ def _status_sources(status_root: Path) -> None:
     _write(status_root / "max_chronicle" / "docs" / "IMPLEMENTATION_CHECKLIST.md", "# Checklist\n")
     _write(status_root / "ssot-ledger.jsonl", "")
     _write(status_root / "chronicle-snapshots.jsonl", "")
-    _json(status_root / "mem0-dump.json", {"memories": []})
     _json(status_root / "company-intel.json", {"companies": {}, "lead_companies": {"with_intel": [], "without_intel": []}})
 
 
@@ -141,8 +140,6 @@ snapshot_file = "{sandbox.status_root / 'chronicle-snapshots.jsonl'}"
 chronicle_db = "{sandbox.status_root / 'chronicle.db'}"
 chronicle_artifact_dir = "{sandbox.status_root / 'chronicle-artifacts'}"
 chronicle_package_root = "{CHRONICLE_PACKAGE_ROOT}"
-mem0_dump = "{sandbox.status_root / 'mem0-dump.json'}"
-mem0_bridge = "{sandbox.status_root / 'scripts' / 'mem0_bridge.py'}"
 workspace_root = "{sandbox.root}"
 company_intel_json = "{sandbox.status_root / 'company-intel.json'}"
 portfolio_asset_manifest = "{sandbox.portfolio_repo / 'src' / 'data' / 'asset-manifest.ts'}"
@@ -239,11 +236,6 @@ stale_hours = 1440
 recent_hours = 240
 stale_hours = 1440
 
-[freshness.semantic_recall.mem0_dump]
-live_hours = 18
-recent_hours = 30
-stale_hours = 54
-
 [[sources]]
 id = "status"
 label = "Status"
@@ -324,13 +316,11 @@ priority = 53
 id = "global"
 label = "Whole System"
 source_ids = ["status", "priorities", "job_search", "memory_system", "chronicle_protocol"]
-mem0_queries = ["chronicle tests"]
 
 [[domains]]
 id = "memory"
 label = "Memory"
 source_ids = ["memory_system", "chronicle_protocol", "chronicle_adr", "chronicle_schema", "chronicle_checklist", "status"]
-mem0_queries = ["chronicle memory tests"]
 """
     _write(sandbox.manifest_path, textwrap.dedent(manifest).strip() + "\n")
 
@@ -355,7 +345,6 @@ weekly_audit_per_week = 1
 backup_interval_days = 2
 projection_stale_hours = 36
 snapshot_stale_hours = 30
-mem0_sync_batch_size = 10
 jsonl_rotate_mb = 25
 artifact_store_warn_gb = 6
 
@@ -388,11 +377,6 @@ throttle_seconds = 600
 hour = 23
 minute = 15
 throttle_seconds = 600
-
-[jobs.mem0_dump]
-hour = 7
-minute = 0
-throttle_seconds = 900
 
 [jobs.weekly_audit]
 weekday = 0
@@ -450,24 +434,6 @@ def chronicle_sandbox(tmp_path: Path) -> ChronicleSandbox:
     _write(sandbox.status_root / "scripts" / "ssot_hub.py", "#!/usr/bin/env python3\nprint('sync ok')\n")
     _write(sandbox.status_root / "scripts" / "chronicle", "#!/bin/zsh\nexec python3 -m max_chronicle.cli \"$@\"\n")
     (sandbox.status_root / "scripts" / "chronicle").chmod(0o755)
-    _write(
-        sandbox.status_root / "scripts" / "mem0_bridge.py",
-        "#!/usr/bin/env python3\n"
-        "import json, sys\n"
-        "args = sys.argv[1:]\n"
-        "if args and args[0] == 'add':\n"
-        "    print(json.dumps({'id': 'fake-memory', 'status': 'stored', 'text': ' '.join(args[1:])}, ensure_ascii=False))\n"
-        "    raise SystemExit(0)\n"
-        "if args and args[0] == 'dump':\n"
-        "    output = args[args.index('--output') + 1] if '--output' in args else 'mem0-dump.json'\n"
-        "    payload = {'total_memories': 1, 'memories': [{'id': 'fake-memory', 'memory': 'Chronicle sandbox memory', 'metadata': {'project': 'status'}}]}\n"
-        "    with open(output, 'w', encoding='utf-8') as handle:\n"
-        "        json.dump(payload, handle, ensure_ascii=False, indent=2)\n"
-        "        handle.write('\\n')\n"
-        "    print(json.dumps({'status': 'ok', 'output': output}, ensure_ascii=False))\n"
-        "    raise SystemExit(0)\n"
-        "raise SystemExit(1)\n",
-    )
     _write(
         sandbox.status_root / "git-hooks" / "post-commit",
         "#!/bin/zsh\nexit 0\n",

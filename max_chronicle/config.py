@@ -35,18 +35,10 @@ EXIT_SCHEMA_ACTION = 3  # the schema needs `chronicle migrate`, or a newer relea
 # v8 feature flags — toggle Phase 1 surfaces without editing code.
 ENV_FEATURE_ENTITY_ALIASES = "CHRONICLE_ENABLE_ENTITY_ALIASES"
 ENV_FEATURE_EVENT_HASH_DEDUP = "CHRONICLE_ENABLE_EVENT_HASH_DEDUP"
-ENV_FEATURE_MEM0_LIVE_SEARCH = "CHRONICLE_ENABLE_MEM0_LIVE_SEARCH"
-ENV_MEM0_LIVE_TIMEOUT_S = "CHRONICLE_MEM0_LIVE_TIMEOUT_S"
 ENV_EVENT_DEDUP_WINDOW_HOURS = "CHRONICLE_EVENT_DEDUP_WINDOW_HOURS"
 
-# 15s: a cold `uv run` of the mem0 bridge can resolve/sync an environment and
-# blow far past 5s. Since the MCP tool bodies moved off the event loop, a slow
-# bridge call no longer blocks other sessions, so a generous budget is safe.
-DEFAULT_MEM0_LIVE_TIMEOUT_S = 15.0
-# Mem0 collection the outbox targets, and the operator label used in agent
-# prompts. Both are per-installation identity, so they live in the manifest
-# ([settings] mem0_collection / operator) instead of being baked into code.
-DEFAULT_MEM0_COLLECTION = "chronicle_personal"
+# The operator label used in agent prompts: per-installation identity, so it
+# lives in the manifest ([settings] operator) instead of being baked into code.
 DEFAULT_OPERATOR_LABEL = "the operator"
 DEFAULT_EVENT_DEDUP_WINDOW_HOURS = 24
 DEFAULT_ARTIFACT_MAX_COPY_BYTES = 25 * 1024 * 1024
@@ -92,7 +84,6 @@ class ChronicleConfig:
     artifact_allowed_extensions: tuple[str, ...]
     artifact_pointer_only_enabled: bool
     artifact_follow_symlinks: bool
-    mem0_collection: str
     operator_label: str
     # Canonical names of agents, projects and domains (FR-14); every scope
     # filter resolves spellings through it. Built from the manifest.
@@ -119,22 +110,6 @@ def feature_enabled(env_name: str, *, default: bool = True) -> bool:
     if value in {"0", "false", "no", "off"}:
         return False
     return default
-
-
-def mem0_enabled(manifest: dict | None) -> bool:
-    """Whether this installation runs the optional Mem0 layer.
-
-    ``[mem0] enabled`` decides; without it, the layer is on when the manifest
-    names a bridge (``paths.mem0_bridge``), as before the switch existed. Off,
-    Chronicle queues nothing for Mem0, reads no Mem0 dump, and neither runs nor
-    checks the Mem0 jobs; the rows it queued earlier stay as they are.
-    """
-    section = (manifest or {}).get("mem0")
-    if isinstance(section, dict) and "enabled" in section:
-        if not isinstance(section["enabled"], bool):
-            raise ValueError("[mem0] enabled must be true or false")
-        return section["enabled"]
-    return bool(((manifest or {}).get("paths") or {}).get("mem0_bridge"))
 
 
 def env_float(env_name: str, *, default: float) -> float:
@@ -279,7 +254,6 @@ def default_config(
         artifact_allowed_extensions=DEFAULT_ARTIFACT_ALLOWED_EXTENSIONS,
         artifact_pointer_only_enabled=True,
         artifact_follow_symlinks=False,
-        mem0_collection=DEFAULT_MEM0_COLLECTION,
         operator_label=DEFAULT_OPERATOR_LABEL,
     )
 

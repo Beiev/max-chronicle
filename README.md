@@ -9,7 +9,7 @@ working state so another agent can continue a task without the previous chat.
 
 Chronicle stores attributed events and current assertions in SQLite. Agents use
 MCP or the CLI to search, record observations, and exchange checkpoints. Local
-vector search is optional; the core works without Ollama, Mem0, or paid APIs.
+vector search is optional; the core works without Ollama or paid APIs.
 
 A stored assertion is not automatically a verified fact. Its author, evidence,
 and kind (`observed`, `decision`, or `assumption`) remain visible.
@@ -97,9 +97,8 @@ Agents / CLI / MCP
         |--- recall.py       scoped lexical/vector ranking
         |--- store.py        SQLite transactions and archived evidence
         |
-   SQLite (schema 15) + content-addressed files
+   SQLite (schema 18) + content-addressed files
         |--- Markdown projections
-        |--- optional Mem0 mirror
 ```
 
 ```bash

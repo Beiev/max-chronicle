@@ -216,8 +216,7 @@ def test_hiding_every_event_of_a_day_clears_its_daybook(
 def test_an_unchanged_day_and_its_own_summary_do_not_regenerate(loaded_manifest, loaded_automation) -> None:
     _record(loaded_manifest, "Chose SQLite over Postgres for the local store.", "2026-09-20T08:00:00Z")
     run_daybook_catchup(loaded_manifest, loaded_automation, now=JUST_AFTER_MIDNIGHT)
-    # The scheduled run's own summary lands inside the day, and sync
-    # bookkeeping touches the day's events. Neither is news about the day.
+    # The scheduled run's own summary lands inside the day; it is no news about the day.
     _record(
         loaded_manifest,
         f"Chronicle daybook generated for {DAY}.",
@@ -225,7 +224,6 @@ def test_an_unchanged_day_and_its_own_summary_do_not_regenerate(loaded_manifest,
         category="daily_summary",
         source_kind=DAYBOOK_SOURCE_KIND,
     )
-    _execute(loaded_manifest, "UPDATE events SET mem0_status = 'synced'")
 
     result = run_daybook_catchup(loaded_manifest, loaded_automation, now=NEXT_EVENING)
 
