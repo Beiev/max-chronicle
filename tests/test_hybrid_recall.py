@@ -569,5 +569,5 @@ def test_weak_positive_vector_match_does_not_answer_unrelated_query(loaded_manif
     stored_vector = [0.6, 0.8] + [0.0] * (EMBED_DIM - 2)
     store_event_embedding(config_from_manifest(loaded_manifest), event["id"], stored_vector,
                           "nomic-embed-text", EMBED_DIM)
-    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda _: [1.0] + [0.0] * (EMBED_DIM - 1))
+    monkeypatch.setattr("max_chronicle.embeddings.embed_text", lambda _text, **_options: [1.0] + [0.0] * (EMBED_DIM - 1))
     assert service.query_memory(loaded_manifest, query="unicornquantumzxy987")["results"] == []

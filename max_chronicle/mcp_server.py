@@ -28,7 +28,7 @@ from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from . import __version__, viewer
+from . import __version__, embeddings, viewer
 
 from .automation import load_automation_config
 from .config import (
@@ -122,7 +122,7 @@ STARTUP_MODE_ARG = Annotated[
     Field(description="brief (default): the compact memory brief, plus task_context for a task_id; bundle: the full startup bundle."),
 ]
 BRIEF_TIMEOUT_S = 2.0  # a session-start hook waits for this, so it must stay short
-VIEW_TIMEOUT_S = 15.0  # a page reads a few queries; recall may wait on the embedding model
+VIEW_TIMEOUT_S = 30.0  # a page reads a few queries; recall may wait QUERY_WAIT_S for Ollama to start
 # /brief is for processes on this machine. A browser page must not read it: its
 # fetch always sends Origin, and DNS rebinding arrives with a foreign Host (O4).
 _LOOPBACK_HOST = re.compile(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?")
@@ -1210,7 +1210,7 @@ def _runtime_health() -> dict[str, Any]:
     if _RUNTIME["last_write"] is not None:
         health["last_write"] = _RUNTIME["last_write"]
     if _RUNTIME["embedder"] is not None:
-        health["embedder"] = _RUNTIME["embedder"].snapshot()
+        health["embedder"] = {**_RUNTIME["embedder"].snapshot(), "last_start": embeddings.last_start()}
     if _RUNTIME["scheduler"] is not None:
         health["scheduler"] = _RUNTIME["scheduler"].snapshot()
     return health
@@ -1306,7 +1306,8 @@ def _start_scheduler(manifest_path: Path) -> Scheduler | None:
 
 
 def _start_embedder(manifest_path: Path) -> BackgroundEmbedder:
-    embedder = BackgroundEmbedder(lambda: load_manifest_cached(manifest_path), embed_backfill)
+    embedder = BackgroundEmbedder(lambda: load_manifest_cached(manifest_path),
+                                  functools.partial(embed_backfill, lazy=True))
     _RUNTIME["embedder"] = embedder
     embedder.start()
     return embedder

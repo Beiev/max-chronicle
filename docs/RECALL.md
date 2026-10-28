@@ -25,6 +25,9 @@ what never gets stored, and how to measure recall on your own corpus.
   `--apply` deletes them (never the active model's).
   If native scheduling is enabled, daily capture also retries up to 10 missing
   or incompatible embeddings per run. Disabling event embeddings disables this repair.
+  The capture and the server's background sweep call Ollama only when an event
+  lacks a vector; a vector of another dimension is replaced by the next run that
+  has one to embed. `chronicle embed-backfill` always checks the dimension.
 - **Recency:** breaks ties between equally relevant candidates; it never supplies
   or promotes unrelated answers.
 - **Confidence:** `no_confident_match: true`, with a `hint`, when no result holds

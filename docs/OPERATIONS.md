@@ -40,10 +40,30 @@ itself, and `SIGUSR1` (advertised as `stack_dump_signal`) does the same on deman
 so a supervisor can record a hang before it restarts the process.
 
 An HTTP server writes events without waiting for their vectors: a background
-thread embeds them after the commit, keeps the model loaded
-(`CHRONICLE_EMBED_KEEP_ALIVE`, default `30m`) and backs off while Ollama is down.
-The model's context is capped at `CHRONICLE_EMBED_NUM_CTX` (default 8192 tokens),
-which for `qwen3-embedding` halves its memory and leaves shorter texts' vectors unchanged.
+thread embeds them after the commit and backs off while Ollama is down. A sweep
+with nothing to embed does not call Ollama, so the model stays loaded only for
+`CHRONICLE_EMBED_KEEP_ALIVE` (default `5m`) after the last real call and Ollama
+unloads it then. The model's context is capped at `CHRONICLE_EMBED_NUM_CTX`
+(default 8192 tokens), which for `qwen3-embedding` halves its memory and leaves
+shorter texts' vectors unchanged.
+
+Chronicle can start Ollama when it finds it down, for example after a reboot:
+
+```toml
+[embedder]
+start_command = ["open", "-g", "-a", "Ollama"]  # macOS app; or ["ollama", "serve"]
+```
+
+With it, a search waits up to 20 s for Ollama to come up and the model to load,
+the load getting at least 3 s even when Ollama came up late, and answers on text
+alone if it did not. A background sweep or note sync with work waits up to 60 s
+for the start. A `startup_bundle` with `capture=true` holds the write slot, so
+its recall waits 3 s at most and never starts Ollama. A start that did not bring
+Ollama up is not repeated for a minute, and a start command that is still
+running is not run again. Without the section Chronicle never starts anything,
+and a search with Ollama down runs on text only, as before. `chronicle doctor`
+shows whether Ollama is up, whether the model is loaded and until when;
+`/health` adds the server's last start (`embedder.last_start`).
 
 
 The default (`chronicler`) profile serves the six tools agents use

@@ -192,7 +192,7 @@ def test_notes_rank_by_meaning_when_the_words_differ(notes, monkeypatch) -> None
         return [1.0, 0.0, 0.0] if "cache ahead" in text else [0.0, 1.0, 0.0]
 
     monkeypatch.setattr("max_chronicle.embeddings.embed_documents", lambda texts, **_: [vector(t) for t in texts])
-    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query: [0.9, 0.1, 0.0])
+    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query, **_: [0.9, 0.1, 0.0])
     report = sync_notes(manifest)
     assert report["embedding"]["embedded"] == report["embedding"]["missing"] > 0
 
@@ -496,7 +496,7 @@ def test_a_malformed_note_vector_is_ignored(notes, monkeypatch, size) -> None:
     manifest, _ = notes
     sync_notes(manifest, embed=False)
     service.record_event(manifest, {"agent": "agent-a", "domain": "global", "text": "Orbit launch moved"})
-    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query: [0.9, 0.1, 0.0])
+    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query, **_: [0.9, 0.1, 0.0])
     with open_connection(config_from_manifest(manifest)) as connection:
         chunk_id = connection.execute("SELECT id FROM document_chunks ORDER BY id LIMIT 1").fetchone()[0]
         connection.execute("INSERT INTO chunk_vectors(chunk_id, model_key, dim, vector, created_at_utc) "
@@ -557,7 +557,7 @@ def test_equally_ranked_notes_come_newest_first(notes, monkeypatch) -> None:
     os.utime(newer, (1_700_000_000, 1_700_000_000))
     monkeypatch.setattr("max_chronicle.embeddings.embed_documents",
                         lambda texts, **_: [[1.0, 0.0, 0.0] if "unrelated" in t else [0.0, 1.0, 0.0] for t in texts])
-    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query: [1.0, 0.0, 0.0])
+    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query, **_: [1.0, 0.0, 0.0])
     sync_notes(manifest)
 
     hits = query_memory(manifest, query="walrus harbor")["notes"]
@@ -743,7 +743,7 @@ def test_equal_similarity_ranks_the_newer_note_first(notes, monkeypatch) -> None
     os.utime(newer, (1_700_000_000, 1_700_000_000))
     monkeypatch.setattr("max_chronicle.embeddings.embed_documents",
                         lambda texts, **_: [[1.0, 0.0, 0.0] if "walrus" in t else [0.0, 1.0, 0.0] for t in texts])
-    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query: [1.0, 0.0, 0.0])
+    monkeypatch.setattr("max_chronicle.embeddings.embed_query", lambda query, **_: [1.0, 0.0, 0.0])
     sync_notes(manifest)
 
     hits = [hit for hit in query_memory(manifest, query="pinniped")["notes"] if "walrus" in hit["title"].lower()]

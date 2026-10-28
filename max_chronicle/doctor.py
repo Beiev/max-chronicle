@@ -20,7 +20,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-from . import __version__
+from . import __version__, embeddings
 from .brief import _read_only
 from .automation import JOB_NAMES
 from .store import config_from_manifest, target_schema_version
@@ -136,6 +136,9 @@ def runtime_component(manifest: dict[str, Any], automation: Any, *, server_url: 
                                if automation.backup_root.exists() else None) if disk]
     component["disks"] = disks
     warnings += [f"{disk['path']}: {disk['free_gb']} GB free" for disk in disks if disk["free_ratio"] < DISK_WARN_RATIO]
+    component["embedder"] = embeddings.backend_status(manifest)
+    if component["embedder"]["settings_error"]:
+        warnings.append(f"manifest: {component['embedder']['settings_error']}")
     server = component["server"]
     if not server.get("answering"):
         warnings.append("the HTTP server is not answering")
@@ -174,6 +177,19 @@ def render_summary(payload: dict[str, Any]) -> str:
                          + (f" · last run {last.get('job')} exit {last.get('exit')}" if last else ""))
     else:
         lines.append(f"server     not answering ({server.get('error', 'unknown')})")
+    ollama = runtime.get("embedder") or {}
+    if ollama:
+        if ollama.get("up"):
+            state = (f"{ollama['model']} loaded until {ollama['expires_at']}" if ollama.get("model_loaded")
+                     else f"{ollama['model']} not loaded")
+        elif ollama.get("start_command"):
+            state = "started on demand by `" + " ".join(ollama["start_command"]) + "`"
+        else:
+            state = "no start command: search runs on text only"
+        started = (server.get("embedder") or {}).get("last_start") if server.get("answering") else None
+        if started:
+            state += f" · last start {started.get('at')}: {started.get('outcome')}"
+        lines.append(f"ollama     {'up' if ollama.get('up') else 'down'} · {state}")
     for job in runtime.get("jobs") or []:
         lines.append(f"job        {job['job_name']}: {job['status']}"
                      + (f" at {job['started_at_utc']}" if job.get("started_at_utc") else ""))

@@ -49,6 +49,7 @@ def query_memory(
     project: str | None = None,
     task_id: str | None = None,
     include_notes: bool = True,
+    wait_for_backend: bool = True,
 ) -> dict[str, Any]:
     """Fuse relevant lexical/vector candidates; recency only breaks ties.
 
@@ -61,8 +62,21 @@ def query_memory(
     vector-only candidates; exact lexical hits need no embedding. The response
     says ``no_confident_match`` unless a result holds every query term or
     reaches the profile's confident similarity (FR-2).
+
+    The query's vector may wait QUERY_WAIT_S for Ollama to start and load the
+    model. A caller that holds the write slot passes ``wait_for_backend=False``:
+    it waits DOCUMENT_TIMEOUT_S at most and never starts Ollama.
     """
-    from .embeddings import active_profile, embed_query, similarity_scorer, unpack_vector
+    from .embeddings import (
+        DOCUMENT_TIMEOUT_S,
+        QUERY_WAIT_S,
+        EmbedderSettings,
+        active_profile,
+        embed_query,
+        embedder_settings,
+        similarity_scorer,
+        unpack_vector,
+    )
     from .memory import event_provenance
 
     if not isinstance(query, str) or not query.strip():
@@ -108,7 +122,9 @@ def query_memory(
     vector_available = False
     usable_query_vec: list[float] | None = None
     try:
-        query_vec = embed_query(query)
+        query_vec = (embed_query(query, settings=embedder_settings(manifest), wait_s=QUERY_WAIT_S)
+                     if wait_for_backend else
+                     embed_query(query, settings=EmbedderSettings(), wait_s=DOCUMENT_TIMEOUT_S))
         if query_vec is None:
             errors["vector"] = "embedding_backend_unavailable"
         elif not all(math.isfinite(x) for x in query_vec) or not any(query_vec):

@@ -11,8 +11,9 @@ Two things a server shared by many agents needs and a stdio server does not:
 - ``BackgroundEmbedder`` indexes new events off the write path. An embedding
   call can take seconds on a cold model, and it ran inside the single write
   slot, so one slow call held back every agent's write. Now a write commits
-  without its vector and wakes this thread, which fills the gap, keeps the
-  model warm and backs off while the backend is down.
+  without its vector and wakes this thread, which fills the gap and backs off
+  while the backend is down. A sweep with nothing to embed leaves Ollama alone,
+  so the model unloads once its keep-alive runs out.
 """
 
 from __future__ import annotations
@@ -238,7 +239,7 @@ class BackgroundEmbedder:
         self._wake.clear()
 
     def loop(self) -> None:
-        wait = 0.0  # the first sweep runs at once and warms the model
+        wait = 0.0  # the first sweep runs at once
         while True:
             self.wait_for_work(wait)
             wait = self.next_wait(self.run_once())

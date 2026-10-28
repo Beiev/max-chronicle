@@ -1978,10 +1978,11 @@ def run_automation_job(
             )
             # Repair a bounded slice after an embedding outage. Local capture
             # remains successful even while the optional index is unavailable.
+            # Lazy: a complete index costs no Ollama call (and no start at night).
             embedding_repair = {"status": "disabled"}
             if feature_enabled(ENV_FEATURE_EVENT_EMBEDDINGS):
                 try:
-                    embedding_repair = embed_backfill(manifest, limit=10)
+                    embedding_repair = embed_backfill(manifest, limit=10, lazy=True)
                 except Exception as exc:
                     embedding_repair = {"status": "degraded", "error": str(exc)}
             # The snapshot is stored even when its evidence, projections or
