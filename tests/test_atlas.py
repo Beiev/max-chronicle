@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import math
 import os
 from pathlib import Path
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -453,6 +455,26 @@ def test_every_file_the_page_loads_is_served(client) -> None:
         assert client.get(f"/ui/static/atlas/{name}").status_code == 200, name
     for referenced in ("main.js", "atlas.css", "render.js", "timeline.js", "panel.js", "layout.worker.js"):
         assert referenced in text and referenced in names
+
+
+def test_a_date_on_the_time_machine_never_passes_the_last_memory(tmp_path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    # The map as served on 2026-10-29: the axis counts whole days from the first
+    # memory, so it ran on to 30 October and the page said "Now · 30 Oct 2026".
+    first = datetime(2026, 3, 15, 11, 48, 32, tzinfo=timezone.utc).timestamp()
+    last = datetime(2026, 10, 29, 12, 46, 51, tzinfo=timezone.utc).timestamp()
+    days = math.ceil((last - first) / 86400)
+    module = tmp_path / "timeline.mjs"  # loads as a module on any node
+    module.write_bytes((atlas.UI_DIR / "timeline.js").read_bytes())
+    script = (f"import {{ momentAt }} from {json.dumps(module.as_uri())};"
+              f"console.log(JSON.stringify([0, 10, {days} - 0.5, {days}].map((day) => momentAt([{first}, {last}], day))));")
+
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [first, first + 10 * 86400, last, last]
 
 
 @pytest.mark.parametrize("path", [

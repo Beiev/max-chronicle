@@ -10,7 +10,7 @@
  */
 
 import { Renderer } from "./render.js";
-import { Timeline } from "./timeline.js";
+import { Timeline, momentAt } from "./timeline.js";
 import { el, markdown, relations, kindChip, statRow } from "./panel.js";
 
 const DAY = 86400;
@@ -817,7 +817,7 @@ async function main() {
   const dateBig = $("date-big"), timeLabel = $("time-label"), nowButton = $("now"), playButton = $("play");
   const known = $("known"), knownList = $("known-list"), knownDate = $("known-date");
   let dateTimer = 0;
-  const dateAt = (/** @type {number} */ day) => new Date((span0 + day * DAY) * 1000);
+  const dateAt = (/** @type {number} */ day) => new Date(momentAt([span0, span1], day) * 1000);
   function bornCount() { let c = 0; for (let i = 0; i < n; i++) if (birth[i] <= play) c++; return c; }
   function flashDate() {
     dateBig.replaceChildren(dayFormat.format(dateAt(play)), el("small", "", `${number.format(bornCount())} memories`));
@@ -829,7 +829,7 @@ async function main() {
     known.hidden = true;
     if (play >= days - 0.01 || panelOpen) return;
     knownDate.textContent = dayFormat.format(dateAt(play));
-    const now = span0 + play * DAY;
+    const now = momentAt([span0, span1], play);
     const current = new Map();
     for (const f of data.facts) {
       if (f.from <= now && (f.to === null || f.to > now)) {
@@ -854,7 +854,7 @@ async function main() {
     const travelling = play < days - 0.01;
     nowButton.hidden = !travelling;
     timeLabel.replaceChildren(travelling ? dayFormat.format(dateAt(play)) : "Now", el("span", "", travelling
-      ? ` · ${number.format(bornCount())} memories` : ` · ${dayFormat.format(dateAt(days))}`));
+      ? ` · ${number.format(bornCount())} memories` : ` · ${dayFormat.format(new Date())}`));
     if (!knownTimer) knownTimer = window.setTimeout(() => { knownTimer = 0; renderKnown(); }, 80);
   }
   jumpTo(days);

@@ -15,6 +15,16 @@ const PAD_X = 14;
  *   onScrub: (day: number) => void}} TimelineOptions
  */
 
+/**
+ * The moment a point of the axis stands for. The axis counts whole days from
+ * the first memory, so its end lies up to a day past the last one; a moment
+ * on it never goes past the last memory.
+ * @param {[number, number]} span @param {number} day
+ */
+export function momentAt(span, day) {
+  return Math.min(span[0] + day * DAY, span[1]);
+}
+
 export class Timeline {
   /** @param {HTMLCanvasElement} canvas @param {TimelineOptions} options */
   constructor(canvas, options) {
