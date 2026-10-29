@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -123,6 +124,7 @@ CANONICAL_EVENT_CATEGORIES = frozenset(
         "research",
         "insight",
         "constraint",
+        "curation",
     }
 )
 CATEGORY_ALIASES = {
@@ -506,6 +508,7 @@ _UNREDACTED_ENTRY_KEYS = frozenset(
         "task_id", "recorded_at", "occurred_at", "entity_id", "entity_type",
         "source_files", "slot", "kind", "supersedes", "memory_guard",
         "content_hash", "skip_generic_source_archives", "agent_source",
+        "curation",  # the Atlas's actions: names of actions and memories
     }
 )
 
@@ -2050,11 +2053,17 @@ def record_event(
     source_kind: str = "agent_command",
     imported_from: str = "chronicle.record",
     defer_embedding: bool = False,
+    hash_dedupe: bool = True,
+    within: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Store one event; with *defer_embedding* its vector is left to a background indexer.
 
     A long-running server defers: the embedding call (seconds on a cold
     model) then never runs inside the write slot that every agent shares.
+    Without *hash_dedupe*, the same text recorded again is a new event (an
+    action taken again is another action). *within* runs inside the write
+    transaction once a new event is stored, not on a replay; when it raises,
+    nothing is written.
     """
     # Pop private test/injection keys before any serialization path sees them.
     _embed_fn_override = entry.pop("_embed_fn", None)
@@ -2100,7 +2109,7 @@ def record_event(
     normalized_entry["content_hash"] = content_hash
 
     hash_dedup_active = (
-        not dedupe and feature_enabled(ENV_FEATURE_EVENT_HASH_DEDUP)
+        hash_dedupe and not dedupe and feature_enabled(ENV_FEATURE_EVENT_HASH_DEDUP)
     )
     hash_dedup_window = (
         env_int(ENV_EVENT_DEDUP_WINDOW_HOURS, default=DEFAULT_EVENT_DEDUP_WINDOW_HOURS)
@@ -2204,6 +2213,8 @@ def record_event(
             )
             artifacts_written += 1
         observation = record_observation(connection, normalized_entry, stored["id"], evidence, config.identities)
+        if within is not None and not existing:
+            within(connection, stored)
     if embedding_vec is not None and embed_model is not None and embed_dim is not None:
         # A vector is an index entry, not part of the record. Written in its own
         # transaction, no failure of it can lose the event, not even one that

@@ -183,8 +183,42 @@ The same machine-only checks apply, and the data comes from three JSON routes:
 Texts (an event's words, a note's title, a fact's value, a record opened in full)
 are redacted again on the way out; names of projects, tasks and fact slots are
 shown as recorded, as on every page. Quarantined events (the event, or every one
-of its observations) and deleted notes are not on the map, in its records or in
-its edges.
+of its observations), deleted notes and copies hidden in the Atlas are not on the
+map, in its records or in its edges.
+
+#### Light actions
+
+The panel of an event or a note has three actions for the operator:
+- **Pin to brief:** the memory opens the brief of its project (or every brief,
+  when it has none), above the open tasks; five at most, latest first.
+- **Mark stale:** agents still find it, but `query_memory`, `get_memory` and
+  `recent_events` mark it `stale` and recall weighs its relevance by half; it
+  leaves the brief, and so does a fact it set (`get_memory` of the fact says
+  `stale` too). An open task whose last checkpoint is stale stays in the brief,
+  marked so. The plain pages under `/ui` show the marks. *Mark current* takes
+  the mark off.
+- **Hide copy:** on a memory of the same kind that says the same thing (0.995 or
+  more by meaning, checked again from the stored vectors), next to it under
+  *Close in meaning*. The memory open in the panel stays; the copy leaves recall,
+  records, the brief and the map. A copied event is hidden as a quarantined one
+  is (its guard says `operator_duplicate` and keeps the one before); a copied
+  note's file is not touched, Chronicle leaves it out wherever notes are read.
+  The original's panel lists its hidden copies, each with *Restore*.
+
+Each action is an event by `operator` (category `curation`, source
+`chronicle_atlas`) on the memory's project, so the history says who did what and
+when; what holds now is the latest action on each memory, in the order they
+were written. Only the Atlas's events by `operator` count: an agent can record
+the category, not the action. A copy is checked again inside the write, so two
+copies hidden at once as each other's cannot both go. Those events are not on
+the map themselves; their marks show on the memories (a gold halo for a pin, a
+greyer star for a stale one).
+
+The page posts to `/ui/api/atlas/action` with the token it got with the map;
+the server also wants its own `Origin` and a JSON body, takes the write slot
+every agent shares, and refuses actions on a `readonly` server. A manifest that
+lists `operator` as an alias of an agent is refused too: remove the alias, or the
+operator's actions would be that agent's.
 
 Edges by meaning link each event and note to its three nearest memories at a
 cosine similarity of 0.80 or more (the active embedding model's vectors; a note

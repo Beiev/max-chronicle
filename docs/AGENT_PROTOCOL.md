@@ -53,13 +53,13 @@ Arguments: `domain`, `agent`, `title`, `focus`, `capture`, `limit`, `compact`, `
 
 ### `query_memory`
 
-Recall: start here for 'what do we know about X'. Searches recorded events (`results`) and indexed notes (`notes`) by words and meaning; recency only breaks ties. By default each hit is one short line (id, when, project, task, agent, a gist of the text, how it matched, and `trust`: assumption if its author said so; else evidence (a source file was archived), confirmed (more than one agent recorded the same text) or assertion (one agent's word); note for a note); `get_memory(ids)` returns the full records you pick, and detail='full' returns them all at once. `no_confident_match` means no hit is a strong match: treat the hits as leads. `relaxed` marks a weaker word-stem match, `degraded` a skipped channel (word search still works when the embedding model is down). An empty result does not prove the memory is absent.
+Recall: start here for 'what do we know about X'. Searches recorded events (`results`) and indexed notes (`notes`) by words and meaning; recency only breaks ties. By default each hit is one short line (id, when, project, task, agent, a gist of the text, how it matched, and `trust`: assumption if its author said so; else evidence (a source file was archived), confirmed (more than one agent recorded the same text) or assertion (one agent's word); note for a note); `get_memory(ids)` returns the full records you pick, and detail='full' returns them all at once. `stale` means the operator marked a hit out of date (it ranks lower), `pinned` that they pinned it to the brief. `no_confident_match` means no hit is a strong match: treat the hits as leads. `relaxed` marks a weaker word-stem match, `degraded` a skipped channel (word search still works when the embedding model is down). An empty result does not prove the memory is absent.
 
 Arguments: `query` (required), `domain`, `limit`, `project`, `task_id`, `detail`.
 
 ### `get_memory`
 
-Full records for ids that query_memory (or a brief) returned: `event:<id>` gives the event with its why, checkpoint or fact, evidence files and provenance; `note:<id>` gives the whole indexed note; `fact:<id>` gives a fact with the event that asserted it. Up to 20 ids; ids that name nothing come back in `missing`.
+Full records for ids that query_memory (or a brief) returned: `event:<id>` gives the event with its why, checkpoint or fact, evidence files and provenance; `note:<id>` gives the whole indexed note; `fact:<id>` gives a fact with the event that asserted it. A record the operator marked carries `pinned` or `stale`. Up to 20 ids; ids that name nothing come back in `missing`.
 
 Arguments: `ids` (required).
 
@@ -71,7 +71,7 @@ Arguments: `text` (required), `why`, `domain`, `category`, `project`, `agent`, `
 
 ### `recent_events`
 
-Cheap latest-N feed of Chronicle events for a domain — situational awareness without search. For 'what do we know about X' use query_memory instead.
+Cheap latest-N feed of Chronicle events for a domain — situational awareness without search; an event the operator marked carries `pinned` or `stale`. For 'what do we know about X' use query_memory instead.
 
 Arguments: `domain`, `limit`.
 

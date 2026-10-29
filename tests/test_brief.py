@@ -57,7 +57,7 @@ def test_the_brief_opens_as_data_and_lists_tasks_facts_and_decisions(loaded_mani
     assert f"deploy.target = staging cluster (fact {fact['fact_id']})" in text
     assert f"Chose weekly releases (event {decision['id']})" in text
     assert fact["id"] not in text  # the decision that set a fact is shown as that fact
-    assert brief["counts"] == {"open_tasks": 1, "facts": 1, "decisions": 1, "warnings": 1}  # no snapshot yet
+    assert brief["counts"] == {"pinned": 0, "open_tasks": 1, "facts": 1, "decisions": 1, "warnings": 1}  # no snapshot yet
 
 
 def test_the_brief_leaves_out_closed_tasks_old_decisions_and_quarantine(loaded_manifest) -> None:

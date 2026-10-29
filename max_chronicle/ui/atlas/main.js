@@ -6,7 +6,9 @@
  * notes pages and fact slots crystals. Lines are what the memory records;
  * dotted light between distant memories is resemblance by meaning. The river
  * at the bottom is how much each project recorded per day: drag the playhead
- * and the sky shows what was known then.
+ * and the sky shows what was known then. In the panel, the operator pins a
+ * memory to the brief, marks it stale, or hides a copy of it; each action is
+ * an event in the memory, written by the server.
  */
 
 import { Renderer } from "./render.js";
@@ -30,6 +32,13 @@ const SIMILAR_WAIT = {
   unavailable: "Resemblance by meaning is unavailable: the server log says why.",
 };
 const BIG_CATEGORIES = new Set(["decision", "milestone"]);
+const STALE_GREY = /** @type {[number, number, number]} */ ([0.42, 0.45, 0.53]);
+const PIN_GOLD = "rgba(255, 214, 128, 0.8)";
+/** @type {Record<string, string>} */
+const DONE = {
+  pin: "Pinned to the brief.", unpin: "Unpinned from the brief.", stale: "Marked stale.", fresh: "Marked current again.",
+  duplicate: "The copy is hidden.", restore: "The copy is back.",
+};
 const PICK_PX = 12;
 const FLY_MS = 1100;
 const LAYOUT_KEY = "chronicle.atlas.layout.v1";
@@ -94,7 +103,8 @@ const items = new Map();
 /** @param {string} id */
 function fetchItem(id) {
   if (!items.has(id)) {
-    items.set(id, fetch(`/ui/api/item?id=${encodeURIComponent(id)}`).then((r) => (r.ok ? r.json() : null)));
+    items.set(id, fetch(`/ui/api/item?id=${encodeURIComponent(id)}`).then((r) => (r.ok ? r.json() : null))
+      .catch(() => { items.delete(id); return null; }));  // the server restarts: asked again next time
   }
   return /** @type {Promise<any>} */ (items.get(id));
 }
@@ -118,6 +128,18 @@ async function main() {
   /** @type {{id: string, k: string, l: string, p: number | null, t: number | null, u: number | null, c?: string, a?: string, o?: number}[]} */
   const nodes = data.nodes;
   const n = nodes.length;
+  /** @type {{enabled: boolean, token: string | null}} */
+  const actions = data.actions || { enabled: false, token: null };
+  // What the operator marked: pinned to the brief, stale, or hidden as a copy since the map loaded.
+  const pinned = new Uint8Array(n), stale = new Uint8Array(n), gone = new Uint8Array(n);
+  nodes.forEach((node, i) => { pinned[i] = node.pi ? 1 : 0; stale[i] = node.st ? 1 : 0; });
+  const pins = new Set(/** @type {number[]} */ ([...pinned.keys()].filter((i) => pinned[i])));
+  /** The id the server knows a memory by (event:<id>, note:<id>); null for other nodes. @param {number} i */
+  const memoryId = (i) => (nodes[i].k === "event" ? `event:${nodes[i].id.slice(2)}`
+    : nodes[i].k === "note" ? `note:${nodes[i].id.slice(2)}` : null);
+  /** @type {Map<string, number>} */
+  const byMemoryId = new Map();
+  nodes.forEach((_, i) => { const id = memoryId(i); if (id) byMemoryId.set(id, i); });
   const projects = /** @type {string[]} */ (data.projects);
   const span0 = data.span ? data.span[0] : Date.now() / 1000;
   const span1 = data.span ? data.span[1] : span0 + DAY;
@@ -154,22 +176,28 @@ async function main() {
   const birth = new Float32Array(n), last = new Float32Array(n), seed = new Float32Array(n), size = new Float32Array(n);
   const color = new Float32Array(n * 3), shape = new Float32Array(n);
   const white = /** @type {[number, number, number]} */ ([1, 1, 1]);
+  /** A node's colour and size; a stale memory is greyer and smaller. @param {number} i */
+  function paint(i) {
+    const node = nodes[i];
+    let c = rgb(colorOf(node.p));
+    if (node.k === "note") c = mix(c, [0.78, 0.84, 1], 0.35);
+    if (node.k === "fact") c = mix(c, [1, 0.93, 0.7], 0.6);
+    if (node.k === "project") c = mix(c, white, 0.15);
+    if (stale[i]) c = mix(c, STALE_GREY, 0.6);
+    color.set(c, i * 3);
+    const d = degree[i];
+    size[i] = (node.k === "project" ? clamp(6 + Math.sqrt(d) * 0.32, 6, 15)
+      : node.k === "task" ? clamp(2.3 + Math.sqrt(d) * 0.4, 2.3, 6)
+      : node.k === "fact" ? 2.6
+      : node.k === "note" ? 1.35
+      : BIG_CATEGORIES.has(node.c || "") ? 1.9 : 1.5) * (stale[i] ? 0.8 : 1);
+  }
   nodes.forEach((node, i) => {
     birth[i] = node.t === null ? 0 : (node.t - span0) / DAY;
     last[i] = node.u === null ? birth[i] : (node.u - span0) / DAY;
     seed[i] = random();
     shape[i] = SHAPE[/** @type {keyof typeof SHAPE} */ (node.k)];
-    let c = rgb(colorOf(node.p));
-    if (node.k === "note") c = mix(c, [0.78, 0.84, 1], 0.35);
-    if (node.k === "fact") c = mix(c, [1, 0.93, 0.7], 0.6);
-    if (node.k === "project") c = mix(c, white, 0.15);
-    color.set(c, i * 3);
-    const d = degree[i];
-    size[i] = node.k === "project" ? clamp(6 + Math.sqrt(d) * 0.32, 6, 15)
-      : node.k === "task" ? clamp(2.3 + Math.sqrt(d) * 0.4, 2.3, 6)
-      : node.k === "fact" ? 2.6
-      : node.k === "note" ? 1.35
-      : BIG_CATEGORIES.has(node.c || "") ? 1.9 : 1.5;
+    paint(i);
   });
 
   // ---------- rendering ----------
@@ -345,7 +373,7 @@ async function main() {
   let travel = 0, focusMix = 0, similarMix = 0;
 
   function updateHighlight() {
-    for (let i = 0; i < n; i++) nodeHl[i] = kindOn[kind[i]] ? 0 : -1;
+    for (let i = 0; i < n; i++) nodeHl[i] = kindOn[kind[i]] && !gone[i] ? 0 : -1;
     edges.forEach((e, index) => { edgeHl[index] = nodeHl[e.s] < 0 || nodeHl[e.t] < 0 ? -1 : 0; });
     if (focus >= 0) {
       if (nodeHl[focus] < 0) nodeHl[focus] = 0;
@@ -486,6 +514,15 @@ async function main() {
     };
     if (focus >= 0) ring(focus, 0.55 + 0.25 * Math.sin(time * 2.4), 2 + Math.sin(time * 2.4) * 1.5);
     if (hovered >= 0 && hovered !== focus) ring(hovered, 0.45, 0);
+    // pinned to the brief: a thin gold halo
+    ctx.strokeStyle = PIN_GOLD;
+    ctx.lineWidth = 1.1;
+    for (const i of pins) {
+      if (!shownNow(i) || !onScreen(i) || (focus >= 0 && nodeHl[i] < 1 && focusMix > 0.5)) continue;
+      ctx.beginPath();
+      ctx.arc(sx(i), sy(i), radiusPx(i) * 1.6 + 3.5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
     ctx.textBaseline = "middle";
     ctx.shadowColor = "rgba(0, 0, 0, 0.85)";
@@ -579,6 +616,8 @@ async function main() {
     meta.append(kindChip(KIND_LABEL[/** @type {keyof typeof KIND_LABEL} */ (node.k)] + (node.c && node.k === "event" ? ` · ${node.c}` : ""), colorOf(node.p)));
     if (node.p !== null && node.k !== "project") meta.append(el("span", "", projects[node.p]));
     if (node.t) meta.append(el("span", "", dayFormat.format(new Date(node.t * 1000))));
+    if (pinned[i]) meta.append(el("span", "badge pin", "pinned"));
+    if (stale[i]) meta.append(el("span", "badge stale", "stale"));
     tip.append(meta, el("div", "text", node.l));
     tip.hidden = false;
     const x = mx + 340 > W ? mx - 360 : mx, y = my + 120 > H ? my - 110 : my;
@@ -601,8 +640,8 @@ async function main() {
     const i = noteByName.get(name);
     return i === undefined ? null : () => focusOn(i);
   };
-  /** @param {number} i */
-  const neighbours = (i) => adj[i];
+  /** What a memory is joined to, less copies hidden since the map loaded. @param {number} i */
+  const neighbours = (i) => adj[i].filter((a) => !gone[a.o]);
 
   function renderTrail() {
     trailBox.replaceChildren();
@@ -616,8 +655,10 @@ async function main() {
     });
   }
 
+  let rendered = 0;  // a record that arrives after the panel was drawn again is for a panel that is gone
   /** @param {number} i */
   function renderPanel(i) {
+    const generation = ++rendered;
     const node = nodes[i];
     const c = colorOf(node.p);
     panelBody.replaceChildren();
@@ -638,22 +679,34 @@ async function main() {
     if (node.a) sub.append(el("b", "", node.a));
     head.append(sub);
     panelBody.append(head);
+    const id = memoryId(i);
     const similar = neighbours(i).filter((a) => a.k === EDGE.similar)
       .sort((a, b) => edges[b.e].w - edges[a.e].w)
-      .map((a) => row(a.o, edges[a.e].dup ? "same" : `${Math.round(edges[a.e].w * 100)}%`));
+      .map((a) => {
+        const r = row(a.o, edges[a.e].dup ? "same" : `${Math.round(edges[a.e].w * 100)}%`);
+        const copy = memoryId(a.o);
+        if (actions.enabled && edges[a.e].dup && id && copy && nodes[a.o].k === node.k) {
+          r.action = { label: "Hide copy", title: "Hide that copy from agents and the map; this memory stays",
+                       run: () => act("duplicate", copy, id) };
+        }
+        return r;
+      });
     const focusTo = (/** @type {number} */ target) => focusOn(target);
 
-    if (node.k === "event" || node.k === "note") {
+    if (id) {
+      panelBody.append(curateBar(i, id));
       const box = el("div", "text", "…");
       box.style.marginTop = "14px";
       panelBody.append(box);
-      const id = (node.k === "event" ? "event:" : "note:") + node.id.slice(2);
+      const plain = el("a", "open-plain", node.k === "event" ? "Open the plain record ↗" : "Open the plain note ↗");
       fetchItem(id).then((item) => {
-        if (focus !== i) return;
+        if (focus !== i || generation !== rendered) return;
         if (!item) { box.textContent = node.l; return; }
+        if (item.copies && item.copies.length) panelBody.insertBefore(copiesSection(item.copies, id), plain);
+        markTitles(item);
         if (node.k === "note") box.replaceWith(markdown(item.text || "", resolveNote, item.title || node.l));
         else box.textContent = item.text || node.l;
-        if (item.why) panelBody.insertBefore(el("div", "why", item.why), panelBody.children[2] || null);
+        if (item.why) panelBody.insertBefore(el("div", "why", item.why), panelBody.children[3] || null);
         if (item.checkpoint) {
           const cp = el("section");
           cp.append(el("h3", "", "Checkpoint"));
@@ -666,9 +719,9 @@ async function main() {
             for (const entry of list) ul.append(el("li", "text", entry));
             cp.append(el("h3", "", title), ul);
           }
-          panelBody.insertBefore(cp, panelBody.children[3] || null);
+          panelBody.insertBefore(cp, panelBody.children[4] || null);
         }
-      });
+      }).catch(() => { if (focus === i && generation === rendered) box.textContent = node.l; });
       if (node.k === "note") {
         panelBody.append(relations("Links to", neighbours(i).filter((a) => a.k === EDGE.link && a.out).map((a) => row(a.o)), focusTo));
         panelBody.append(relations("Linked from", neighbours(i).filter((a) => a.k === EDGE.link && !a.out).map((a) => row(a.o)), focusTo));
@@ -677,7 +730,6 @@ async function main() {
       }
       panelBody.append(relations("Close in meaning", similar, focusTo));
       if (!similarReady) panelBody.append(el("p", "sub", SIMILAR_WAIT[similarNote] || SIMILAR_WAIT["computing…"]));
-      const plain = el("a", "open-plain", node.k === "event" ? "Open the plain record ↗" : "Open the plain note ↗");
       plain.setAttribute("href", `/ui/${node.k}/${encodeURIComponent(node.id.slice(2))}`);
       panelBody.append(plain);
     } else if (node.k === "task") {
@@ -694,7 +746,7 @@ async function main() {
       const tasks = neighbours(i).filter((a) => !a.out && nodes[a.o].k === "task").map((a) => a.o)
         .sort((a, b) => (nodes[b].u || 0) - (nodes[a].u || 0));
       const members = [];
-      for (let k = 0; k < n; k++) if (nodes[k].p === node.p && (nodes[k].k === "event" || nodes[k].k === "note")) members.push(k);
+      for (let k = 0; k < n; k++) if (nodes[k].p === node.p && !gone[k] && (nodes[k].k === "event" || nodes[k].k === "note")) members.push(k);
       const eventsCount = members.filter((k) => nodes[k].k === "event").length;
       panelBody.append(statRow([["events", number.format(eventsCount)], ["tasks", tasks.length],
                                 ["notes", number.format(members.length - eventsCount)], ["since", when(i)]]));
@@ -721,8 +773,137 @@ async function main() {
     }
   }
 
+  // ---------- light actions ----------
+  /** The last action's outcome, shown on the memory it was taken from. @type {{at: number, text: string, error: boolean} | null} */
+  let outcome = null;
+  let acting = false;
+
+  /** What the operator marked on a memory, and the buttons to change it. @param {number} i @param {string} id */
+  function curateBar(i, id) {
+    const bar = el("section", "curate");
+    const marks = el("div", "marks");
+    if (pinned[i]) marks.append(el("span", "badge pin", "Pinned to the brief"));
+    if (stale[i]) marks.append(el("span", "badge stale", "Marked stale"));
+    if (marks.childElementCount) bar.append(marks);
+    if (actions.enabled) {
+      const buttons = el("div", "actions");
+      /** @param {string} label @param {string} title @param {string} action */
+      const button = (label, title, action) => {
+        const b = el("button", "act", label);
+        b.setAttribute("type", "button");
+        b.title = title;
+        b.disabled = acting;
+        b.addEventListener("click", () => act(action, id));
+        buttons.append(b);
+      };
+      if (pinned[i]) button("Unpin", "Take it out of the brief", "unpin");
+      else button("Pin to brief", "Open every brief of its project with it", "pin");
+      if (stale[i]) button("Mark current", "Rank it as any other memory again", "fresh");
+      else button("Mark stale", "Agents still find it, marked stale and ranked lower; it leaves the brief", "stale");
+      bar.append(buttons);
+    }
+    if (outcome && outcome.at === i) bar.append(el("p", `act-status${outcome.error ? " error" : ""}`, outcome.text));
+    return bar;
+  }
+
+  /** When and by whom the marks were set, once the full record has come. @param {any} item */
+  function markTitles(item) {
+    const since = (/** @type {any} */ mark) => (mark ? `since ${timeFormat.format(new Date(mark.since))}, by ${mark.by}` : "");
+    const pin = panelBody.querySelector(".badge.pin"), old = panelBody.querySelector(".badge.stale");
+    if (pin instanceof HTMLElement) pin.title = since(item.pinned);
+    if (old instanceof HTMLElement) old.title = since(item.stale);
+  }
+
+  /** The copies hidden as repeating a memory, each with a way back. @param {any[]} copies @param {string} id */
+  function copiesSection(copies, id) {
+    const section = el("section");
+    section.append(el("h3", "", `Hidden copies · ${copies.length}`));
+    const list = el("ul", "rel copies");
+    for (const copy of copies) {
+      const li = el("li");
+      const label = el("span", "label", copy.label);
+      label.title = `Hidden ${timeFormat.format(new Date(copy.since))} by ${copy.by}`;
+      li.append(label);
+      if (actions.enabled) {
+        const back = el("button", "row-act", "Restore");
+        back.setAttribute("type", "button");
+        back.title = "Show it to agents and on the map again";
+        back.addEventListener("click", () => act("restore", copy.id, id));
+        li.append(back);
+      }
+      list.append(li);
+    }
+    section.append(list);
+    return section;
+  }
+
+  function requestId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  /**
+   * Take an action; the server writes it as the operator's event, then the map follows.
+   * @param {string} action @param {string} target @param {string} [origin] the memory a copy repeats
+   */
+  async function act(action, target, origin) {
+    if (acting || focus < 0) return;
+    const at = focus;
+    acting = true;
+    panelBody.classList.add("still");  // the same memory again: no rising in
+    renderPanel(at);
+    let text = DONE[action] || "Done.", error = false;
+    try {
+      const response = await fetch("/ui/api/atlas/action", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-chronicle-token": actions.token || "" },
+        body: JSON.stringify({ action, target, of: action === "duplicate" ? origin : undefined, request_id: requestId() }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `The server answered HTTP ${response.status}.`);
+      if (body.status === "unchanged") text = "Already so: nothing changed.";
+      applyAction(target, body);
+      if (action === "restore" && !byMemoryId.has(target)) text += " Reload the map to see it.";
+    } catch (failure) {
+      text = failure instanceof Error ? failure.message : String(failure);
+      error = true;
+    }
+    acting = false;
+    for (const id of [target, origin]) if (id) items.delete(id);
+    outcome = { at, text, error };
+    if (focus === at) renderPanel(at);
+  }
+
+  /**
+   * The map as the server says the memory now is (another tab may have changed it too).
+   * @param {string} target @param {{marks?: {pinned?: object, stale?: object}, hidden?: boolean}} body
+   */
+  function applyAction(target, body) {
+    const i = byMemoryId.get(target);
+    if (i === undefined) return;
+    const marks = body.marks || {};
+    pinned[i] = marks.pinned ? 1 : 0;
+    if (pinned[i]) pins.add(i); else pins.delete(i);
+    const wasStale = stale[i];
+    stale[i] = marks.stale ? 1 : 0;
+    if (stale[i] !== wasStale) {
+      paint(i);
+      renderer.setNodes({ color, size, shape, birth, last, seed });
+      renderer.setPositions(positions);
+    }
+    const hide = body.hidden ? 1 : 0;
+    if (gone[i] !== hide) counts[kind[i]] += hide ? -1 : 1;
+    gone[i] = hide;
+    if (gone[i] && focus === i) clearFocus();
+    updateHighlight();
+    renderFilters();
+  }
+
   /** @param {number} i @param {boolean} [push] */
   function focusOn(i, push = true) {
+    if (gone[i]) return;  // hidden as a copy since the map loaded
+    if (outcome && outcome.at !== i) outcome = null;
+    panelBody.classList.remove("still");
     if (birth[i] > play + 0.01) jumpTo(days);
     focus = i;
     isolate = null;
@@ -888,7 +1069,7 @@ async function main() {
       const scored = [];
       for (let i = 0; i < n; i++) {
         const text = haystack[i];
-        if (!words.every((w) => text.includes(w))) continue;
+        if (gone[i] || !words.every((w) => text.includes(w))) continue;
         const kw = kindWeight[/** @type {keyof typeof kindWeight} */ (nodes[i].k)];
         scored.push([i, kw + (text.startsWith(words[0]) ? 2 : 0) + (nodes[i].u || 0) / (span1 || 1)]);
       }

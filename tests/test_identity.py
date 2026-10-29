@@ -47,7 +47,7 @@ def test_a_spelling_claimed_by_two_projects_is_a_configuration_error() -> None:
 @pytest.mark.parametrize(
     ("given", "agent"),
     [
-        ("claude-mac", "claude"), ("claude-opus-harp-nuss-p0-build", "claude"), ("operator", "claude"),
+        ("claude-mac", "claude"), ("claude-opus-demo-build", "claude"), ("operator", "operator"),
         ("Codex", "codex"), ("codex-mcp-client", "codex"), ("claude-code", "claude"),
         ("opencode-glm5.2", "glm"), ("glm-5.2-opencode", "glm"), ("zcode", "glm"),
         ("opencode-deepseek", "deepseek"), ("opencode", "opencode"),
