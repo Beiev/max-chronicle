@@ -64,6 +64,9 @@ anything is stored.
   checkpoint history, facts with every value a slot had, search that says why each
   hit matched, and single records with their evidence. Read-only, no script,
   answered only on this machine.
+- **Atlas:** `http://127.0.0.1:8093/ui/atlas` draws the whole memory as a map:
+  projects, tasks, events, notes and fact slots, joined by what the memory records
+  and by resemblance in meaning, with a time machine that replays how it grew.
 - **CLI:** `chronicle query-memory`, `chronicle timeline --as-of`, `chronicle record`;
   `chronicle doctor --summary` answers "is everything running" on one screen.
 

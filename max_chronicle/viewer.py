@@ -100,6 +100,7 @@ def _page(title: str, body: str) -> str:
         f"<title>{_e(title)} · Chronicle</title><style>{STYLE}</style></head><body>"
         "<header><b>Chronicle</b><nav>"
         + _link("/ui", "Overview") + _link("/ui/facts", "Facts") + _link("/ui/search", "Search")
+        + _link("/ui/atlas", "Atlas")
         + "</nav></header>"
         f"<main><h1>{_e(title)}</h1>{body}</main></body></html>"
     )
