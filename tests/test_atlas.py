@@ -152,6 +152,7 @@ def test_every_text_of_a_record_is_redacted_and_its_identifiers_are_kept(loaded_
               "text": "Plain", "checkpoint": {"goal": f"Rotate {key}", "next_steps": [f"Revoke {key}"]},
               "provenance": {"observations": [{"session_id": "s-1", "note": f"saw {key}"}]}}
     monkeypatch.setattr(atlas, "get_items", lambda manifest, ids: {"items": [record], "missing": []})
+    _record(loaded_manifest, "Something", project="alpha")  # a database to read the operator's marks from
 
     item = atlas.item_payload(loaded_manifest, "note:abc")
 

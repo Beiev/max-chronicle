@@ -2943,6 +2943,23 @@ def _facts_as_of(connection: sqlite3.Connection, config: ChronicleConfig, target
     return facts
 
 
+def set_event_memory_guard(connection: sqlite3.Connection, event_id: str, memory_guard: dict[str, Any] | None) -> bool:
+    """Replace an event's memory guard, and the visibility it sets, within the caller's transaction."""
+    row = connection.execute("SELECT payload_json FROM events WHERE id = ? LIMIT 1", (event_id,)).fetchone()
+    if not row:
+        return False
+    event_payload = _load_json(row["payload_json"])
+    if memory_guard is None:
+        event_payload.pop("memory_guard", None)
+    else:
+        event_payload["memory_guard"] = memory_guard
+    connection.execute(
+        "UPDATE events SET payload_json = ?, visibility = ? WHERE id = ?",
+        (_json(event_payload), guard_visibility(memory_guard), event_id),
+    )
+    return True
+
+
 def update_event_memory_guard(
     config: ChronicleConfig,
     *,
@@ -2950,29 +2967,7 @@ def update_event_memory_guard(
     memory_guard: dict[str, Any],
 ) -> bool:
     with open_connection(config) as connection, connection:
-        row = connection.execute(
-            """
-            SELECT e.payload_json
-            FROM events AS e
-            WHERE e.id = ?
-            LIMIT 1
-            """,
-            (event_id,),
-        ).fetchone()
-        if not row:
-            return False
-
-        event_payload = _load_json(row["payload_json"])
-        event_payload["memory_guard"] = memory_guard
-        connection.execute(
-            """
-            UPDATE events
-            SET payload_json = ?, visibility = ?
-            WHERE id = ?
-            """,
-            (_json(event_payload), guard_visibility(memory_guard), event_id),
-        )
-    return True
+        return set_event_memory_guard(connection, event_id, memory_guard)
 
 
 # ==========================================================================

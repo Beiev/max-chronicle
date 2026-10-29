@@ -27,6 +27,8 @@ any operator's personal workspace.
 - `viewer.py`: the read-only web view under `/ui` (server-rendered, no script).
 - `atlas.py` / `ui/atlas/`: the memory map at `/ui/atlas`: the graph, edges by meaning
   kept in a cache, and a page of plain ES modules (WebGL2, no build step, no CDN).
+- `curation.py`: the Atlas's light actions (pin, stale, hide a copy) as operator
+  events, and the marks they leave, read by the brief, recall and the map.
 - `agent_doc.py`: writes `docs/AGENT_PROTOCOL.md` from the registered tools.
 - `doctor.py`: what `chronicle doctor` reports about the running installation, and its summary.
 - `scaffold.py`: neutral new-workspace templates.

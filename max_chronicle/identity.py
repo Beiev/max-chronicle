@@ -24,8 +24,11 @@ UNKNOWN_AGENT = "mcp"
 # Agents every installation meets. A manifest [[agents]] entry with the same id
 # replaces its default. After exact aliases, rules are tried in this order, so
 # ``opencode-glm5.2`` is GLM's before it is opencode's. ZCode runs GLM.
+# "operator", the person at the screen (the Atlas writes their actions), is
+# no agent's spelling: undeclared, it stays itself, and a manifest that made
+# it an alias of an agent keeps working.
 DEFAULT_AGENTS: tuple[dict[str, Any], ...] = (
-    {"id": "claude", "prefixes": ["claude"], "aliases": ["operator"]},
+    {"id": "claude", "prefixes": ["claude"]},
     {"id": "glm", "prefixes": ["zcode"], "contains": ["glm"]},
     {"id": "deepseek", "contains": ["deepseek"]},
     {"id": "codex", "prefixes": ["codex"]},

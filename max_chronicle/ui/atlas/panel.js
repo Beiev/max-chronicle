@@ -103,7 +103,8 @@ export function markdown(source, resolve, title = "") {
 }
 
 /**
- * @typedef {{index: number, label: string, color: string, when: string, note?: string}} Row
+ * @typedef {{label: string, title: string, run: () => void}} RowAction
+ * @typedef {{index: number, label: string, color: string, when: string, note?: string, action?: RowAction}} Row
  */
 
 /**
@@ -131,6 +132,14 @@ export function relations(title, rows, go) {
       button.append(el("span", "when", row.when));
       button.addEventListener("click", () => go(row.index));
       li.append(button);
+      const action = row.action;
+      if (action) {
+        const act = el("button", "row-act", action.label);
+        act.setAttribute("type", "button");
+        act.title = action.title;
+        act.addEventListener("click", () => action.run());
+        li.append(act);
+      }
       list.append(li);
     }
     shown += LIST_STEP;

@@ -24,6 +24,7 @@ import re
 from typing import Any
 from urllib.parse import quote, unquote, urlencode
 
+from . import curation
 from .agent_surface import get_items
 from .brief import _read_only, _warnings
 from .memory import _scope_filter, open_tasks
@@ -236,8 +237,9 @@ def project_page(manifest: dict[str, Any], project: str) -> str:
         tasks = open_tasks(connection, identities, project=name, limit=20)
         facts = _current_facts(connection, identities, project=name)
         events = _recent_events(connection, identities, project=name)
-        notes = connection.execute(
-            "SELECT COUNT(*) FROM documents WHERE deleted_at_utc IS NULL AND project = ?", (name,)).fetchone()[0]
+        hidden = curation.marks(connection).hidden_notes()  # copies hidden in the Atlas
+        notes = sum(1 for (identifier,) in connection.execute(
+            "SELECT id FROM documents WHERE deleted_at_utc IS NULL AND project = ?", (name,)) if identifier not in hidden)
     body = [f"<p class=\"muted\">{notes} indexed notes · "
             + _link("/ui/search?" + urlencode({"project": name}), "search this project") + "</p>", "<h2>Open tasks</h2>"]
     body.append("".join(
@@ -338,6 +340,13 @@ def search_page(manifest: dict[str, Any], query: str | None, project: str | None
     return _page(f"Search: {query}", "".join(body))
 
 
+def _marks_html(item: dict[str, Any]) -> str:
+    """What the operator marked on a record in the Atlas, when anything."""
+    marks = [f"<span class=\"pill\">{label}</span> since {_when(item[key].get('since'))} by {_e(item[key].get('by'))}"
+             for key, label in (("pinned", "pinned to the brief"), ("stale", "stale")) if item.get(key)]
+    return f"<p class=\"muted\">{' · '.join(marks)}</p>" if marks else ""
+
+
 def item_page(manifest: dict[str, Any], identifier: str) -> str | None:
     found = get_items(manifest, [identifier])["items"]
     if not found:
@@ -345,11 +354,12 @@ def item_page(manifest: dict[str, Any], identifier: str) -> str | None:
     item = found[0]
     if item["kind"] == "note":
         body = (f"<p class=\"muted\">{_e(item.get('path'))} · modified {_when(item.get('modified_at_utc'))}</p>"
-                f"<div class=\"card\"><pre>{_e(item.get('text'))}</pre></div>")
+                + _marks_html(item) + f"<div class=\"card\"><pre>{_e(item.get('text'))}</pre></div>")
         return _page(item.get("title") or "Note", body)
     parts = [f"<p class=\"muted\">{_e(item.get('agent'))} · {_when(item.get('recorded_at'))} · "
              f"{_project_link(item.get('project'))} {_task_link(item.get('project'), item.get('task_id'))} · "
              f"<span class=\"pill\">{_e(item.get('category'))}</span></p>",
+             _marks_html(item),
              f"<div class=\"card\"><pre>{_e(item.get('text'))}</pre></div>"]
     if item.get("why"):
         parts.append(f"<h2>Why</h2><div class=\"card\"><pre>{_e(item['why'])}</pre></div>")
