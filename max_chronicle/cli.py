@@ -11,6 +11,7 @@ import sys
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+from . import atlas
 from .automation import JOB_NAMES
 from .bootstrap import bootstrap_legacy
 from .brief import BRIEF_DEFAULT_CHARS, build_brief
@@ -750,6 +751,11 @@ def cmd_embed_prune(args: argparse.Namespace) -> int:
     return _print_json(payload)
 
 
+def cmd_atlas(args: argparse.Namespace) -> int:
+    manifest = _with_db(load_manifest(args.manifest), args.db)
+    return _print_json(atlas.refresh_similar(manifest, full=args.full))
+
+
 def cmd_notes(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     manifest = _with_db(manifest, args.db)
@@ -1197,6 +1203,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_embed_prune.add_argument("--model", required=True, help="Model key of the vectors, e.g. nomic-embed-text")
     p_embed_prune.add_argument("--apply", action="store_true", help="Delete them (default: only count)")
     p_embed_prune.set_defaults(handler=cmd_embed_prune)
+
+    p_atlas = sub.add_parser("atlas", help="The memory map at /ui/atlas")
+    atlas_sub = p_atlas.add_subparsers(dest="atlas_command", required=True)
+    p_atlas_similar = atlas_sub.add_parser(
+        "similar",
+        help="Bring the cached edges by meaning up to date (compares only what was added or changed)",
+    )
+    p_atlas_similar.add_argument("--full", action="store_true", help="Compare every pair again")
+    p_atlas.set_defaults(handler=cmd_atlas)
 
     p_notes = sub.add_parser("notes", help="Index notes written on purpose (FR-10): sync, status, show")
     notes_sub = p_notes.add_subparsers(dest="notes_command", required=True)

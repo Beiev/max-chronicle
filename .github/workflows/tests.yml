@@ -61,3 +61,10 @@ jobs:
           curl -fsS -m 5 http://127.0.0.1:18093/health
           curl -fsS -m 5 "http://127.0.0.1:18093/brief?project=demo" | grep -q "Smoke test decision"
           curl -fsS -m 10 http://127.0.0.1:18093/ui | grep -q "Smoke test decision"
+          # The Atlas ships its page and scripts in the wheel, and maps the record.
+          curl -fsS -m 5 http://127.0.0.1:18093/ui/atlas | grep -q "/ui/static/atlas/main.js"
+          for file in main.js render.js layout.worker.js timeline.js panel.js atlas.css; do
+            curl -fsS -m 5 -o /dev/null "http://127.0.0.1:18093/ui/static/atlas/$file"
+          done
+          curl -fsS -m 10 -o "$RUNNER_TEMP/atlas.json" http://127.0.0.1:18093/ui/api/atlas
+          grep -q "Smoke test decision" "$RUNNER_TEMP/atlas.json"

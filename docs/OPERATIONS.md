@@ -160,6 +160,43 @@ requests. Only this machine is answered: the `Host` must be a loopback name, an
 `Origin` must be the server's own, and a cross-site `Sec-Fetch-Site` is refused.
 Quarantined events never appear.
 
+### Atlas
+
+`/ui/atlas` is the same memory as a map to wander through. Projects are suns,
+tasks rings, events stars, notes pages, fact slots crystals; the colour is the
+project, the brightness how recent. Lines are what the memory records (an event
+in its task, a task in its project, a note linking another note, an event that
+set a fact) and, as a separate layer, resemblance in meaning. A click flies to a
+memory and opens it in full, with its links, backlinks and nearest memories by
+meaning. The river at the bottom is the time machine: drag it to any day, or
+play the memory growing; the facts known on that day are listed beside it.
+Search with `⌘K` or `/`.
+
+The page runs scripts, its own only: they come from the package, nothing from
+another site, and its Content-Security-Policy allows nothing else (`script-src
+'self'`, no inline code). Memory text is always set as text, never as markup.
+The same machine-only checks apply, and the data comes from three JSON routes:
+- `/ui/api/atlas`: nodes, recorded edges and every fact value with its time span;
+- `/ui/api/atlas/similar`: edges by meaning (below);
+- `/ui/api/item?id=event:<id>` or `note:<id>`: one memory in full.
+
+Texts (an event's words, a note's title, a fact's value, a record opened in full)
+are redacted again on the way out; names of projects, tasks and fact slots are
+shown as recorded, as on every page. Quarantined events (the event, or every one
+of its observations) and deleted notes are not on the map, in its records or in
+its edges.
+
+Edges by meaning link each event and note to its three nearest memories at a
+cosine similarity of 0.80 or more (the active embedding model's vectors; a note
+is the mean of its sections), and mark a pair at 0.995 or more as a likely
+duplicate. The first pass compares every pair: about 40 seconds for 4,000
+memories. It runs as its own process, started by the server when the page asks
+and the stored vectors changed, and keeps its result in
+`chronicle-artifacts/atlas/similar.json` (its log beside it). A later pass
+compares only the memories added or changed since, so it takes seconds; the page
+shows the previous edges meanwhile. `chronicle atlas similar` runs a pass by hand
+(`--full` compares every pair again).
+
 
 ## Notes written on purpose
 

@@ -1,6 +1,6 @@
 include README.md INSTALL.md AGENTS.md LICENSE
 recursive-include docs *.md
-recursive-include max_chronicle *.py *.sql *.md
+recursive-include max_chronicle *.py *.sql *.md *.html *.js *.css
 recursive-include tests *.py
 global-exclude *.pyc *.db *.db-wal *.db-shm *.jsonl .env .env.*
 # The synthetic eval fixtures, by name; runtime ledgers stay excluded above.

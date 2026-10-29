@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atlas · Chronicle</title>
+<link rel="stylesheet" href="/ui/static/atlas/atlas.css">
+<script type="module" src="/ui/static/atlas/main.js"></script>
+</head>
+<body>
+<canvas id="sky" aria-hidden="true"></canvas>
+<canvas id="gl" aria-label="Map of the memory"></canvas>
+<canvas id="ink" aria-hidden="true"></canvas>
+
+<header class="bar">
+  <a class="brand glass" href="/ui" title="Back to the overview"><span class="mark" aria-hidden="true"></span><b>Chronicle</b><span class="sub">Atlas</span></a>
+  <button id="search-open" class="search-btn glass" type="button"><span>Search the memory</span><kbd>⌘K</kbd></button>
+  <div id="stats" class="stats glass"></div>
+</header>
+
+<nav id="filters" class="filters" aria-label="What the map shows"></nav>
+<aside id="legend" class="legend glass" aria-label="Projects"></aside>
+
+<div id="tip" class="tip" hidden></div>
+
+<aside id="panel" class="panel glass" aria-hidden="true">
+  <div class="panel-head">
+    <div id="trail" class="trail" aria-label="Your path"></div>
+    <button id="panel-close" class="icon-btn" type="button" title="Close (Esc)">×</button>
+  </div>
+  <div id="panel-body" class="panel-body"></div>
+</aside>
+
+<section id="known" class="known glass" hidden>
+  <h3>Known on <span id="known-date"></span></h3>
+  <ul id="known-list"></ul>
+</section>
+
+<div id="date-big" class="date-big" aria-live="polite"></div>
+
+<footer class="time glass">
+  <div class="time-controls">
+    <button id="play" class="icon-btn play" type="button" title="Play the memory growing (Space)">▶</button>
+    <div id="time-label" class="time-label"></div>
+    <div class="speed" role="group" aria-label="Playback speed">
+      <button type="button" data-speed="1" class="on">1×</button>
+      <button type="button" data-speed="4">4×</button>
+      <button type="button" data-speed="16">16×</button>
+    </div>
+    <button id="now" class="chip now" type="button" hidden>Back to now</button>
+  </div>
+  <canvas id="river" aria-label="Activity over time; drag to travel"></canvas>
+</footer>
+
+<div id="search" class="search" hidden>
+  <div class="search-box" role="dialog" aria-label="Search">
+    <input id="search-input" type="search" placeholder="A task, a note, a decision…" autocomplete="off" spellcheck="false">
+    <ul id="search-results"></ul>
+    <div class="search-hint"><kbd>↑</kbd><kbd>↓</kbd> to move · <kbd>↵</kbd> to fly there · <kbd>esc</kbd> to close</div>
+  </div>
+</div>
+
+<div id="loading" class="loading"><span class="pulse" aria-hidden="true"></span><span id="loading-text">Reading the memory…</span></div>
+<noscript><p class="noscript">The Atlas needs JavaScript. The plain pages are at <a href="/ui">/ui</a>.</p></noscript>
+</body>
+</html>

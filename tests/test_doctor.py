@@ -54,7 +54,9 @@ def test_a_recent_good_backup_is_not_a_warning(loaded_manifest, loaded_automatio
     runtime = doctor.runtime_component(loaded_manifest, loaded_automation, server_url=NOBODY, now=now)
 
     assert runtime["last_good_backup"] is not None
-    assert not any("backup" in warning for warning in runtime["warnings"])
+    # A disk warning names a path under this test's folder, which says "backup"; how
+    # full this machine's disk is says nothing about the backup.
+    assert not [warning for warning in runtime["warnings"] if "backup" in warning and "GB free" not in warning]
 
 
 def test_the_summary_fits_the_answer_on_one_screen() -> None:

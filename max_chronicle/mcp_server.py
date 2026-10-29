@@ -26,9 +26,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from . import __version__, embeddings, viewer
+from . import __version__, atlas, embeddings, viewer
 
 from .automation import load_automation_config
 from .config import (
@@ -579,10 +579,53 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         return JSONResponse({"status": "ok", "pid": os.getpid(),
                              "uptime_s": round(time.time() - _PROCESS_STARTED_AT), **_runtime_health()})
 
+    similar_refresher = atlas.SimilarRefresher(resolved_manifest_path)
+
+    async def route_atlas(request: Request, segments: list[str]) -> Response:
+        # The map is a page of scripts: its files, then JSON for them. The same
+        # machine-only check as every page under /ui, with a policy of its own.
+        headers = atlas.SECURITY_HEADERS
+        match segments:
+            case ["atlas"] | ["atlas", ""]:
+                return Response(atlas.page(), media_type="text/html; charset=utf-8", headers=headers)
+            case ["static", "atlas", name]:
+                found = atlas.static_file(name)
+                if found is None:
+                    return PlainTextResponse("Not found\n", status_code=404, headers=headers)
+                return Response(found[0], media_type=found[1], headers=headers)
+            case ["api", "atlas"]:
+                work = lambda: atlas.graph_payload(manifest())  # noqa: E731
+            case ["api", "atlas", "similar"]:
+                work = lambda: atlas.similar_payload(manifest(), similar_refresher)  # noqa: E731
+            case ["api", "item"]:
+                identifier = request.query_params.get("id", "")
+                work = lambda: atlas.item_payload(manifest(), identifier)  # noqa: E731
+            case _:
+                return PlainTextResponse("Not found\n", status_code=404, headers=headers)
+
+        def encoded() -> bytes | None:
+            # The whole map is most of a megabyte of JSON: encoded off the event loop.
+            payload = work()
+            return None if payload is None else json.dumps(payload, ensure_ascii=False,
+                                                           separators=(",", ":")).encode("utf-8")
+
+        try:
+            with anyio.fail_after(VIEW_TIMEOUT_S):
+                body = await anyio.to_thread.run_sync(encoded, abandon_on_cancel=True, limiter=_get_limiter("ui"))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400, headers=headers)
+        except Exception as exc:  # noqa: BLE001 — the page says the memory is unavailable instead of hanging
+            return JSONResponse({"error": f"Unavailable: {type(exc).__name__}"}, status_code=503, headers=headers)
+        if body is None:
+            return JSONResponse({"error": "Not found"}, status_code=404, headers=headers)
+        return Response(body, media_type="application/json", headers=headers)
+
     async def route_ui(request: Request):
         if not viewer.allowed(request.headers):
             return PlainTextResponse("Forbidden\n", status_code=403)
         segments = viewer.segments_of(request.scope.get("raw_path") or request.url.path)
+        if segments[:1] in (["atlas"], ["static"], ["api"]):
+            return await route_atlas(request, segments)
         query = dict(request.query_params)
         health = _runtime_health()
         try:

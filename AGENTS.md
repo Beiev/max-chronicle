@@ -25,6 +25,8 @@ any operator's personal workspace.
 - `liveness.py`: the HTTP server's event-loop monitor and background embedder.
 - `scheduler.py`: the HTTP server's job scheduler (due occurrences, run keys, retries).
 - `viewer.py`: the read-only web view under `/ui` (server-rendered, no script).
+- `atlas.py` / `ui/atlas/`: the memory map at `/ui/atlas`: the graph, edges by meaning
+  kept in a cache, and a page of plain ES modules (WebGL2, no build step, no CDN).
 - `agent_doc.py`: writes `docs/AGENT_PROTOCOL.md` from the registered tools.
 - `doctor.py`: what `chronicle doctor` reports about the running installation, and its summary.
 - `scaffold.py`: neutral new-workspace templates.
