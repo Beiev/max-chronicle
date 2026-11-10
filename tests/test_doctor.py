@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timedelta, timezone
+import errno
 import json
+import subprocess
 import sys
+from urllib.error import URLError
 
 from max_chronicle import doctor, service
+from max_chronicle.automation import load_automation_config
 from max_chronicle.store import config_from_manifest, open_connection
 
 NOBODY = "http://127.0.0.1:9"  # discard port: nothing answers
@@ -194,3 +199,229 @@ def test_a_missing_backup_root_is_a_warning(loaded_manifest, loaded_automation, 
     runtime = doctor.runtime_component(loaded_manifest, gone, server_url=NOBODY)
 
     assert any("backup root" in warning and "missing" in warning for warning in runtime["warnings"])
+
+
+# ---- a server that is down, and why ----
+
+SERVICE = "com.example.chronicle-mcp"
+
+
+def _launchctl(monkeypatch, *, returncode: int, stdout: str = "") -> list[list[str]]:
+    """launchd as the test says it is: `launchctl print` answers with this code and text."""
+    calls: list[list[str]] = []
+
+    def fake(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, returncode, stdout, "")
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(doctor.subprocess, "run", fake)
+    return calls
+
+
+def test_a_stdio_installation_has_no_server_to_miss(loaded_manifest, loaded_automation) -> None:
+    runtime = doctor.runtime_component(loaded_manifest, loaded_automation, server_url=NOBODY)
+
+    assert runtime["server_expected"] is False and runtime["down"] is False
+    assert runtime["service"] is None
+
+
+def test_an_installation_whose_server_runs_the_jobs_is_down_without_it(loaded_manifest, loaded_automation) -> None:
+    automation = dataclasses.replace(loaded_automation, scheduler_enabled=True)
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert runtime["server_expected"] is True and runtime["down"] is True
+    assert "the HTTP server is not answering" in runtime["warnings"]
+
+
+def test_a_service_missing_from_launchd_is_named_with_the_way_back(monkeypatch, loaded_manifest,
+                                                                    loaded_automation) -> None:
+    """Plist in place and valid, nothing running: two outages of six and eight days looked like this."""
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    automation.launch_agent_dir.mkdir(parents=True, exist_ok=True)
+    plist = automation.launch_agent_dir / f"{SERVICE}.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+    calls = _launchctl(monkeypatch, returncode=113)
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert calls[0][:2] == ["launchctl", "print"] and calls[0][2].endswith(f"/{SERVICE}")
+    assert runtime["service"] == {"label": SERVICE, "plist": str(plist), "plist_exists": True,
+                                  "loaded": False, "pid": None}
+    assert runtime["down"] is True
+    warning = next(w for w in runtime["warnings"] if SERVICE in w)
+    assert f"launchd does not have {SERVICE} loaded (its plist is in place)" in warning
+    assert f"launchctl bootstrap gui/$(id -u) {plist}" in warning and "Login Items" in warning
+
+
+def test_a_service_whose_plist_is_gone_says_so(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    _launchctl(monkeypatch, returncode=113)
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert any("its plist is missing" in w for w in runtime["warnings"])
+
+
+def test_a_loaded_service_that_does_not_answer_is_a_hang(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    _launchctl(monkeypatch, returncode=0, stdout="gui/501/x = {\n\tstate = running\n\tpid = 4242\n}\n")
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert runtime["service"]["loaded"] is True and runtime["service"]["pid"] == 4242
+    assert f"although {SERVICE} runs as pid 4242: a hang" in " ".join(runtime["warnings"])
+
+
+def test_a_loaded_service_with_no_process_points_at_its_log(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    _launchctl(monkeypatch, returncode=0, stdout="gui/501/x = {\n\tstate = waiting\n}\n")
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert runtime["service"]["pid"] is None
+    assert "no process stays up" in " ".join(runtime["warnings"])
+
+
+def test_where_launchd_does_not_exist_the_service_is_not_asked(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert runtime["service"] is None
+    assert runtime["down"] is True and "the HTTP server is not answering" in runtime["warnings"]
+
+
+def test_a_launchctl_that_hangs_is_reported_not_raised(monkeypatch, loaded_manifest, loaded_automation) -> None:
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/bin/{name}")
+
+    def hang(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+
+    monkeypatch.setattr(doctor.subprocess, "run", hang)
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert runtime["service"]["loaded"] is None and "TimeoutExpired" in runtime["service"]["error"]
+
+
+def test_a_probe_this_machine_could_not_send_does_not_blame_the_server(monkeypatch, loaded_manifest,
+                                                                        loaded_automation) -> None:
+    """Out of local ports after 51 days of uptime: connect() failed before it reached a healthy server."""
+    def no_local_port(url, timeout=None):
+        raise URLError(OSError(errno.EADDRNOTAVAIL, "Can't assign requested address"))
+
+    monkeypatch.setattr(doctor, "urlopen", no_local_port)
+    automation = dataclasses.replace(loaded_automation, scheduler_enabled=True)
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url="http://127.0.0.1:8000")
+
+    assert runtime["server"]["answering"] is False and runtime["server"]["blind"] is True
+    assert runtime["down"] is False
+    assert any("could not open a connection to the server" in w and "reboot" in w for w in runtime["warnings"])
+
+
+def test_launchd_saying_the_service_is_gone_outweighs_a_probe_that_could_not_be_sent(monkeypatch, loaded_manifest,
+                                                                                    loaded_automation) -> None:
+    def no_local_port(url, timeout=None):
+        raise URLError(OSError(errno.EADDRNOTAVAIL, "Can't assign requested address"))
+
+    monkeypatch.setattr(doctor, "urlopen", no_local_port)
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    _launchctl(monkeypatch, returncode=113)
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url="http://127.0.0.1:8000")
+
+    assert runtime["server"]["blind"] is True and runtime["down"] is True
+    assert f"launchd does not have {SERVICE} loaded" in " ".join(runtime["warnings"])
+
+
+def test_a_launchd_that_fails_otherwise_is_not_read_as_a_missing_service(monkeypatch, loaded_manifest,
+                                                                         loaded_automation) -> None:
+    """Only launchd's own 'no such service' says not loaded; any other failure says nothing about the service."""
+    automation = dataclasses.replace(loaded_automation, server_launchd_label=SERVICE)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(doctor.subprocess, "run",
+                        lambda args, **kwargs: subprocess.CompletedProcess(args, 1, "", "Operation not permitted"))
+
+    runtime = doctor.runtime_component(loaded_manifest, automation, server_url=NOBODY)
+
+    assert runtime["service"]["loaded"] is None
+    assert "exited 1: Operation not permitted" in runtime["service"]["error"]
+    assert "the HTTP server is not answering" in runtime["warnings"]  # no claim about launchd
+    assert "unknown (launchctl print exited 1" in doctor.render_summary({"status": "critical", "components": {"runtime": runtime}})
+
+
+def test_a_refused_connection_is_not_blind() -> None:
+    assert doctor.server_status(NOBODY)["blind"] is False
+
+
+def test_the_server_s_service_is_named_in_the_automation_config(chronicle_sandbox) -> None:
+    path = chronicle_sandbox.automation_path
+    assert load_automation_config(path).server_launchd_label is None
+
+    path.write_text(path.read_text(encoding="utf-8") + f'\n[server]\nlaunchd_label = "{SERVICE}"\n', encoding="utf-8")
+
+    assert load_automation_config(path).server_launchd_label == SERVICE
+
+
+def test_the_summary_says_down_and_shows_the_service() -> None:
+    summary = doctor.render_summary({"status": "critical", "components": {"runtime": {
+        "package_version": "1.0", "down": True,
+        "server": {"answering": False, "error": "URLError: refused"},
+        "service": {"label": SERVICE, "loaded": False, "plist_exists": True, "pid": None},
+        "warnings": []}}})
+
+    assert "doctor: critical" in summary
+    assert "server     DOWN (URLError: refused)" in summary
+    assert f"service    {SERVICE}: NOT loaded" in summary
+
+
+def _doctor_cli(chronicle_sandbox, monkeypatch, *flags: str) -> int:
+    from max_chronicle import cli
+
+    monkeypatch.setattr(sys, "argv", [
+        "chronicle", "--manifest", str(chronicle_sandbox.manifest_path),
+        "--automation-config", str(chronicle_sandbox.automation_path), "doctor", "--server-url", NOBODY, *flags])
+    return cli.main()
+
+
+def test_a_strict_doctor_fails_when_the_server_that_runs_the_jobs_is_down(chronicle_sandbox, loaded_manifest,
+                                                                          monkeypatch, capsys) -> None:
+    """The doctor was green through a six-day outage: the runtime was reported and never counted."""
+    service.record_event(loaded_manifest, {"agent": "agent-a", "domain": "global", "text": "Something"})
+    path = chronicle_sandbox.automation_path
+    _doctor_cli(chronicle_sandbox, monkeypatch, "--summary", "--strict")
+    quiet = capsys.readouterr().out
+    path.write_text(path.read_text(encoding="utf-8") + "\n[scheduler]\nenabled = true\n", encoding="utf-8")
+
+    code = _doctor_cli(chronicle_sandbox, monkeypatch, "--summary", "--strict")
+    out = capsys.readouterr().out
+
+    # Without a scheduler the same silent server is a warning: this installation needs none.
+    assert "server     not answering" in quiet and "doctor: critical" not in quiet and "server     DOWN" not in quiet
+    assert code == 1
+    assert out.splitlines()[0].endswith("doctor: critical") and "server     DOWN" in out
+
+
+def test_the_json_doctor_counts_the_missing_server(chronicle_sandbox, loaded_manifest, monkeypatch, capsys) -> None:
+    service.record_event(loaded_manifest, {"agent": "agent-a", "domain": "global", "text": "Something"})
+    path = chronicle_sandbox.automation_path
+    _doctor_cli(chronicle_sandbox, monkeypatch)
+    before = json.loads(capsys.readouterr().out)
+    path.write_text(path.read_text(encoding="utf-8") + "\n[scheduler]\nenabled = true\n", encoding="utf-8")
+
+    _doctor_cli(chronicle_sandbox, monkeypatch)
+    after = json.loads(capsys.readouterr().out)
+
+    def counted_elsewhere(payload: dict) -> int:
+        components = payload["components"]
+        return int(components["audit"].get("issue_count", 0)) + int(components["launchd"].get("issue_count", 0))
+
+    assert before["components"]["runtime"]["down"] is False
+    assert before["issue_count"] == counted_elsewhere(before)
+    assert after["status"] == "critical" and after["components"]["runtime"]["down"] is True
+    assert after["issue_count"] == counted_elsewhere(after) + 1  # the missing server is one issue more

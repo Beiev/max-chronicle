@@ -689,18 +689,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     from .doctor import render_summary, runtime_component
 
+    # What is running now. Its warnings are reported, not counted: a stdio-only
+    # installation has no server to answer. A server the installation expects
+    # (it runs the jobs, or its launchd service is named) and does not have is
+    # counted, as critical: the doctor was green through a six-day outage.
+    runtime = runtime_component(manifest, automation, server_url=args.server_url)
     payload = {
-        "status": _doctor_status(audit.get("status"), sources.get("status"), launchd.get("status")),
+        "status": _doctor_status(audit.get("status"), sources.get("status"), launchd.get("status"),
+                                 "critical" if runtime.get("down") else None),
         "generated_at_utc": audit.get("report", {}).get("generated_at_utc"),
         "strict": args.strict,
-        "issue_count": int(audit.get("issue_count", 0)) + int(launchd.get("issue_count", 0)),
+        "issue_count": (int(audit.get("issue_count", 0)) + int(launchd.get("issue_count", 0))
+                        + (1 if runtime.get("down") else 0)),
         "components": {
             "audit": audit,
             "sources_audit": sources,
             "launchd": launchd,
-            # What is running now: reported, not counted in the status, since a
-            # stdio-only installation has no server to answer.
-            "runtime": runtime_component(manifest, automation, server_url=args.server_url),
+            "runtime": runtime,
         },
     }
     if args.summary:

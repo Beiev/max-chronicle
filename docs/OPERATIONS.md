@@ -124,12 +124,23 @@ id = "atlas"
 roots = ["~/code/atlas", "~/code/atlas-worktrees"]
 ```
 
-A session-start hook prints the brief and stays silent when the server is down:
+A session-start hook prints the brief. When the server does not answer, it says
+so and reads the same brief straight from the database, which needs no server:
 
 ```sh
 dir=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-curl -fsS -m 2 --get --data-urlencode "cwd=$dir" http://127.0.0.1:8093/brief 2>/dev/null || true
+curl -fsS -m 2 --get --data-urlencode "cwd=$dir" http://127.0.0.1:8093/brief 2>/dev/null || {
+  echo "Chronicle's server is not answering: tell the user. Its tools will fail;"
+  echo "record with \`chronicle record\`, which writes to the database directly."
+  chronicle brief --cwd "$dir" 2>/dev/null
+}
 ```
+
+Do not end that hook with `|| true` alone. A hook that stays silent makes an
+outage invisible: the agents work without memory, nothing fails, and nobody is
+told. One installation ran that way for six days, and for eight before that.
+A hook worth keeping also remembers when the server last answered, so a session
+that starts on day six says "six days" and tells the user at once.
 
 Claude Code and Codex add a SessionStart hook's plain standard output to the
 session context; Claude Code keeps up to 10,000 characters, above the brief's
@@ -363,7 +374,32 @@ chronicle doctor --summary        # server, jobs, last good backup, disks on one
 
 `chronicle doctor` asks the HTTP server at `CHRONICLE_SERVER_URL`, or else at the
 address the server reads (`MCP_HOST`, `MCP_PORT`, default port 8000); `--server-url`
-overrides both. `--fact-file` accepts the assertion JSON above. Startup defaults to compact source
+overrides both.
+
+A server that does not answer is a warning for an installation that needs none
+(stdio only). It fails the doctor, as `critical` and with exit code 1 under
+`--strict`, when the installation expects one: the server runs the jobs
+(`[scheduler] enabled = true`) or its launchd service is named in the automation
+config:
+
+```toml
+# CHRONICLE_AUTOMATION.toml
+[server]
+launchd_label = "com.example.chronicle-mcp"   # the label in the server's own plist
+```
+
+With the name, the doctor asks launchd and says which of these it is:
+- the service is not loaded although its plist is in place. launchd dropped it
+  from the domain, or macOS refuses it because its background permission was
+  switched off (System Settings, Login Items & Extensions). `KeepAlive` does
+  not cover either, and a valid plist proves nothing;
+- the service is loaded and no process stays up: the server's error log says why;
+- the process runs and does not answer: a hang.
+
+A probe this machine could not send (no local port left, no descriptor) is
+reported as such and blames nobody: the server may be running.
+
+`--fact-file` accepts the assertion JSON above. Startup defaults to compact source
 metadata; `--full` includes full source content. Run `chronicle --help` for optional
 automation and maintenance commands.
 
