@@ -10,12 +10,15 @@ write-ahead log when it closes the database.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import errno
 from http.client import HTTPException
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
+import subprocess
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -30,6 +33,17 @@ SERVER_DEFAULT_PORT = "8000"  # the server's own default (chronicle-mcp without 
 _WILDCARD_HOSTS = {"", "0.0.0.0", "::", "[::]"}
 BACKUP_WARN_DAYS = 3
 DISK_WARN_RATIO = 0.10
+LAUNCHCTL_TIMEOUT_S = 5.0
+LAUNCHCTL_NO_SUCH_SERVICE = 113  # `launchctl print` on a label the domain does not have
+# connect() failed on this side (no local port, descriptor, buffer or route): the
+# request never reached the server, so it says nothing about the server. A Mac
+# ran out of local ports after 51 days of uptime and every probe read as "dead".
+_LOCAL_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, name, None)
+        for name in ("EADDRNOTAVAIL", "EADDRINUSE", "EMFILE", "ENFILE", "ENOBUFS", "ENOMEM", "ENETDOWN", "ENETUNREACH")
+    ) if code is not None
+)
 
 
 def default_server_url() -> str:
@@ -56,7 +70,9 @@ def server_status(url: str) -> dict[str, Any]:
     except HTTPError as exc:  # 503 is a degraded Chronicle; its body still says why
         raw = exc.read()
     except (URLError, OSError, HTTPException) as exc:
-        return {"answering": False, "error": f"{type(exc).__name__}: {exc}"}
+        reason = getattr(exc, "reason", exc)  # urllib wraps the OSError
+        blind = isinstance(reason, OSError) and reason.errno in _LOCAL_ERRNOS
+        return {"answering": False, "error": f"{type(exc).__name__}: {exc}", "blind": blind}
     try:
         body = json.loads(raw.decode("utf-8"))
     except ValueError:
@@ -64,6 +80,54 @@ def server_status(url: str) -> dict[str, Any]:
     if not isinstance(body, dict) or "status" not in body:
         return {"answering": False, "error": f"something else answers at {url}, not a Chronicle server"}
     return {"answering": True, **body}
+
+
+def service_status(label: str | None, agent_dir: Path) -> dict[str, Any] | None:
+    """Whether launchd has the server's service loaded; None where that cannot be asked.
+
+    A service missing from the domain looks configured (its plist is in place and
+    valid) while nothing runs: that state lasted eight days in one outage and six
+    in another. KeepAlive does not cover it, and a reboot does not bring back a
+    service whose background permission was switched off.
+    """
+    if not label or not hasattr(os, "getuid") or shutil.which("launchctl") is None:
+        return None
+    plist = agent_dir / f"{label}.plist"
+    status: dict[str, Any] = {"label": label, "plist": str(plist), "plist_exists": plist.exists(),
+                              "loaded": None, "pid": None}
+    try:
+        result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],  # noqa: S603, S607
+                                capture_output=True, text=True, timeout=LAUNCHCTL_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as exc:
+        status["error"] = f"{type(exc).__name__}: {exc}"
+        return status
+    if result.returncode == 0:
+        status["loaded"] = True
+        pid = re.search(r"^\s*pid = (\d+)$", result.stdout, re.MULTILINE)
+        status["pid"] = int(pid.group(1)) if pid else None
+    elif result.returncode == LAUNCHCTL_NO_SUCH_SERVICE:
+        status["loaded"] = False
+    else:  # launchd could not be asked: that is not an answer about the service
+        status["error"] = f"launchctl print exited {result.returncode}: {(result.stderr or result.stdout).strip()[:200]}"
+    return status
+
+
+def _server_warning(server: dict[str, Any], service: dict[str, Any] | None) -> str:
+    """Why the server does not answer, as far as this machine can tell."""
+    if server.get("blind") and not (service and service.get("loaded") is False):
+        return (f"this machine could not open a connection to the server ({server.get('error')}): "
+                "the server may be running; a Mac that ran out of local ports needs a reboot")
+    if service and service.get("loaded") is False:
+        where = "its plist is in place" if service.get("plist_exists") else "its plist is missing"
+        return (f"the HTTP server is not answering: launchd does not have {service['label']} loaded ({where}). "
+                f"`launchctl bootstrap gui/$(id -u) {service['plist']}` loads it; if that is refused, its "
+                "background permission is off (System Settings, Login Items & Extensions)")
+    if service and service.get("loaded") and service.get("pid") is None:
+        return (f"the HTTP server is not answering: launchd has {service['label']} loaded but no process "
+                "stays up; its error log says why")
+    if service and service.get("pid"):
+        return f"the HTTP server is not answering although {service['label']} runs as pid {service['pid']}: a hang"
+    return "the HTTP server is not answering"
 
 
 def _disk(path: Path) -> dict[str, Any] | None:
@@ -140,8 +204,17 @@ def runtime_component(manifest: dict[str, Any], automation: Any, *, server_url: 
     if component["embedder"]["settings_error"]:
         warnings.append(f"manifest: {component['embedder']['settings_error']}")
     server = component["server"]
+    label = getattr(automation, "server_launchd_label", None)
+    component["service"] = service_status(label, automation.launch_agent_dir)
+    # An installation whose server runs the jobs, or that names the server's
+    # service, expects a server: without one nothing is scheduled, backed up or
+    # served. A stdio-only installation has no server to miss.
+    component["server_expected"] = bool(getattr(automation, "scheduler_enabled", False) or label)
+    # A probe this machine could not send proves nothing, unless launchd itself says the service is gone.
+    proven = not server.get("blind") or (component["service"] or {}).get("loaded") is False
+    component["down"] = bool(component["server_expected"] and not server.get("answering") and proven)
     if not server.get("answering"):
-        warnings.append("the HTTP server is not answering")
+        warnings.append(_server_warning(server, component["service"]))
     elif server.get("status") != "ok" or server.get("db_ok") is False:
         warnings.append(f"the server is {server.get('status')}: {server.get('error') or 'database not ok'}")
     elif server.get("version") and server["version"] != __version__:
@@ -176,7 +249,17 @@ def render_summary(payload: dict[str, Any]) -> str:
             lines.append(f"scheduler  last tick {scheduler.get('last_tick')}"
                          + (f" · last run {last.get('job')} exit {last.get('exit')}" if last else ""))
     else:
-        lines.append(f"server     not answering ({server.get('error', 'unknown')})")
+        lines.append(f"server     {'DOWN' if runtime.get('down') else 'not answering'} "
+                     f"({server.get('error', 'unknown')})")
+    launchd_service = runtime.get("service")
+    if launchd_service:
+        if launchd_service.get("loaded"):
+            state = f"loaded, pid {launchd_service['pid']}" if launchd_service.get("pid") else "loaded, no process"
+        elif launchd_service.get("loaded") is False:
+            state = "NOT loaded" + ("" if launchd_service.get("plist_exists") else ", plist missing")
+        else:
+            state = f"unknown ({launchd_service.get('error', 'launchctl did not answer')})"
+        lines.append(f"service    {launchd_service['label']}: {state}")
     ollama = runtime.get("embedder") or {}
     if ollama:
         if ollama.get("up"):
