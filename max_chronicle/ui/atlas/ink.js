@@ -42,6 +42,7 @@ const SINGLE_NAMES = 28;
  *   projected: Float32Array, fit: number, lights: number, zoom: number, focus: number, hovered: number, hoveredEdge: number,
  *   chosenEdge: number, isolate: number | null, focusMix: number, trail: number[], pins: Set<number>,
  *   rings: Map<number, import("./sky.js").Ring>, inked: number[], span: [number, number],
+ *   hole: {x: number, y: number, r: number, count: number, shows: number} | null,
  *   shown: (i: number) => boolean, lit: (i: number) => boolean,
  * }} View what the page shows this frame; fit is the pixels per world unit when everything fits, lights the scale of
  *   every light, rings the discs the sky drew, inked the edges of the focus drawn here in brass, span the stretch of
@@ -297,6 +298,13 @@ export class Ink {
       if (!places.some((under) => name(i, text, font, fill, { under, plate })) && (rank < 6 || alone)) {
         name(i, text, font, fill, { under: places[0], force: true, plate });
       }
+    }
+    // The hole is named by what circles it, once it is large enough on the screen to be looked at.
+    const hole = view.hole;
+    if (hole && hole.r > 5 && hole.shows > 0.05) {
+      const alpha = 0.8 * hole.shows * clamp((hole.r - 5) / 6, 0, 1);
+      name(0, `${hole.count} stale`, `italic 500 12.5px ${SERIF}`, `rgba(${INK}, ${alpha.toFixed(3)})`,
+           { under: [hole.x, hole.y + hole.r * 3.9 + 14], plate: 0.42 * alpha });
     }
     if (narrowed) return;
 

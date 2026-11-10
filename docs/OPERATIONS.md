@@ -183,10 +183,31 @@ keeps a plain ball. Within a galaxy the oldest memories are the heart and the
 newest the rim, the memories of one task stand on one side, and a galaxy turns
 slowly about its own pole while nothing is held (a memory open, or under the
 pointer). Tasks are ringed points, events stars, notes small squares, fact
-slots diamonds; a decision or a milestone is a bright star with rays. The light
+slots diamonds. The light
 of a memory is the light of its age (warm at the heart, blue-white at the rim)
 with a tone of its project's colour over it. The row under the header is the
 key: it shows each symbol and switches its kind on and off.
+
+Some lights are more than their kind, and each such thing in the sky is a fact
+about the memory:
+
+- **A comet** is a task at work: open, and touched in the last two weeks. Its
+  head is the task; a thin blue tail points away from the sun of its galaxy and
+  a wider one of dust falls behind the way the galaxy turns.
+- **A pulsar** is a record the machinery wrote on its own schedule (a daily
+  summary, a commit, a digest run, maintenance): it beats evenly instead of
+  twinkling.
+- **A double star** is a memory that has a copy: another says the same in
+  nearly the same words, and a small companion circles it.
+- **A bright star**, with four rays, is among the memories joined to the most
+  others by links, facts and resemblance (the top three in a hundred, four
+  others at least). Routine records are never bright stars.
+- **A nova** is a decision: when the time machine passes the day it was made,
+  a ring of light leaves it.
+- **The hole** is where stale memories go. A memory marked stale leaves its
+  galaxy and circles a black hole at the edge of the sky, the oldest nearest
+  and fastest; marked current again, it returns. With nothing stale there is
+  no hole. The hole is named by how many circle it.
 
 Not every light is a memory. The gas of a galaxy, the dust of faint stars
 through it, the bridges between galaxies and the specks between them are drawn
@@ -196,18 +217,41 @@ two galaxies whose memories are joined, by links written in notes and by
 resemblance in meaning, the brighter the more they share. Where two galaxies
 overlap on the screen the nearer lies over the further.
 
+Behind all of it is the far sky, at no distance: only turning moves it. It has
+stars as the night has them (many faint, few bright, most white, some blue,
+yellow or red), the band of a far galaxy seen from inside with its lanes of
+dark dust and its warmer heart, a few faint clouds of colour each in its own
+part of the sky, and far galaxies as smudges. None of it is a memory; it is
+kept fainter than any memory, and it tells a reader who has turned around which
+way they face.
+
 Lines are what the memory records (an event
 in its task, a task in its project, a note linking another note, an event that
 set a fact) and, as a separate layer, resemblance in meaning. The lines inside
 a galaxy show once the reader has come close to it; a memory under the pointer
-shows its own, and a memory that is open holds its lines in brass.
+shows its own, and a memory that is open holds its lines in brass. That a
+memory belongs to a task or a project is drawn only for the memory in focus:
+its place in its galaxy already says it. A task is drawn as a figure instead,
+as a constellation is: from the task to its first memory and on to each next in
+the order they were written. A note that links to very many others (an index)
+has its links drawn faint until the reader is on it.
 
 The memory is laid out in three dimensions. A drag turns the sky around the
 point in view, `Shift`-drag (or the right button) slides it, the wheel comes
 closer to what is under the pointer; a released drag keeps turning for a moment.
 `2` and `3` (or the switch in the header) change between the flat map and the
 sky: the same memory laid out again in the plane. `F` or a double click shows
-all of it. The `?` in the header lists the controls.
+all of it. `I` (or the button beside the `?`) leaves the sky alone on the page:
+the header, the key, the projects and the river step out, a memory still opens
+in its panel, and `I` or `Esc` brings the rest back. The `?` in the header
+lists the controls.
+
+A page opened on no place in particular begins with an overture of a few
+seconds: the memory from its first day to now, the sky filling at an even pace
+as the camera comes in. Any click, key or turn of the wheel ends it; a page
+opened on a memory, a line or a project, and a browser set to reduce motion,
+skip it. Left alone for a quarter of a minute the sky drifts, and with a memory
+open it is a slow walk around that memory.
 
 A click flies to a memory and opens it in full, with its links, backlinks and
 nearest memories by meaning. A click on a line, or on the mark beside a
@@ -271,8 +315,8 @@ when; what holds now is the latest action on each memory, in the order they
 were written. Only the Atlas's events by `operator` count: an agent can record
 the category, not the action. A copy is checked again inside the write, so two
 copies hidden at once as each other's cannot both go. Those events are not on
-the map themselves; their marks show on the memories (a gold halo for a pin, a
-greyer star for a stale one).
+the map themselves; their marks show on the memories (a gold halo for a pin; a
+stale one is greyer and circles the hole).
 
 The page posts to `/ui/api/atlas/action` with the token it got with the map;
 the server also wants its own `Origin` and a JSON body, takes the write slot

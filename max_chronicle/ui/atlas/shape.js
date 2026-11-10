@@ -29,6 +29,11 @@
  * arms trailing. A turn is the same for every memory of a galaxy, so nothing
  * changes its neighbours.
  *
+ * What the operator marked stale leaves its galaxy. Out at the edge of the
+ * room, apart from the galaxies, is a hole, there only once something has been
+ * let go, and the stale memories circle it in a disc: the oldest nearest, each
+ * at its own pace, the near ones faster, as things circle a black hole.
+ *
  * No DOM here: the page asks this module where a memory is drawn, the sky and
  * the gas ask it for the plane of each galaxy, and node:test asks it too.
  */
@@ -39,11 +44,12 @@ import { mulberry32 } from "./model.js";
 /** @typedef {"spiral" | "barred" | "ring" | "lens" | "ball" | "cloud" | "cluster"} Form */
 /**
  * @typedef {{
- *   project: number, sun: number, members: number[], byAge: number[], age: Float32Array, form: Form, disc: boolean,
+ *   project: number, sun: number, all: number[], members: number[], byAge: number[], age: Float32Array, form: Form, disc: boolean,
  *   arms: number, wind: number, bunch: number, bar: number, phase: number, gather: number, wide: number, bulge: number,
  *   thin: number, axes: Vec3, lumps: number[], rate: number, angle: number,
  *   lean: Vec3, n: Vec3, u: Vec3, v: Vec3, reach: number, tall: number,
- * }} Galaxy sun and members are node indexes; byAge is the members from the oldest; age is where each member stands
+ * }} Galaxy sun and members are node indexes; all is every memory of the project and members those not let go;
+ *   byAge is the members from the oldest; age is where each member stands
  *   in that order, 0 the oldest and 1 the newest; n is the pole, u and v the plane; reach is how far from the sun
  *   the galaxy goes in its plane and tall how far off it, as the last shaping left them; angle is how far it has
  *   turned and rate how fast it turns, in radians a second
@@ -74,6 +80,23 @@ const APART = 0.72;
 const SMALL_REACH = 26;
 /** In a ball the memories of one task would stand in a straight row from the heart out; they are swept round by this much, the newest furthest. */
 const SWEEP = 1.7;
+/** How far the shadow of the hole reaches with one memory in it, and how much further with each (by the root of their number). */
+const HOLE_SHADOW = 14;
+const HOLE_GROWS = 1.6;
+/** Where the hole lies from the middle of the suns, as far out as the outermost of them: low and to the left of where the page first looks from, a little nearer the reader. */
+const HOLE_AWAY = unit([-0.87, -0.46, 0.19]);
+const HOLE_OUT = 0.95;
+/** The disc of what circles the hole, from its inner edge to its outer, in shadows; and the room the suns leave it. */
+const HOLE_DISC = /** @type {[number, number]} */ ([1.7, 3.5]);
+const HOLE_ROOM = 4.6;
+/** How fast the inner edge of the disc turns, in radians a second; further out it is slower, as an orbit is. */
+const HOLE_RATE = 0.2;
+/** The pole of the hole's disc: tipped, so that the page first sees it as a ring seen aslant. */
+const HOLE_POLE = unit([0.25, 0.9, 0.35]);
+/**
+ * @typedef {{centre: Vec3, n: Vec3, shadow: number, members: number[]}} Hole where it is, the pole of its disc, how far
+ *   its shadow reaches, and the memories that circle it, the oldest first
+ */
 /** @type {Record<Form, number>} How the memories gather toward the heart: the larger, the nearer the heart the older half lies. */
 const GATHER = { spiral: 1.5, barred: 1.5, ring: 1, lens: 1.3, ball: 1.9, cloud: 1.25, cluster: 2.3 };
 /** @type {Record<Form, number>} How many times wider a galaxy is than the ball the layout left. */
@@ -101,9 +124,18 @@ const smooth = (lo, hi, x) => { const t = Math.min(1, Math.max(0, (x - lo) / (hi
 
 export class Shaper {
   /**
-   * @param {{nodes: {k: string, p: number | null, t?: number | null}[], projectNode: Map<number, number>}} graph
+   * @param {{nodes: {k: string, p: number | null, t?: number | null}[], projectNode: Map<number, number>, stale?: Uint8Array}} graph
    */
   constructor(graph) {
+    this.graph = graph;
+    /** The hole in the middle, once anything has been let go. @type {Hole | null} */ this.hole = null;
+    /** Which nodes circle the hole, and for each how far out (in shadows), where on its circle it began and how fast it goes. */
+    this.fallen = new Uint8Array(graph.nodes.length);
+    this.orbit = new Float32Array(graph.nodes.length * 3);
+    /** What the hole's clock read when each node fell: it circles from then. */
+    this.fell = new Float32Array(graph.nodes.length);
+    /** Seconds the sky has turned. */
+    this.clock = 0;
     /** @type {Map<number, Galaxy>} */ this.galaxies = new Map();
     /** The galaxy each node is a member of. @type {(Galaxy | undefined)[]} */ this.of = new Array(graph.nodes.length);
     /** Every sun, with how deep into the room it is drawn (1 stays out, less comes in). @type {{project: number, sun: number, deep: number}[]} */
@@ -149,7 +181,7 @@ export class Shaper {
         : form === "lens" ? [oval, 1 / oval, 1] : [1, 1, 1];
       /** @type {Galaxy} */
       const galaxy = {
-        project, sun: /** @type {number} */ (graph.projectNode.get(project)), members: list, byAge, age, form, disc,
+        project, sun: /** @type {number} */ (graph.projectNode.get(project)), all: list, members: list, byAge, age, form, disc,
         arms, wind, bunch: arms ? 0.72 : 0, bar: form === "barred" ? 0.3 + more * 0.12 : 0, phase,
         gather: GATHER[form], wide: WIDE[form], bulge: BULGE[form], thin: THIN[form], axes,
         lumps: [1.7 + vary * 1.2, 2.3 + more * 1.1, 1.3 + pick * 1.4, vary * 6.28, more * 6.28, pick * 6.28],
@@ -160,6 +192,35 @@ export class Shaper {
       this.galaxies.set(project, galaxy);
       for (const i of list) this.of[i] = galaxy;
     }
+    this.restale(graph.stale || new Uint8Array(graph.nodes.length));
+  }
+
+  /**
+   * Says again which memories have been let go. They leave their galaxies, whose forms stay as they were read off the
+   * whole project, and circle the hole; with none let go there is no hole.
+   * @param {Uint8Array} stale one per node
+   */
+  restale(stale) {
+    const nodes = this.graph.nodes, when = (/** @type {number} */ i) => nodes[i].t || 0;
+    for (const galaxy of this.galaxies.values()) {
+      galaxy.members = galaxy.all.filter((i) => !stale[i]);
+      galaxy.byAge = [...galaxy.members].sort((a, b) => when(a) - when(b) || a - b);
+      const place = new Map(galaxy.byAge.map((i, rank) => [i, rank / Math.max(galaxy.byAge.length - 1, 1)]));
+      galaxy.age = Float32Array.from(galaxy.members, (i) => /** @type {number} */ (place.get(i)));
+      for (const i of galaxy.all) this.of[i] = stale[i] ? undefined : galaxy;
+    }
+    const members = [...nodes.keys()].filter((i) => stale[i] && nodes[i].k !== "project").sort((a, b) => when(a) - when(b) || a - b);
+    const had = this.fallen;
+    this.fallen = new Uint8Array(nodes.length);
+    members.forEach((i, rank) => {
+      this.fallen[i] = 1;
+      if (!had[i]) this.fell[i] = this.clock;
+      // The oldest nearest the hole; where on its circle each begins is its own, the same on every visit.
+      const out = HOLE_DISC[0] + (HOLE_DISC[1] - HOLE_DISC[0]) * Math.pow((rank + 0.5) / members.length, 0.8);
+      this.orbit.set([out, mulberry32(3301 + i * 17)() * Math.PI * 2, HOLE_RATE * Math.pow(out / HOLE_DISC[0], -1.5)], i * 3);
+    });
+    this.hole = members.length ? { centre: this.hole ? this.hole.centre : [0, 0, 0], n: this.hole ? this.hole.n : HOLE_POLE,
+                                   shadow: HOLE_SHADOW + Math.sqrt(members.length) * HOLE_GROWS, members } : null;
   }
 
   /**
@@ -181,7 +242,7 @@ export class Shaper {
       const sx = laid[galaxy.sun * 3], sy = laid[galaxy.sun * 3 + 1], sz = laid[galaxy.sun * 3 + 2];
       let mean = 0;
       for (const i of galaxy.members) mean += Math.hypot(laid[i * 3] - sx, laid[i * 3 + 1] - sy, laid[i * 3 + 2] - sz);
-      const size = Math.max(mean / galaxy.members.length, 12) * galaxy.wide;
+      const size = Math.max(mean / Math.max(galaxy.members.length, 1), 12) * galaxy.wide;
       galaxy.reach = size * Math.max(galaxy.axes[0], galaxy.axes[1]);
       galaxy.tall = galaxy.disc ? size * (galaxy.bulge + galaxy.thin) : size * galaxy.axes[2];
     }
@@ -193,7 +254,26 @@ export class Shaper {
       at[k * 3 + 1] = my + (laid[sun * 3 + 1] - my) * NEARER * share;
       at[k * 3 + 2] = mz + (laid[sun * 3 + 2] - mz) * NEARER * share;
     });
+    const hole = this.hole;
+    let hx = mx, hy = my, hz = mz;
+    if (hole) {
+      let out = 0;
+      for (let k = 0; k < suns.length; k++) out = Math.max(out, Math.hypot(at[k * 3] - mx, at[k * 3 + 1] - my, at[k * 3 + 2] - mz));
+      const away = deep ? HOLE_AWAY : unit([HOLE_AWAY[0], HOLE_AWAY[1], 0]);
+      hx = mx + away[0] * out * HOLE_OUT; hy = my + away[1] * out * HOLE_OUT; hz = mz + away[2] * out * HOLE_OUT;
+      hole.centre = [hx, hy, hz];
+      hole.n = deep ? HOLE_POLE : [0, 0, 1];
+    }
     for (let pass = 0; pass < 14; pass++) {
+      for (let a = 0; hole && a < suns.length; a++) {
+        // The hole does not give way: a sun that would lie through its disc moves off, all the way.
+        let dx = at[a * 3] - hx, dy = at[a * 3 + 1] - hy, dz = deep ? at[a * 3 + 2] - hz : 0, far = Math.hypot(dx, dy, dz);
+        const need = (room[a] + hole.shadow * HOLE_ROOM) * APART;
+        if (far >= need) continue;
+        if (far < 1e-6) { dx = Math.cos(a * 2.4); dy = Math.sin(a * 2.4); dz = 0; far = 1; }
+        const push = (need - far) / far;
+        at[a * 3] += dx * push; at[a * 3 + 1] += dy * push; at[a * 3 + 2] += dz * push;
+      }
       for (let a = 0; a < suns.length; a++) {
         for (let b = a + 1; b < suns.length; b++) {
           let dx = at[b * 3] - at[a * 3], dy = at[b * 3 + 1] - at[a * 3 + 1], dz = at[b * 3 + 2] - at[a * 3 + 2];
@@ -221,6 +301,16 @@ export class Shaper {
         out[i * 3] = at[with_ * 3] + (laid[i * 3] - laid[sun]) * NEARER;
         out[i * 3 + 1] = at[with_ * 3 + 1] + (laid[i * 3 + 1] - laid[sun + 1]) * NEARER;
         out[i * 3 + 2] = at[with_ * 3 + 2] + (laid[i * 3 + 2] - laid[sun + 2]) * NEARER;
+      }
+    }
+
+    if (hole) {
+      // What has been let go: on its circle about the hole, a little off the plane of the disc.
+      const [u, v] = planeOf(hole.n), n = hole.n;
+      for (const i of hole.members) {
+        const r = this.orbit[i * 3] * hole.shadow, turn = this.orbit[i * 3 + 1], x = Math.cos(turn) * r, y = Math.sin(turn) * r;
+        const h = deep ? (mulberry32(911 + i * 29)() - 0.5) * hole.shadow * 0.3 : 0;
+        for (let a = 0; a < 3; a++) out[i * 3 + a] = hole.centre[a] + u[a] * x + v[a] * y + n[a] * h;
       }
     }
 
@@ -291,9 +381,28 @@ export class Shaper {
     return out;
   }
 
-  /** Lets every galaxy turn for a while. @param {number} seconds */
+  /** Lets every galaxy turn for a while, and what circles the hole go on. @param {number} seconds */
   spin(seconds) {
     for (const galaxy of this.galaxies.values()) galaxy.angle += galaxy.rate * seconds;
+    this.clock += seconds;
+  }
+
+  /**
+   * A point turned about a pole through a centre.
+   * @param {number} x @param {number} y @param {number} z the point, from the centre @param {Vec3} pole @param {number} angle
+   * @returns {Vec3} where it is then, from the centre
+   */
+  static about(x, y, z, pole, angle) {
+    const cos = Math.cos(angle), sin = Math.sin(angle), [nx, ny, nz] = pole;
+    // What lies along the pole stays, the rest goes round it.
+    const along = (nx * x + ny * y + nz * z) * (1 - cos);
+    return [x * cos + (ny * z - nz * y) * sin + nx * along, y * cos + (nz * x - nx * z) * sin + ny * along,
+            z * cos + (nx * y - ny * x) * sin + nz * along];
+  }
+
+  /** How far round the hole a fallen node has gone since it fell. @param {number} i */
+  #round(i) {
+    return this.orbit[i * 3 + 2] * (this.clock - this.fell[i]);
   }
 
   /**
@@ -316,6 +425,14 @@ export class Shaper {
         out[i * 3 + 2] = sz + z * cos + (nx * y - ny * x) * sin + nz * along;
       }
     }
+    const hole = this.hole;
+    if (hole) {
+      const [cx, cy, cz] = hole.centre;
+      for (const i of hole.members) {
+        const at = Shaper.about(shaped[i * 3] - cx, shaped[i * 3 + 1] - cy, shaped[i * 3 + 2] - cz, hole.n, this.#round(i));
+        out[i * 3] = cx + at[0]; out[i * 3 + 1] = cy + at[1]; out[i * 3 + 2] = cz + at[2];
+      }
+    }
     return out;
   }
 
@@ -324,8 +441,12 @@ export class Shaper {
    * @param {Float32Array} shaped @param {number} i @returns {Vec3}
    */
   turned(shaped, i) {
-    const galaxy = this.of[i];
+    const galaxy = this.of[i], hole = this.hole;
     /** @type {Vec3} */ const at = [shaped[i * 3], shaped[i * 3 + 1], shaped[i * 3 + 2]];
+    if (hole && this.fallen[i]) {
+      const [cx, cy, cz] = hole.centre, round = Shaper.about(at[0] - cx, at[1] - cy, at[2] - cz, hole.n, this.#round(i));
+      return [cx + round[0], cy + round[1], cz + round[2]];
+    }
     if (!galaxy || !galaxy.angle) return at;
     const cos = Math.cos(galaxy.angle), sin = Math.sin(galaxy.angle), [nx, ny, nz] = galaxy.n;
     const sx = shaped[galaxy.sun * 3], sy = shaped[galaxy.sun * 3 + 1], sz = shaped[galaxy.sun * 3 + 2];

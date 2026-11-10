@@ -1,11 +1,12 @@
 // @ts-check
 /**
- * WebGL2 renderer for the Atlas: the gas of the galaxies as soft clouds, edges
- * as thin lines of light, memories as small drawn lights (a star, a ringed
- * point, a diamond, a square, a sun).
+ * WebGL2 renderer for the Atlas: the far sky behind everything, the gas of
+ * the galaxies as soft clouds, edges as thin lines of light, memories as small
+ * drawn lights (a star, a ringed point, a diamond, a square, a sun).
  *
  * Positions are in three dimensions and the camera is a matrix and a focal
- * length (camera.js). What lies between the galaxies is drawn first, then the
+ * length (camera.js). The far sky is drawn first (far.js: its band, its
+ * clouds, its stars), then what lies between the galaxies, then the
  * lines, then the galaxies one by one from the furthest to the nearest, each
  * its gas and then its memories. So where two galaxies overlap on the screen
  * the nearer one lies over the further: its gas veils the other's lights, and
@@ -30,6 +31,135 @@
  */
 
 import { mulberry32 } from "./model.js";
+import { farSky, FAR, NEBULAE, BAND_POLE, BAND_ACROSS, BAND_ALONG, BAND_HEART } from "./far.js";
+
+/** The far sky is seen through a wider glass than the memory, so more of it is in the window. */
+const FAR_FOCAL = 0.62;
+/** Radians of far sky for every world unit the target slides: without it the flat map would hang over a painted backdrop. */
+const SLIDE_TURN = 0.00009;
+/** The painted wisps are a square of this many pixels. */
+const WISPS_PX = 512;
+/** @param {number[]} v a vector as GLSL writes it */
+const vec3 = (v) => `vec3(${v.map((value) => value.toFixed(5)).join(", ")})`;
+
+// The deep of the far sky (far.js): the band of a far galaxy seen from inside and the clouds of colour. One triangle
+// over the window; every pixel asks which way it looks.
+const DEEP_VS = `#version 300 es
+uniform vec3 u_right, u_up, u_back;
+uniform vec2 u_k;        // 2 * the far sky's focal / resolution
+out vec3 v_ray;
+void main() {
+  vec2 corner = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+  v_ray = u_right * (corner.x / u_k.x) + u_up * (corner.y / u_k.y) - u_back;
+  gl_Position = vec4(corner, 0.0, 1.0);
+}`;
+
+const DEEP_FS = `#version 300 es
+precision highp float;
+in vec3 v_ray;
+uniform sampler2D u_wisps;
+uniform float u_dim;
+uniform float u_grain;   // radians of far sky to a pixel of the screen
+out vec4 o;
+const float TURN = 6.2831853;
+// The painted wisps, read at the fineness the screen can show: given how many painted pixels go to a radian of sky,
+// the copy of the painting that has about one of its pixels to a pixel of the screen. Read finer, it would glitter
+// as the sky turns. (Said outright and not left to the GPU, which would misjudge it where the band closes its turn.)
+float wisp(vec2 at, float perRadian) { return textureLod(u_wisps, at, max(log2(perRadian * u_grain), 0.0)).r; }
+void main() {
+  vec3 dir = normalize(v_ray);
+  // Where the pixel looks, by the band: how far off its middle, and how far round it.
+  float off = dot(dir, ${vec3(BAND_POLE)});
+  float round_ = atan(dot(dir, ${vec3(BAND_ALONG)}), dot(dir, ${vec3(BAND_ACROSS)}));
+  // The wisps repeat once a turn, so whole numbers of them go round the band with no seam.
+  vec2 at = vec2(round_ / TURN, off * 0.5);
+  float fromHeart = abs(mod(round_ - (${BAND_HEART.toFixed(4)}) + TURN * 1.5, TURN) - TURN * 0.5);
+  float heart = exp(-fromHeart * fromHeart / 0.5);
+  float wide = 0.12 + 0.15 * heart;
+  // A turn of the band is three times as long as the band is read across: the wisps are drawn out along it, a little.
+  float big = wisp(at * vec2(3.0, 5.0), 1280.0), mid = wisp(at * vec2(8.0, 14.0) + 0.37, 3584.0), fine = wisp(at * vec2(23.0, 44.0) + 0.71, 11264.0);
+  float band = exp(-off * off / (wide * wide));
+  float glow = band * (0.22 + 1.05 * big) * (0.4 + 0.9 * mid) * (0.68 + 0.56 * fine) * (0.5 + 1.15 * heart);
+  // lanes of dark dust along the middle of the band
+  float lanes = smoothstep(0.5, 0.76, wisp(at * vec2(5.0, 9.0) + 0.11, 2304.0)) * exp(-off * off / (wide * wide * 0.32));
+  glow *= 1.0 - 0.78 * lanes;
+  // blue-white along the band, the cream of old stars at its heart
+  vec3 col = mix(vec3(0.56, 0.68, 1.0), vec3(1.0, 0.85, 0.66), clamp(heart * 1.3 + (mid - 0.5) * 0.4, 0.0, 1.0)) * glow * 0.17;
+  // a haze far wider than the band, so the night away from it is not one flat black
+  col += vec3(0.1, 0.13, 0.24) * exp(-off * off / 0.4) * 0.1;
+${NEBULAE.map((cloud) => `  {
+    float near = dot(dir, ${vec3(cloud.at)}), rim = ${Math.cos(cloud.reach).toFixed(5)};
+    if (near > rim) {
+      float t = (near - rim) / (1.0 - rim);
+      vec2 p = vec2(dot(dir, ${vec3(cloud.aside)}), dot(dir, ${vec3(cloud.over)})) / ${cloud.reach.toFixed(3)};
+      float torn = smoothstep(0.3, 0.74, wisp(p * 0.8 + vec2(${cloud.seed[0].toFixed(2)}, ${cloud.seed[1].toFixed(2)}), ${((0.8 * WISPS_PX) / cloud.reach).toFixed(1)}));
+      float veins = wisp(p * 2.6 + vec2(${cloud.seed[1].toFixed(2)}, ${cloud.seed[0].toFixed(2)}), ${((2.6 * WISPS_PX) / cloud.reach).toFixed(1)});
+      col += ${vec3(cloud.tint)} * (t * t * (3.0 - 2.0 * t) * torn * (0.45 + veins) * ${cloud.strength.toFixed(3)});
+    }
+  }`).join("\n")}
+  col *= u_dim;
+  // A slow fade on a screen falls into bands; a grain of less than one step, different in every pixel, hides them.
+  vec3 q = fract(vec3(gl_FragCoord.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  col = max(col + (fract((q.x + q.y) * q.z) - 0.5) / 255.0, 0.0);
+  // light laid over the night
+  o = vec4(col, max(col.r, max(col.g, col.b)));
+}`;
+
+// The points of the far sky: its stars and its far galaxies.
+const FAR_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 a_dir;
+layout(location=1) in vec4 a_look;    // red, green, blue, strength
+layout(location=2) in vec2 a_form;    // pixels across, a number of its own
+layout(location=3) in vec2 a_lies;    // how it leans, how flat it lies: a star has no flatness
+uniform vec3 u_right, u_up, u_back;
+uniform vec2 u_k;
+uniform float u_dpr, u_time, u_dim;
+out vec3 v_color;
+out float v_alpha;
+out float v_rayed;
+out vec2 v_lies;
+void main() {
+  // With the depth as w the GPU leaves out what is behind the reader.
+  gl_Position = vec4(dot(u_right, a_dir) * u_k.x, dot(u_up, a_dir) * u_k.y, 0.0, -dot(u_back, a_dir));
+  bool star = a_lies.y <= 0.0, bright = star && a_form.x > 4.1;
+  // Every star twinkles a little in its own time, a bright one more.
+  float twinkle = star ? 1.0 - (bright ? 0.3 : 0.14) * (0.5 + 0.5 * sin(u_time * (0.7 + fract(a_form.y * 7.13) * 2.1) + a_form.y * 6.2831)) : 1.0;
+  v_color = a_look.rgb;
+  v_alpha = a_look.a * twinkle * u_dim;
+  v_rayed = bright ? 1.0 : 0.0;
+  v_lies = a_lies;
+  // A bright star is drawn in a wider square, for its glow and its rays to lie in.
+  gl_PointSize = a_form.x * u_dpr * (bright ? 2.4 : 1.0);
+}`;
+
+const FAR_FS = `#version 300 es
+precision highp float;
+in vec3 v_color;
+in float v_alpha;
+in float v_rayed;
+in vec2 v_lies;
+out vec4 o;
+void main() {
+  vec2 p = gl_PointCoord * 2.0 - 1.0;
+  float d = length(p), light;
+  if (d > 1.0) discard;
+  if (v_lies.y > 0.0) {
+    // a far galaxy: a smudge longer than wide, with a brighter middle
+    float c = cos(v_lies.x), s = sin(v_lies.x);
+    vec2 q = vec2(c * p.x + s * p.y, (c * p.y - s * p.x) / v_lies.y);
+    float d2 = dot(q, q);
+    light = (exp(-d2 * 3.4) * 0.7 + exp(-d2 * 30.0) * 0.6) * (1.0 - smoothstep(0.7, 1.0, d));
+  } else if (v_rayed > 0.5) {
+    float rays = max(exp(-abs(p.x) * 26.0 - abs(p.y) * 3.2), exp(-abs(p.y) * 26.0 - abs(p.x) * 3.2));
+    light = exp(-d * d * 20.0) + (exp(-d * d * 4.5) * 0.16 + rays * 0.26) * (1.0 - smoothstep(0.6, 1.0, d));
+  } else {
+    light = exp(-d * d * 3.2) * (1.0 - smoothstep(0.75, 1.0, d));
+  }
+  light = min(light, 1.0) * v_alpha;
+  o = vec4(v_color * light, light);
+}`;
 
 // The projection the programs share. With w = depth the GPU clips what is
 // behind the camera, lines included.
@@ -61,6 +191,7 @@ layout(location=4) in float a_birth;
 layout(location=5) in float a_last;
 layout(location=6) in float a_seed;
 layout(location=7) in float a_hl;
+layout(location=8) in float a_mark;   // what the light is besides its kind: the sum of its MARKs (model.js)
 uniform float u_dpr, u_time, u_play, u_from, u_travel, u_focus, u_dim, u_focal, u_fit, u_lights, u_maxPoint;
 ${PROJECT}
 out vec3 v_color;
@@ -68,29 +199,41 @@ out float v_alpha;
 out float v_shape;
 out float v_flash;
 out float v_px;
+out float v_seed;
+flat out int v_mark;
 void main() {
   float depth = depthOf(a_pos, gl_Position);
+  int mark = int(a_mark + 0.5);
+  bool routine = (mark & 1) != 0, working = (mark & 4) != 0, hub = (mark & 8) != 0;
   float age = u_play - a_birth;
   float born = smoothstep(-0.5, 0.0, age);
   float flash = u_travel * step(0.0, age) * exp(-age * 1.1);
   float since = max(u_play - min(a_last, u_play), 0.0);
   float glow = mix(0.42, 1.0, exp(-since / 45.0));
-  float twinkle = 0.94 + 0.06 * sin(u_time * (0.5 + fract(a_seed * 7.13)) + a_seed * 6.2831);
+  // A star twinkles a little, each in its own time. A pulsar does not twinkle: it beats, evenly, a short beat
+  // and a long rest, each at a pace of its own.
+  float twinkle = routine
+    ? 0.6 + 0.55 * pow(max(sin(u_time * (1.3 + fract(a_seed * 5.3) * 1.4) + a_seed * 6.2831), 0.0), 10.0)
+    : 0.94 + 0.06 * sin(u_time * (0.5 + fract(a_seed * 7.13)) + a_seed * 6.2831);
   // With something in focus the rest steps back: its own galaxy a little, the others further.
   float keep = a_hl > 0.75 ? 1.0 : mix(1.0, a_hl > 0.25 ? min(u_dim * 2.0, 0.8) : u_dim, u_focus);
   float shown = a_hl < -0.5 ? 0.0 : 1.0;
   // Before the start of the range: memories go dark, suns and tasks stay as a faint frame.
   bool frame = a_shape > 3.5 || (a_shape > 0.5 && a_shape < 1.5);
   float ranged = a_birth >= u_from - 0.01 ? 1.0 : (frame ? 0.3 : 0.0);
-  v_alpha = born * glow * twinkle * keep * shown * ranged * fog(depth);
+  v_alpha = born * glow * twinkle * keep * shown * ranged * fog(depth) * (working ? 1.25 : 1.0);
   v_color = a_color;
   v_shape = a_shape;
   v_flash = flash;
+  v_seed = a_seed;
+  v_mark = mark;
   // What is near is larger, but less than geometry would have it: a sky, not a room.
   float grow = clamp(pow(u_focal / max(depth, NEAR) / u_fit, 0.55), 0.45, 7.0);
   float px = a_size * grow * u_lights * (1.0 + 1.4 * flash) * (a_hl > 1.5 ? 1.45 : 1.0);
-  // A bright star (a decision, a milestone) is drawn in a wider square, for its rays to lie in.
-  if (a_shape > 0.15 && a_shape < 0.5) px *= RAYS;
+  // A bright star (an event or a note) is drawn in a wider square, for its rays to lie in; a comet's head is larger
+  // than a task's point.
+  if (hub && (a_shape < 0.5 || (a_shape > 2.5 && a_shape < 3.5))) px *= RAYS;
+  if (working) px *= 1.35;
   v_px = min(px * 4.0 * u_dpr, u_maxPoint);
   gl_PointSize = v_px * shown * step(0.001, born * ranged);
 }`;
@@ -103,6 +246,9 @@ in float v_alpha;
 in float v_shape;
 in float v_flash;
 in float v_px;
+in float v_seed;
+flat in int v_mark;
+uniform float u_time;
 out vec4 o;
 const vec3 STARLIGHT = vec3(0.925, 0.91, 0.867);
 // 1 inside the edge at r, 0 outside, with a device pixel of softness.
@@ -111,29 +257,56 @@ void main() {
   vec2 p = gl_PointCoord * 2.0 - 1.0;
   float d = length(p);
   if (d > 1.0) discard;
+  bool twin = (v_mark & 2) != 0, working = (v_mark & 4) != 0, hub = (v_mark & 8) != 0, decided = (v_mark & 16) != 0;
   float aa = 2.0 / max(v_px, 2.0);   // one device pixel, in the sprite's own units
   float core;
   float heat = 0.25;              // how far the heart of the light goes from its colour to starlight
   float halo = exp(-d * d * 5.5) * 0.3;
-  if (v_shape < 0.15) {           // event: a star, a point in a small glow
-    core = inside(d, 0.26, aa);
-  } else if (v_shape < 0.5) {     // a decision or a milestone: the same star, with four thin rays as a bright star has
-    core = inside(d, 0.26 / RAYS, aa);
-    float rays = max(exp(-abs(p.x) * 30.0 - abs(p.y) * 3.4), exp(-abs(p.y) * 30.0 - abs(p.x) * 3.4));
-    halo = exp(-d * d * 5.5 * RAYS * RAYS) * 0.34 + rays * 0.5;
-  } else if (v_shape < 1.5) {     // task: a point inside a thin ring
-    core = inside(d, 0.15, aa) + inside(abs(d - 0.5), max(0.05, aa * 0.6), aa) * 0.6;
-    halo *= 0.5;
+  float wide = 1.0;               // how much wider than its light the square is drawn
+  // A bright star is the same light with four thin rays, as a bright star has in a telescope.
+  float rays = max(exp(-abs(p.x) * 30.0 - abs(p.y) * 3.4), exp(-abs(p.y) * 30.0 - abs(p.x) * 3.4));
+  if (v_shape < 0.5) {            // event: a star, a point in a small glow
+    if (hub) {
+      wide = RAYS;
+      halo = exp(-d * d * 5.5 * RAYS * RAYS) * 0.34 + rays * 0.5;
+    }
+    core = inside(d, 0.26 / wide, aa);
+  } else if (v_shape < 1.5) {     // task: a point inside a thin ring; at work, the head of a comet
+    if (working) {
+      core = inside(d, 0.2, aa);
+      halo = exp(-d * d * 4.2) * 0.62;
+      heat = 0.7;
+    } else {
+      core = inside(d, 0.15, aa) + inside(abs(d - 0.5), max(0.05, aa * 0.6), aa) * 0.6;
+      halo *= 0.5;
+    }
   } else if (v_shape < 2.5) {     // fact: a small diamond
     core = inside(abs(p.x) + abs(p.y), 0.44, aa * 1.4);
     halo *= 0.8;
   } else if (v_shape < 3.5) {     // note: a small square, quieter than an event
-    core = inside(max(abs(p.x), abs(p.y)), 0.24, aa) * 0.7;
-    halo *= 0.35;
+    if (hub) {
+      wide = RAYS;
+      core = inside(max(abs(p.x), abs(p.y)), 0.24 / wide, aa) * 0.85;
+      halo = exp(-d * d * 5.5 * RAYS * RAYS) * 0.2 + rays * 0.4;
+    } else {
+      core = inside(max(abs(p.x), abs(p.y)), 0.24, aa) * 0.7;
+      halo *= 0.35;
+    }
   } else {                        // project: a sun, a hot heart in a wide soft glow
     core = inside(d, 0.14, aa * 1.5);
     halo = exp(-d * d * 11.0) * 0.8 + exp(-d * d * 2.6) * 0.34;
     heat = 0.85;
+  }
+  if (twin && v_shape < 3.5) {
+    // A double star: another memory says the same. Its small companion goes round it.
+    float turn = u_time * (0.9 + fract(v_seed * 3.1) * 0.5) + v_seed * 6.2831;
+    vec2 companion = vec2(cos(turn), sin(turn)) * 0.6 / wide;
+    core += inside(length(p - companion), 0.1 / wide, aa) * 0.75;
+  }
+  if (decided && v_flash > 0.02) {
+    // A nova: on the day a decision was made a ring of light leaves it and fades.
+    float reach = mix(0.28, 0.94, 1.0 - v_flash);
+    halo += inside(abs(d - reach), 0.035, aa) * v_flash;
   }
   core = min(core, 1.0);
   halo *= 1.0 - smoothstep(0.7, 1.0, d);   // nothing is left of the glow where its square ends
@@ -186,10 +359,35 @@ in float v_seed;
 in float v_px;
 uniform float u_time;
 uniform sampler2D u_wisps;
+uniform vec3 u_hole;   // the long axis of the hole's disc as it lies on the screen, and how open the disc is to the reader
 out vec4 o;
+// The hole, in a square a few shadows wide (gas.js: HOLE_WIDE): its shadow, which covers what is behind it; the light
+// from behind bent round it into a ring; and its disc of what is falling in, the near half in front of the shadow.
+vec4 hole(vec2 uv, float shows) {
+  const float RS = 1.0 / 4.2;
+  float d = length(uv);
+  vec2 q = vec2(dot(uv, u_hole.xy), dot(uv, vec2(-u_hole.y, u_hole.x)));
+  vec2 inDisc = vec2(q.x, q.y / max(u_hole.z, 0.07));
+  float rd = length(inDisc), around = atan(inDisc.y, inDisc.x);
+  // the disc: brightest near its inner edge, drawn out into streaks that go round
+  float band = smoothstep(RS * 1.3, RS * 1.55, rd) * (1.0 - smoothstep(RS * 2.0, RS * 3.9, rd));
+  float streaks = texture(u_wisps, vec2(around / 6.2831853 * 2.0 - u_time * 0.012, rd * 2.4)).r;
+  // the side that turns toward the reader is the brighter
+  float glow = band * (0.12 + 0.95 * streaks * streaks) * (1.0 + 0.55 * inDisc.x / max(rd, 0.001));
+  float shadow = 1.0 - smoothstep(RS * 0.94, RS, d);
+  float ring = exp(-pow((d - RS * 1.06) / (RS * 0.05), 2.0)) * 0.9
+    + exp(-pow((d - RS * 1.3) / (RS * 0.3), 2.0)) * 0.26 * (0.5 + streaks);
+  // the far half of the disc is behind the shadow
+  float behind = q.y > 0.0 ? 1.0 - shadow : 1.0;
+  float light = min(ring * (1.0 - shadow) + glow * behind, 1.0) * shows;
+  // amber where the light is thin, near white where it is strong
+  vec3 col = mix(vec3(1.0, 0.5, 0.2), vec3(1.0, 0.93, 0.8), clamp(light * light * 1.25, 0.0, 1.0));
+  return vec4(col * light, max(shadow * shows, light));
+}
 void main() {
   float d = length(v_uv);
   if (d >= 1.0) discard;
+  if (v_seed < -1.5) { o = hole(v_uv, v_alpha); return; }
   // a soft round light that is nothing at its rim
   float light = (exp(-d * d * 3.0) - 0.0498) / 0.9502;
   vec3 col = v_color;
@@ -214,8 +412,6 @@ void main() {
   // laid over what is behind it, as every light here is
   o = vec4(min(col, vec3(1.0)) * light, light);
 }`;
-
-const WISPS_PX = 512;
 
 /**
  * The wisps every cloud of gas is cut from, painted once: noise on noise, each layer finer than the last, read
@@ -306,16 +502,21 @@ void main() {
   float depth = depthOf(a_pos, gl_Position);
   float born = smoothstep(-0.5, 0.0, u_play - a_birth) * step(u_from - 0.01, a_since);
   bool lit = a_hl > 0.75;
-  float meaning = a_kind > 3.5 ? (lit ? 1.0 : u_similar) : 1.0;
+  bool byMeaning = a_kind > 3.5 && a_kind < 4.5;
+  // That a memory belongs to a task or a project is drawn only for what is in focus.
+  float belonging = (a_kind < 1.5 && !lit) ? 0.0 : 1.0;
+  float meaning = byMeaning ? (lit ? 1.0 : u_similar) : belonging;
   float keep = a_hl > 0.25 ? 1.0 : mix(1.0, u_dim * 0.5, u_focus);
   // A line the ink draws in brass is not drawn here as well.
   float shown = (a_hl < -0.5 || a_hl > 1.5) ? 0.0 : 1.0;
-  float boost = lit ? (a_kind > 3.5 ? 5.0 : 4.0) : 1.0;
+  float boost = lit ? (byMeaning ? 5.0 : 4.0) : 1.0;
+  // A link of an index is drawn faint among a hundred like it (model.js); lit, it is drawn as any link is.
+  float strength = max(a_color.a * boost, lit && a_kind > 1.5 && a_kind < 2.5 ? 0.34 : 0.0);
   // From afar a galaxy is its lights and its gas; the lines inside it come as the reader comes closer. A line by
   // meaning the reader asked for, and any line that is lit, shows from any distance.
   float nearness = u_focal / max(depth, NEAR) / u_fit;
-  float closeBy = (lit || a_kind > 3.5) ? 1.0 : smoothstep(1.5, 3.6, nearness);
-  v_color = vec4(a_color.rgb, min(a_color.a * boost, 0.7) * born * meaning * keep * shown * closeBy * fog(depth));
+  float closeBy = (lit || byMeaning) ? 1.0 : smoothstep(1.5, 3.6, nearness);
+  v_color = vec4(a_color.rgb, min(strength, 0.7) * born * meaning * keep * shown * closeBy * fog(depth));
   v_along = a_along;
   v_hl = a_hl;
 }`;
@@ -370,9 +571,10 @@ const LAYERS = 4;
 /**
  * @typedef {{res: [number, number], camera: import("./camera.js").Camera, radius: number, dpr: number, time: number,
  *   play: number, from: number, travel: number, focus: number, dim: number, similar: number, lights: number,
- *   order: number[], field: Range}} Frame
+ *   order: number[], field: Range, hole: [number, number, number]}} Frame
  *   lights scales every light: a small window holds the same sky in less room; dim is how much light is left to
- *   what is not in focus; order is the groups from the furthest to the nearest, field the gas that is no galaxy's
+ *   what is not in focus; order is the groups from the furthest to the nearest, field the gas that is no galaxy's;
+ *   hole is the long axis of the hole's disc on the screen and how open the disc lies to the reader
  */
 
 export class Renderer {
@@ -385,6 +587,20 @@ export class Renderer {
     this.edgeProgram = program(gl, EDGE_VS, EDGE_FS);
     this.gasProgram = program(gl, GAS_VS, GAS_FS);
     this.sheetProgram = program(gl, SHEET_VS, SHEET_FS);
+    this.deepProgram = program(gl, DEEP_VS, DEEP_FS);
+    this.farProgram = program(gl, FAR_VS, FAR_FS);
+    // The points of the far sky never change: sent once.
+    const far = farSky();
+    this.farCount = far.count;
+    this.farVao = /** @type {WebGLVertexArrayObject} */ (gl.createVertexArray());
+    gl.bindVertexArray(this.farVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, far.lights, gl.STATIC_DRAW);
+    [[0, 3, 0], [1, 4, 12], [2, 2, 28], [3, 2, 36]].forEach(([loc, size, offset]) => {
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, FAR * 4, offset);
+    });
+    gl.bindVertexArray(null);
     /** The sheet the gas of one layer is drawn into, at a share of the window's sharpness. */
     this.sheet = { frame: gl.createFramebuffer(), image: gl.createTexture(), w: 0, h: 0 };
     /** The painted wisps every cloud of gas is cut from. */
@@ -477,15 +693,15 @@ export class Renderer {
 
   /**
    * @param {{color: Float32Array, size: Float32Array, shape: Float32Array, birth: Float32Array,
-   *   last: Float32Array, seed: Float32Array}} nodes
+   *   last: Float32Array, seed: Float32Array, mark: Float32Array}} nodes
    */
   setNodes(nodes) {
     const gl = this.gl, n = nodes.size.length;
     this.nodeCount = n;
-    const packed = new Float32Array(n * 8);
+    const packed = new Float32Array(n * 9);
     for (let i = 0; i < n; i++) {
       packed.set([nodes.color[i * 3], nodes.color[i * 3 + 1], nodes.color[i * 3 + 2], nodes.size[i],
-                  nodes.shape[i], nodes.birth[i], nodes.last[i], nodes.seed[i]], i * 8);
+                  nodes.shape[i], nodes.birth[i], nodes.last[i], nodes.seed[i], nodes.mark[i]], i * 9);
     }
     gl.bindVertexArray(this.nodeVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.nodePos);
@@ -494,8 +710,8 @@ export class Renderer {
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.nodeStatic);
     gl.bufferData(gl.ARRAY_BUFFER, packed, gl.STATIC_DRAW);
-    const stride = 32;
-    [[1, 3, 0], [2, 1, 12], [3, 1, 16], [4, 1, 20], [5, 1, 24], [6, 1, 28]].forEach(([loc, size, offset]) => {
+    const stride = 36;
+    [[1, 3, 0], [2, 1, 12], [3, 1, 16], [4, 1, 20], [5, 1, 24], [6, 1, 28], [8, 1, 32]].forEach(([loc, size, offset]) => {
       gl.enableVertexAttribArray(loc);
       gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, offset);
     });
@@ -593,6 +809,33 @@ export class Renderer {
       gl.uniform3f(program.uniforms.u_fog, fog[0], fog[1], fog[2]);
     };
 
+    // The far sky first, behind everything: it sees only which way the camera looks, and a slight turn for every
+    // slide of the target. With something in focus it steps back, and stays a sky.
+    const yaw = camera.yaw + (camera.target[0] * camera.right[0] + camera.target[2] * camera.right[2]) * SLIDE_TURN;
+    const pitch = camera.pitch + camera.target[1] * SLIDE_TURN;
+    const cp = Math.cos(pitch), sp = Math.sin(pitch), cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const farK = [(2 * camera.focal * FAR_FOCAL) / f.res[0], (2 * camera.focal * FAR_FOCAL) / f.res[1]], farDim = 1 - 0.4 * f.focus;
+    for (const far of [this.deepProgram, this.farProgram]) {
+      gl.useProgram(far.p);
+      gl.uniform3f(far.uniforms.u_right, cy, 0, -sy);
+      gl.uniform3f(far.uniforms.u_up, -sp * sy, cp, -sp * cy);
+      gl.uniform3f(far.uniforms.u_back, cp * sy, sp, cp * cy);
+      gl.uniform2f(far.uniforms.u_k, farK[0], farK[1]);
+      gl.uniform1f(far.uniforms.u_dim, farDim);
+    }
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.wisps);
+    gl.useProgram(this.deepProgram.p);
+    gl.uniform1i(this.deepProgram.uniforms.u_wisps, 1);
+    gl.uniform1f(this.deepProgram.uniforms.u_grain, 1 / (camera.focal * FAR_FOCAL * f.dpr));
+    gl.bindVertexArray(this.sheetVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.useProgram(this.farProgram.p);
+    gl.uniform1f(this.farProgram.uniforms.u_dpr, f.dpr);
+    gl.uniform1f(this.farProgram.uniforms.u_time, f.time);
+    gl.bindVertexArray(this.farVao);
+    gl.drawArrays(gl.POINTS, 0, this.farCount);
+
     const g = this.gasProgram;
     gl.useProgram(g.p);
     project(g);
@@ -600,6 +843,7 @@ export class Renderer {
     gl.uniform1f(g.uniforms.u_time, f.time);
     gl.uniform1f(g.uniforms.u_window, Math.min(f.res[0], f.res[1]));
     gl.uniform2f(g.uniforms.u_px, 2 / f.res[0], 2 / f.res[1]);
+    gl.uniform3f(g.uniforms.u_hole, f.hole[0], f.hole[1], f.hole[2]);
     // The wisps are read from the second texture slot; the first is the sheet's, when it is laid down.
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.wisps);

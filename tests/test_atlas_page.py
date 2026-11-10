@@ -194,11 +194,12 @@ def test_the_model_reads_the_map_and_takes_the_edges_by_meaning(run) -> None:
     assert out["joined"] == 1 and out["edges"] == 5 and out["explicit"] == 4
     assert out["last"] == {"s": 3, "t": 5, "k": out["similar"], "w": 0.91, "dup": 0}
     assert out["degree"] == [2, 1, 2, 1, 1, 1]  # resemblance adds no weight to a node
-    assert out["ends"] == [2, 0, 3, 2, 4, 0, 5, 1, 3, 5]
-    assert out["edgeBirth"] == [0, 1, 2, 3, 3] and out["edgeKind"] == [1, 0, 1, 1, 4]  # a line is born with its later end
+    # After the edges of the memory comes the figure of its one task: from the task to its one memory.
+    assert out["ends"] == [2, 0, 3, 2, 4, 0, 5, 1, 3, 5, 2, 3]
+    assert out["edgeBirth"] == [0, 1, 2, 3, 3, 1] and out["edgeKind"] == [1, 0, 1, 1, 4, 5]  # a line is born with its later end
     # A range that starts after a memory was written loses its lines too: a line by meaning between days 1 and 3
     # is gone from day 2 on. A task and a project stay as the frame, so the line between them is in every range.
-    assert out["edgeSince"][1:] == [1, 2, 3, 1] and out["edgeSince"][0] > 1e8
+    assert out["edgeSince"][1:] == [1, 2, 3, 1, 1] and out["edgeSince"][0] > 1e8
     assert out["neighboursOfDecided"] == [[2, 0, True]]  # the note went from the map as a copy
 
 
@@ -529,7 +530,10 @@ def test_the_gas_hangs_on_the_memories_and_comes_with_them(run) -> None:
         const edges = [0, 1, 2].map((k) => ({ s: first[0] + k, t: first[3] + k, k: 2, w: 1 }));
         edges.push({ s: first[4], t: first[5], k: 4, w: 0.9 });
         const birth = Float32Array.from(nodes, (node) => node.t / DAY);
-        const world = { ...graph, edges, birth, colorOf: (p) => ["#8db7e0", "#e0a98a", "#a9c98c", "#c3a6e0", "#e3c27e", "#7fc7cc"][p] };
+        // One task of the spiral is at work: a comet.
+        const comet = first[0] + 3, mark = new Float32Array(nodes.length);
+        mark[comet] = 4;
+        const world = { ...graph, edges, birth, mark, colorOf: (p) => ["#8db7e0", "#e0a98a", "#a9c98c", "#c3a6e0", "#e3c27e", "#7fc7cc"][p] };
         const shaper = new Shaper(world), shaped = shaper.shape(new Float32Array(laid), 3), gas = new Gas(world, shaper);
         const runs = [...gas.ranges.values(), ...gas.dust.values(), gas.field].sort((a, b) => a.start - b.start);
         const gapless = runs.every((r, k) => r.start === (k ? runs[k - 1].start + runs[k - 1].count : 0));
@@ -541,8 +545,16 @@ def test_the_gas_hangs_on_the_memories_and_comes_with_them(run) -> None:
         const fromSun = (placed, j) => Math.hypot(...where(placed, j).map((v, k) => v - shaped[spiral.sun * 3 + k]));
         // The last light of a galaxy's gas is the hot middle of its heart: at the sun itself.
         const heart = own.start + own.count - 1;
+        // The last lights of the spiral's dust are the two tails of its comet: sixteen of the blue one, nine of dust.
+        const TAILS = 25, tail = dust.start + dust.count - TAILS;
+        const head = at(shaped, comet), sunAt = at(shaped, spiral.sun), away = head.map((v, k) => v - sunAt[k]), awayLong = Math.hypot(...away);
+        const blue = [], drift = [];
+        for (let j = tail; j < tail + TAILS; j++) {
+          const d = where(now, j).map((v, k) => v - head[k]), along = dot(d, away) / awayLong;
+          (j < tail + 16 ? blue : drift).push([along / spiral.reach, Math.hypot(...d.map((v, k) => v - (away[k] / awayLong) * along)) / spiral.reach]);
+        }
         const dustOff = [];
-        for (let j = dust.start; j < dust.start + dust.count; j++) dustOff.push(Math.hypot(...where(now, j).map((v, k) => v - shaped[gas.anchor[j] * 3 + k])) / spiral.reach);
+        for (let j = dust.start; j < tail; j++) dustOff.push(Math.hypot(...where(now, j).map((v, k) => v - shaped[gas.anchor[j] * 3 + k])) / spiral.reach);
         // On the day the spiral was half written, the gas of what was written later is not there yet.
         gas.updateBorn(352);
         const half = gas.place(shaped, { ...view, play: 352 }).slice();
@@ -571,6 +583,11 @@ def test_the_gas_hangs_on_the_memories_and_comes_with_them(run) -> None:
           unborn, bornThen: bornThen > 0, hidden: hidden[(own.start + 1) * AT + 4], shown: now[(own.start + 1) * AT + 4] > 0,
           bridges: gas.bridges.length, joins: [bridge.pa, bridge.pb], sag: Math.max(...beads),
           travels: [0, 1, 2, 3].some((k) => Math.abs(later[(gas.motes + k) * AT + 4] - now[(gas.motes + k) * AT + 4]) > 0.01),
+          tailOn: [...Array(TAILS).keys()].every((k) => gas.anchor[tail + k] === comet), noHole: gas.hole === null,
+          blueOut: [Math.min(...blue.map((b) => b[0])), Math.max(...blue.map((b) => b[0])), Math.max(...blue.map((b) => b[1]))],
+          driftAside: Math.max(...drift.map((d) => d[1])), driftOut: Math.min(...drift.map((d) => d[0])),
+          streams: [0, 1, 2].some((k) => Math.abs(later[(tail + k) * AT] - now[(tail + k) * AT]) > 1e-3),
+          tailPlain: gas.look[tail * LOOK + 5] < 0 && gas.look[tail * LOOK + 6] > 1e5,
           bridgeHidden: hidden[gas.motes * AT + 4], flatZ: Math.max(...[...flatAt].filter((_, index) => index % AT === 2).slice(0, flatGas.motes).map(Math.abs)),
           finite: [...now].every(Number.isFinite) && [...gas.look].every(Number.isFinite),
         }));
@@ -581,6 +598,11 @@ def test_the_gas_hangs_on_the_memories_and_comes_with_them(run) -> None:
     assert out["heart"] < 1e-3 and 0.1 < out["heartSize"] < 0.2 and out["plain"] and out["wispy"]
     # The dust of stars: many points to a galaxy, each close by a memory, each a point on the screen however near.
     assert out["dust"][0] >= 90 and out["dust"][1] < 0.16 and out["dust"][2] < 2 and out["inReach"]
+    # The comet: both tails hang on the task at work and stream. The blue one runs straight out from the head along
+    # the line from the sun, a quarter of the galaxy's reach at most; the one of dust leaves that line to one side.
+    assert out["tailOn"] and out["streams"] and out["tailPlain"] and out["noHole"]
+    assert 0 < out["blueOut"][0] and out["blueOut"][1] < 0.25 and out["blueOut"][2] < 1e-4
+    assert out["driftAside"] > 0.01 and out["driftOut"] > 0
     # The gas comes with the memories as the time machine plays, and steps back with its galaxy.
     assert out["unborn"] == 0 and out["bornThen"] and out["hidden"] == 0 and out["shown"]
     # One bridge: three links join the spiral and the great ball; one resemblance is not enough for the other pair.
@@ -610,6 +632,53 @@ def test_the_wisps_fill_their_range_and_repeat_at_the_edges(run) -> None:
     assert out["same"]
 
 
+def test_the_far_sky_is_a_night_of_many_faint_stars_and_a_band(run) -> None:
+    out = run("""
+        import { farSky, FAR, NEBULAE, BAND_POLE, BAND_ACROSS, BAND_ALONG, BAND_HEART } from "./far.mjs";
+        const sky = farSky(), again = farSky(), at = (k) => [...sky.lights.slice(k * FAR, k * FAR + 3)];
+        const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let longest = 0, shortest = 9, nearBand = 0, faint = 0, bright = 0, strongest = 0, smallest = 99, flattest = 0;
+        let atHeart = 0, opposite = 0;
+        for (let k = 0; k < sky.stars; k++) {
+          const d = at(k), length = Math.hypot(...d), size = sky.lights[k * FAR + 7], off = Math.abs(dot(d, BAND_POLE));
+          longest = Math.max(longest, length); shortest = Math.min(shortest, length);
+          if (off < 0.17) nearBand++;
+          if (size < 1.6) faint++; else if (size > 4.1) bright++;
+          strongest = Math.max(strongest, sky.lights[k * FAR + 6]); smallest = Math.min(smallest, size);
+          flattest = Math.max(flattest, sky.lights[k * FAR + 10]);
+          if (off > 0.3) continue;
+          // Along the band: how far round from its heart, the short way.
+          const round = Math.atan2(dot(d, BAND_ALONG), dot(d, BAND_ACROSS));
+          const from = Math.abs(((round - BAND_HEART + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+          if (from < 0.6) atHeart++; else if (from > Math.PI - 0.6) opposite++;
+        }
+        const galaxies = [];
+        for (let k = sky.stars; k < sky.count; k++) galaxies.push([Math.abs(dot(at(k), BAND_POLE)), sky.lights[k * FAR + 10], sky.lights[k * FAR + 7]]);
+        console.log(JSON.stringify({
+          floats: [FAR, sky.lights.length / sky.count], stars: sky.stars, count: sky.count, unit: [shortest, longest],
+          nearBand: nearBand / sky.stars, faint: faint / sky.stars, bright: bright / sky.stars, strongest, smallest, flattest, atHeart, opposite,
+          galaxies: [Math.min(...galaxies.map((g) => g[0])), Math.min(...galaxies.map((g) => g[1])), Math.max(...galaxies.map((g) => g[1])), Math.min(...galaxies.map((g) => g[2]))],
+          square: [dot(BAND_POLE, BAND_ACROSS), dot(BAND_POLE, BAND_ALONG), dot(BAND_ACROSS, BAND_ALONG), dot(BAND_POLE, BAND_POLE)],
+          clouds: NEBULAE.map((cloud) => [Math.hypot(...cloud.at) - 1, dot(cloud.at, cloud.aside), dot(cloud.at, cloud.over), dot(cloud.aside, cloud.over)]),
+          faintClouds: NEBULAE.every((cloud) => cloud.strength <= 0.15 && cloud.reach < 0.5),
+          same: sky.lights.every((value, index) => value === again.lights[index]), finite: [...sky.lights].every(Number.isFinite),
+        }));
+    """)
+
+    assert out["floats"] == [11, 11] and out["stars"] == 24000 and out["count"] == 24046
+    assert _near(out["unit"], [1, 1], within=1e-5)  # every light is a direction, at no distance
+    # Half the stars crowd the band: spread evenly, a sixth of them would lie that near its middle.
+    assert out["nearBand"] > 0.4 and out["atHeart"] > 1.5 * out["opposite"]  # and more of them toward its heart
+    # Many faint, few bright; none as strong as a memory, none too small to be drawn; a star is a point, not a smudge.
+    assert out["faint"] > 0.8 and 0.001 < out["bright"] < 0.03 and out["strongest"] < 0.75 and out["smallest"] > 1.1
+    assert out["flattest"] == 0
+    # The far galaxies keep off the band and are each longer than wide.
+    assert out["galaxies"][0] >= 0.2 and 0.2 < out["galaxies"][1] and out["galaxies"][2] < 0.85 and out["galaxies"][3] >= 8
+    assert _near(out["square"], [0, 0, 0, 1], within=1e-6)
+    assert all(_near(cloud, [0, 0, 0, 0], within=1e-6) for cloud in out["clouds"]) and out["faintClouds"]
+    assert out["same"] and out["finite"]  # the same night on every visit
+
+
 def test_a_memory_wears_the_light_of_its_age_and_a_tone_of_its_project(run) -> None:
     out = run("""
         import { Graph } from "./model.mjs";
@@ -621,14 +690,131 @@ def test_a_memory_wears_the_light_of_its_age_and_a_tone_of_its_project(run) -> N
         const old = [...Array(10).keys()].map((k) => 1 + k), young = [...Array(10).keys()].map((k) => 31 + k);
         const spread = Math.max(...old.map((i) => graph.color[i * 3 + 2])) - Math.min(...old.map((i) => graph.color[i * 3 + 2]));
         console.log(JSON.stringify({ youth: [graph.youth[1], graph.youth[40], graph.youth[0]], old: mean(old), young: mean(young), spread,
-                                     shapes: [graph.shape[1], graph.shape[6], graph.shape[0]], finite: [...graph.color].every(Number.isFinite) }));
+                                     shapes: [graph.shape[1], graph.shape[6], graph.shape[0]], decided: [graph.mark[6] & 16, graph.mark[1] & 16],
+                                     finite: [...graph.color].every(Number.isFinite) }));
     """)
 
     assert out["youth"] == [0, 1, 0.5]
     assert out["old"] > out["young"] + 0.05  # the old stars of the heart are warm, the young ones of the rim blue-white
     assert out["spread"] > 0.01  # and no two are one colour
-    assert out["shapes"][0] == 0 and 0.15 < out["shapes"][1] < 0.5 and out["shapes"][2] == 4  # a decision is a bright star
+    # A decision is a star as any event is; that it was decided is a mark on it, for the ring it gives off.
+    assert out["shapes"] == [0, 0, 4] and out["decided"] == [16, 0]
     assert out["finite"]
+
+
+def test_what_a_light_is_besides_its_kind_is_read_off_the_memory(run) -> None:
+    out = run("""
+        import { Graph, MARK, FIGURE } from "./model.mjs";
+        const DAY = 86400, T0 = 1000, END = T0 + 60 * DAY;
+        const nodes = [
+          { id: "p:a", k: "project", l: "alpha", p: 0, t: null, u: null },
+          { id: "t:a/now", k: "task", l: "now", p: 0, t: T0 + 50 * DAY, u: END - DAY, o: 1 },   // open, touched yesterday
+          { id: "t:a/idle", k: "task", l: "idle", p: 0, t: T0, u: T0 + 5 * DAY, o: 1 },         // open, untouched for weeks
+          { id: "t:a/done", k: "task", l: "done", p: 0, t: T0 + 50 * DAY, u: END - DAY },       // touched yesterday, closed
+          { id: "e:d", k: "event", l: "decided", p: 0, t: T0 + 10 * DAY, u: null, c: "decision" },
+          { id: "e:r", k: "event", l: "daybook", p: 0, t: T0 + 11 * DAY, u: null, c: "daily_summary" },
+          { id: "n:index", k: "note", l: "index", p: 0, t: T0 + 12 * DAY, u: null },
+          { id: "e:copy", k: "event", l: "copy", p: 0, t: T0 + 13 * DAY, u: null, c: "note" },
+        ];
+        for (let i = 0; i < 12; i++) nodes.push({ id: "n:" + i, k: "note", l: "n" + i, p: 0, t: T0 + (20 + i) * DAY, u: null });
+        // The task at work has three memories, recorded out of order; the index links to every note; two notes link to each other.
+        const edges = [[10, 1, 0], [8, 1, 0], [9, 1, 0]];
+        for (let i = 0; i < 12; i++) edges.push([6, 8 + i, 2]);
+        edges.push([8, 9, 2]);
+        const graph = new Graph({ nodes, projects: ["alpha"], edges, span: [T0, END] });
+        const first = [...graph.mark];
+        // The daybook resembles five notes; the decision has a copy.
+        graph.addSimilar([0, 1, 2, 3, 4].map((i) => ["e:r", "n:" + i, 0.9, 0]).concat([["e:d", "e:copy", 0.99, 1]]));
+        const buffers = graph.edgeBuffers(), lines = buffers.kind.length;
+        console.log(JSON.stringify({
+          marks: MARK, figure: FIGURE, first: first.slice(0, 8), then: [...graph.mark].slice(0, 8), notes: [...graph.mark].slice(8),
+          figures: graph.figures(), drawn: [...buffers.kind].slice(lines - 3), ends: [...buffers.ends].slice(lines * 2 - 6),
+          ofIndex: buffers.color[3 * 4 + 3], ofPair: buffers.color[15 * 4 + 3],
+        }));
+    """)
+
+    marks = out["marks"]
+    assert marks == {"routine": 1, "twin": 2, "working": 4, "hub": 8, "decided": 16}
+    # A comet is a task open and touched lately, not one left idle and not one closed. A decision is marked as one,
+    # what the machinery wrote as routine, and the memory joined to the most others is the bright star.
+    assert out["first"] == [0, marks["working"], 0, 0, marks["decided"], marks["routine"], marks["hub"], 0]
+    # With the lines by meaning: the decision and its copy are twins. The daybook resembles five notes and is no
+    # bright star for it: the machinery resembles itself.
+    assert out["then"] == [0, marks["working"], 0, 0, marks["decided"] + marks["twin"], marks["routine"], marks["hub"], marks["twin"]]
+    assert set(out["notes"]) == {0}
+    # The figure of a task goes from the task to its first memory and on in the order they were written.
+    assert out["figures"] == [[1, 8], [8, 9], [9, 10]]
+    assert out["drawn"] == [out["figure"]] * 3 and out["ends"] == [1, 8, 8, 9, 9, 10]
+    # A link of the index is one of twelve and is drawn faint; a link between two notes of few links is drawn in full.
+    assert abs(out["ofIndex"] - 0.18 * 5 / 12) < 1e-4 and abs(out["ofPair"] - 0.18) < 1e-4
+
+
+def test_what_was_let_go_circles_a_hole_apart_from_the_galaxies(run) -> None:
+    out = run(_GALAXIES + """
+        import { Gas, LOOK, AT, HOLE_SEED, HOLE_WIDE } from "./gas.mjs";
+        // Three memories of the spiral are stale, one of the project too small for a form, and the one of no project.
+        const gone = [first[0], first[0] + 1, first[0] + 2, first[1], 6], stale = new Uint8Array(nodes.length);
+        for (const i of gone) stale[i] = 1;
+        const raw = new Float32Array(laid), none = new Shaper(graph), shaper = new Shaper({ ...graph, stale });
+        none.shape(raw, 3);
+        const shaped = shaper.shape(raw, 3), hole = shaper.hole, spiral = shaper.galaxies.get(0);
+        const fromHole = (positions, i) => Math.hypot(...at(positions, i).map((v, a) => v - hole.centre[a])) / hole.shadow;
+        const outs = hole.members.map((i) => fromHole(shaped, i));
+        const before = shaper.turn(shaped);
+        // A few seconds: less than half a turn for the nearest, so how far each went can be read off two places.
+        shaper.spin(5);
+        const after = shaper.turn(shaped), one = shaper.turned(shaped, gone[0]);
+        const went = (i) => {
+          const a = at(before, i).map((v, k) => v - hole.centre[k]), b = at(after, i).map((v, k) => v - hole.centre[k]);
+          return Math.acos(Math.max(-1, Math.min(1, dot(a, b) / (Math.hypot(...a) * Math.hypot(...b)))));
+        };
+        const clear = Math.min(...shaper.suns.map(({ sun }) => fromHole(shaped, sun)));
+        const again = new Shaper({ ...graph, stale }).shape(raw, 3);
+        const birth = Float32Array.from(nodes, (node) => node.t / DAY);
+        const world = { ...graph, stale, edges: [], birth, mark: new Float32Array(nodes.length), colorOf: () => "#8db7e0" };
+        const gas = new Gas(world, shaper);
+        gas.updateBorn(400);
+        const placed = gas.place(after, { time: 0, play: 400, flat: false, centre: [0, 0, 0], radius: 900, beside: 1, shows: () => 1, hole: 0.5 });
+        const light = gas.hole.start;
+        const runs = [...gas.ranges.values(), ...gas.dust.values(), gas.field, gas.hole].sort((a, b) => a.start - b.start);
+        const flat = new Shaper({ ...graph, stale }), flatShaped = flat.shape(new Float32Array(laid.map((v, i) => (i % 3 === 2 ? 0 : v))), 2);
+        flat.spin(30);
+        const flatTurned = flat.turn(flatShaped);
+        const report = {
+          noHole: none.hole === null, members: [...hole.members].sort((a, b) => a - b), fallen: gone.every((i) => shaper.fallen[i] === 1),
+          left: [spiral.members.length, spiral.all.length, gone.slice(0, 3).some((i) => spiral.members.includes(i))],
+          forms: [spiral.form === none.galaxies.get(0).form, spiral.arms === none.galaxies.get(0).arms],
+          outs: [Math.min(...outs), Math.max(...outs)], oldestNearest: outs[0] === Math.min(...outs),
+          kept: hole.members.map((i) => fromHole(after, i) - fromHole(before, i)),
+          went: [went(hole.members[0]), went(hole.members[hole.members.length - 1])],
+          one: one.map((v, k) => v - at(after, gone[0])[k]), clear, pole: Math.hypot(...hole.n),
+          same: [...again].every((value, index) => value === shaped[index]), finite: [...after].every(Number.isFinite),
+          light: [placed[light * AT], placed[light * AT + 1], placed[light * AT + 2]].map((v, k) => v - hole.centre[k]),
+          wide: placed[light * AT + 3] / hole.shadow, shows: placed[light * AT + 4], seed: gas.look[light * LOOK + 5],
+          holeSeed: HOLE_SEED, holeWide: HOLE_WIDE, total: runs.reduce((sum, r) => sum + r.count, 0) === gas.count,
+          flatZ: Math.max(...gone.flatMap((i) => [flatShaped[i * 3 + 2], flatTurned[i * 3 + 2]]).map(Math.abs)), flatPole: flat.hole.n,
+        };
+        // Marked current again, they are back in their galaxies and the hole is gone.
+        shaper.restale(new Uint8Array(nodes.length));
+        console.log(JSON.stringify({ ...report, back: [shaper.hole === null, spiral.members.length, shaper.fallen.some((v) => v === 1)] }));
+    """)
+
+    assert out["noHole"]  # with nothing let go there is no hole
+    assert len(out["members"]) == 5 and out["fallen"]
+    # They leave their galaxy; the galaxy keeps the form read off the whole project.
+    assert out["left"] == [237, 240, False] and out["forms"] == [True, True]
+    # In a disc about the hole, the oldest nearest, each a little off the plane.
+    assert 1.6 < out["outs"][0] and out["outs"][1] < 3.6 and out["oldestNearest"]
+    # They circle: as far from the hole as before, the nearest faster than the furthest.
+    assert all(abs(change) < 1e-2 for change in out["kept"]) and out["went"][0] > out["went"][1] > 0.2
+    assert _near(out["one"], [0, 0, 0], within=1e-2)
+    # No sun lies through the hole's disc.
+    assert out["clear"] > 3 and abs(out["pole"] - 1) < 1e-6 and out["same"] and out["finite"]
+    # The hole is one light of its own, where the hole is, a few shadows wide, and shows as much as the page says.
+    assert _near(out["light"], [0, 0, 0]) and abs(out["wide"] - out["holeWide"]) < 1e-3 and out["shows"] == 0.5
+    assert out["seed"] == out["holeSeed"] == -2 and out["total"]
+    assert out["flatZ"] == 0 and out["flatPole"] == [0, 0, 1]
+    assert out["back"] == [True, 240, False]
 
 
 # ---------------------------------------------------------------------------
