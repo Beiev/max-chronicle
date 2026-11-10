@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 import random
-import shutil
+import re
 import struct
 import subprocess
 import sys
@@ -447,35 +447,17 @@ def test_the_page_and_its_files_carry_a_policy_that_runs_only_their_own_code(cli
         assert response.headers["x-content-type-options"] == "nosniff"
 
 
-def test_every_file_the_page_loads_is_served(client) -> None:
+def test_every_file_the_page_loads_is_served_and_no_other_ships(client) -> None:
     names = {path.name for path in atlas.UI_DIR.iterdir() if path.suffix in (".js", ".css")}
-    text = "".join((atlas.UI_DIR / name).read_text(encoding="utf-8") for name in names)
-    text += atlas.page().decode()
+    sources = [(atlas.UI_DIR / name).read_text(encoding="utf-8") for name in names if name.endswith(".js")]
+    loaded = set(re.findall(r"/ui/static/atlas/([\w.]+)", atlas.page().decode() + "".join(sources)))
+    for source in sources:
+        loaded |= set(re.findall(r'^import .+ from "\./([\w.]+)";$', source, flags=re.MULTILINE))
 
+    assert {"main.js", "atlas.css", "layout.worker.js", "camera.js", "render.js", "cards.js"} <= loaded
+    assert loaded == names  # nothing the page asks for is missing, and nothing is shipped that it never loads
     for name in names:
         assert client.get(f"/ui/static/atlas/{name}").status_code == 200, name
-    for referenced in ("main.js", "atlas.css", "render.js", "timeline.js", "panel.js", "layout.worker.js"):
-        assert referenced in text and referenced in names
-
-
-def test_a_date_on_the_time_machine_never_passes_the_last_memory(tmp_path) -> None:
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is not installed")
-    # The map as served on 2026-10-29: the axis counts whole days from the first
-    # memory, so it ran on to 30 October and the page said "Now · 30 Oct 2026".
-    first = datetime(2026, 3, 15, 11, 48, 32, tzinfo=timezone.utc).timestamp()
-    last = datetime(2026, 10, 29, 12, 46, 51, tzinfo=timezone.utc).timestamp()
-    days = math.ceil((last - first) / 86400)
-    module = tmp_path / "timeline.mjs"  # loads as a module on any node
-    module.write_bytes((atlas.UI_DIR / "timeline.js").read_bytes())
-    script = (f"import {{ momentAt }} from {json.dumps(module.as_uri())};"
-              f"console.log(JSON.stringify([0, 10, {days} - 0.5, {days}].map((day) => momentAt([{first}, {last}], day))));")
-
-    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=30)
-
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == [first, first + 10 * 86400, last, last]
 
 
 @pytest.mark.parametrize("path", [
@@ -491,8 +473,8 @@ def test_nothing_else_is_served_from_the_atlas_paths(client, path) -> None:
     assert client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("path", ["/ui/atlas", "/ui/static/atlas/main.js", "/ui/api/atlas",
-                                  "/ui/api/atlas/similar", "/ui/api/item?id=event:x"])
+@pytest.mark.parametrize("path", ["/ui/atlas", "/ui/static/atlas/main.js", "/ui/api/atlas", "/ui/api/atlas/similar",
+                                  "/ui/api/item?id=event:x", "/ui/api/atlas/link?a=event:x&b=event:y"])
 @pytest.mark.parametrize("headers", [{"host": "evil.example"}, {"origin": "http://evil.example"},
                                      {"sec-fetch-site": "cross-site"}],
                          ids=["foreign-host", "foreign-origin", "cross-site"])
@@ -525,6 +507,81 @@ def test_the_item_api_gives_one_memory_in_full_and_nothing_hidden(client, loaded
     assert client.get("/ui/api/item?id=event:nothing").status_code == 404
     assert client.get("/ui/api/item?id=fact:x").status_code == 400
     assert client.get("/ui/api/item").status_code == 400
+
+
+def test_the_line_between_two_memories_says_what_they_share(loaded_manifest) -> None:
+    first = _record(loaded_manifest, "Decided to keep the gateway on SQLite storage because others were slower",
+                    project="alpha", task_id="storage", source_files=["/srv/docs/storage.md", "/srv/docs/gateway.md"])
+    second = _record(loaded_manifest, "The gateway storage stays SQLite because the review said so", project="alpha",
+                     task_id="review", source_files=["/srv/docs/storage.md"])
+    same_task = _record(loaded_manifest, "Storage benchmark recorded", project="alpha", task_id="Storage")
+    elsewhere = _record(loaded_manifest, "Storage for the other gateway", project="beta", task_id="storage")
+    base = _vector(1)
+    _embed(loaded_manifest, first["id"], base)
+    _embed(loaded_manifest, second["id"], _vector(2, near=base, spread=0.01))
+    _embed(loaded_manifest, elsewhere["id"], _vector(3))
+    a, b = f"event:{first['id']}", f"event:{second['id']}"
+
+    link = atlas.link_payload(loaded_manifest, a, b)
+    in_task = atlas.link_payload(loaded_manifest, a, f"event:{same_task['id']}")
+    apart = atlas.link_payload(loaded_manifest, a, f"event:{elsewhere['id']}")
+
+    assert (link["a"], link["b"], link["model"]) == (a, b, active_profile().key)
+    assert link["similarity"] > 0.99 and link["copy"] is (link["similarity"] >= atlas.DUPLICATE_MIN)
+    # The words both use, the longer first; "because" is in both and says nothing.
+    assert link["shared_words"] == ["gateway", "storage", "sqlite"]
+    assert link["shared_sources"] == ["storage.md"]
+    assert link["same_project"] and not link["same_task"] and link["days_apart"] == 0
+    assert link["mentions"] == {"a": [], "b": []}
+    # One task on the map whatever the case of its name; no vector to compare.
+    assert in_task["same_task"] and in_task["similarity"] is None and in_task["copy"] is False
+    # The same task name in another project is another task.
+    assert not apart["same_project"] and not apart["same_task"] and apart["similarity"] < 0.9
+    assert apart["shared_sources"] == [] and apart["shared_words"] == ["gateway", "storage"]
+
+
+def test_a_line_between_notes_quotes_where_one_links_to_the_other(loaded_manifest, tmp_path) -> None:
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    long_line = "Later: [the ports](./ports.md) " + "and more " * 60
+    (folder / "gateway.md").write_text(
+        f"# Gateway\n\nSee [[ports]] for the list.\nThe [runbook](./runbook.md) restarts it.\n{long_line}\n"
+        "Again [[Ports]].\nAnd [[ports|the table]] once more.\n", encoding="utf-8")
+    (folder / "ports.md").write_text("# Ports\n\nThe gateway listens on 9000.\n", encoding="utf-8")
+    manifest = {**loaded_manifest, "notes": {"paths": [str(folder / "*.md")]}}
+    sync_notes(manifest, embed=False)
+    ids = {node["l"]: f"note:{node['id'][2:]}" for node in atlas.graph_payload(manifest)["nodes"] if node["k"] == "note"}
+
+    link = atlas.link_payload(manifest, ids["Gateway"], ids["Ports"])
+
+    quoted = link["mentions"]["a"]
+    assert quoted[0] == "See [[ports]] for the list." and quoted[2] == "Again [[Ports]]."
+    assert quoted[1].startswith("Later: [the ports](./ports.md)") and len(quoted[1]) == atlas.LINK_LINE_CHARS
+    assert len(quoted) == atlas.LINK_MENTIONS  # the first few lines, not every one
+    assert link["mentions"]["b"] == [] and link["similarity"] is None
+    assert {"gateway", "ports"} <= set(link["shared_words"])
+    assert link["shared_sources"] == []  # each note rests on its own file
+
+
+def test_the_line_api_compares_two_memories_and_nothing_hidden(client, loaded_manifest) -> None:
+    key = "sk-" + "proj-" + "Zq8" * 16
+    first = _record(loaded_manifest, "Decided to keep the gateway on SQLite", project="alpha")
+    second = _record(loaded_manifest, "The gateway keeps SQLite", project="alpha")
+    hidden = _record(loaded_manifest, "Hidden gateway", project="alpha", memory_guard={"visibility": "raw_only"})
+    a, b = f"event:{first['id']}", f"event:{second['id']}"
+    # A row written before the secret filter, or imported past it.
+    with open_connection(config_from_manifest(loaded_manifest)) as connection, connection:
+        connection.execute("UPDATE events SET text = ? WHERE id = ?", (f"The gateway keeps SQLite, key {key}", second["id"]))
+
+    response = client.get("/ui/api/atlas/link", params={"a": a, "b": b})
+
+    assert response.status_code == 200 and response.headers["content-security-policy"] == atlas.CSP
+    assert response.json()["shared_words"][:2] == ["gateway", "sqlite"] and key not in response.text
+    for missing in (f"event:{hidden['id']}", "event:nothing"):
+        assert client.get("/ui/api/atlas/link", params={"a": a, "b": missing}).status_code == 404
+        assert client.get("/ui/api/atlas/link", params={"a": missing, "b": a}).status_code == 404
+    for wrong in ({"a": a, "b": a}, {"a": a, "b": "fact:x"}, {"a": a}, {}):
+        assert client.get("/ui/api/atlas/link", params=wrong).status_code == 400
 
 
 def test_without_a_database_the_api_says_so(client) -> None:

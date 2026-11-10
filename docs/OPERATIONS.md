@@ -162,23 +162,52 @@ Quarantined events never appear.
 
 ### Atlas
 
-`/ui/atlas` is the same memory as a map to wander through. Projects are suns,
-tasks rings, events stars, notes pages, fact slots crystals; the colour is the
-project, the brightness how recent. Lines are what the memory records (an event
+`/ui/atlas` is the same memory as a sky to wander through. Projects are suns,
+each in a nebula of its colour with a thin ring around the ball its memories
+form; tasks are ringed points, events stars, notes small squares, fact slots
+diamonds. The colour is the project, the brightness how recent. The row under
+the header is the key: it shows each symbol and switches its kind on and off.
+Lines are what the memory records (an event
 in its task, a task in its project, a note linking another note, an event that
-set a fact) and, as a separate layer, resemblance in meaning. A click flies to a
-memory and opens it in full, with its links, backlinks and nearest memories by
-meaning. The river at the bottom is the time machine: drag it to any day, or
-play the memory growing; the facts known on that day are listed beside it.
-Search with `⌘K` or `/`.
+set a fact) and, as a separate layer, resemblance in meaning.
+
+The memory is laid out in three dimensions. A drag turns the sky around the
+point in view, `Shift`-drag (or the right button) slides it, the wheel comes
+closer to what is under the pointer; a released drag keeps turning for a moment.
+`2` and `3` (or the switch in the header) change between the flat map and the
+sky: the same memory laid out again in the plane. `F` or a double click shows
+all of it. The `?` in the header lists the controls.
+
+A click flies to a memory and opens it in full, with its links, backlinks and
+nearest memories by meaning. A click on a line, or on the mark beside a
+neighbour in the panel, opens the line itself: what kind it is, who drew it and
+when, and, for two events or notes, what they share that a reader can check: the
+resemblance as a number, the words both use, the files both rest on, whether
+they are of one task or project, how far apart they were written, and the lines
+of a note that link to the other.
+
+The river at the bottom is the time machine. Its right handle is the day the
+sky shows; the left one is where the range starts, and memories written before
+it go dark. The wheel zooms the axis around the pointer, a sideways scroll
+slides it, a double click shows all of time. The date above the river opens a
+calendar. The chip beside it opens the stretch of time as a list: how much was
+written, by project, and each memory. Play replays the memory growing; the
+facts known on the day shown are listed beside it. Search with `⌘K` or `/`.
+
+Where the reader is goes into the address after `#`: the memory or the line in
+focus, the day, the start of the range, one project alone, the flat map. A
+reload, the back button and a saved link come back to the same place. The
+layout is kept in the browser between visits (`localStorage`); nothing else is.
 
 The page runs scripts, its own only: they come from the package, nothing from
 another site, and its Content-Security-Policy allows nothing else (`script-src
 'self'`, no inline code). Memory text is always set as text, never as markup.
-The same machine-only checks apply, and the data comes from three JSON routes:
+The same machine-only checks apply, and the data comes from four JSON routes:
 - `/ui/api/atlas`: nodes, recorded edges and every fact value with its time span;
 - `/ui/api/atlas/similar`: edges by meaning (below);
-- `/ui/api/item?id=event:<id>` or `note:<id>`: one memory in full.
+- `/ui/api/item?id=event:<id>` or `note:<id>`: one memory in full;
+- `/ui/api/atlas/link?a=<id>&b=<id>`: what two events or notes share, for the
+  line between them; 404 when either is hidden or gone.
 
 Texts (an event's words, a note's title, a fact's value, a record opened in full)
 are redacted again on the way out; names of projects, tasks and fact slots are

@@ -68,6 +68,21 @@ _WIKILINK = re.compile(r"\[\[([^\]|#\n]+)")
 _MD_LINK = re.compile(r"\]\((?:\./)?([^)\s#]+\.md)\)")
 _DATED_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})[-_]")
 _NOT_ATLAS = f"e.category IS NOT '{curation.CATEGORY}'"
+# What the panel says two memories share: this many words, sources and quoted lines at most.
+LINK_WORDS = 12
+LINK_SOURCES = 8
+LINK_MENTIONS = 3
+LINK_LINE_CHARS = 220
+_WORD = re.compile(r"[^\W\d_]{4,}")
+# Too common to say why two memories resemble each other.
+_COMMON_WORDS = frozenset("""
+this that with from have been were will would could should their there which about after before because into more than
+then them they what when where while your also only just over under each other some such these those does done being
+make made uses used using need needs still every must same both
+этот этого этой этих того чтобы когда если после перед также только было были будет через между более менее может можно
+нужно надо есть либо один одна одно тоже ещё уже или как что так все всё при над под без про для его её их они она оно
+быть этом этому тому теперь потом затем
+""".split())
 _VISIBLE = f"e.visibility != 'raw_only' AND o.visibility != 'raw_only' AND {_NOT_ATLAS}"
 # An event is on the map when neither it nor every one of its observations is
 # quarantined, and it is not one of the Atlas's own.
@@ -626,6 +641,82 @@ SECURITY_HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
+
+
+def _word_counts(item: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for field in ("title", "text", "why"):
+        for word in _WORD.findall(str(item.get(field) or "").lower()):
+            if word not in _COMMON_WORDS:
+                counts[word] = counts.get(word, 0) + 1
+    return counts
+
+
+def _sources(item: dict[str, Any]) -> set[str]:
+    """The files a memory rests on: an event's sources, a note's own file."""
+    found = {str(path) for path in item.get("source_files") or []}
+    if item.get("path"):
+        found.add(str(item["path"]))
+    return found
+
+
+def _mentions(item: dict[str, Any], other: dict[str, Any]) -> list[str]:
+    """The lines of a note that link to another note, as its wikilinks and markdown links name it."""
+    if item.get("kind") != "note" or other.get("kind") != "note":
+        return []
+    stem = PurePath(str(other.get("path") or "")).stem.lower()
+    names = {name for name in (stem, str(other.get("title") or "").strip().lower()) if name}
+    lines: list[str] = []
+    for line in str(item.get("text") or "").splitlines():
+        targets = {target.strip().lower() for target in _WIKILINK.findall(line)}
+        targets |= {PurePath(target).stem.lower() for target in _MD_LINK.findall(line)}
+        if targets & names:
+            lines.append(line.strip()[:LINK_LINE_CHARS])
+            if len(lines) == LINK_MENTIONS:
+                break
+    return lines
+
+
+def link_payload(manifest: dict[str, Any], a: str, b: str) -> dict[str, Any] | None:
+    """What two memories have in common, for the line between them on the map.
+
+    The resemblance is the number the edges by meaning carry. The rest is what a
+    reader can check for himself: the words both use, the files both rest on,
+    whether they share a project and a task, how far apart they were written,
+    and the lines where one note links to the other. Both are read as the panel
+    reads them, redacted and without what is hidden; None when either is.
+    """
+    if a == b:
+        raise ValueError("a and b must be two memories")
+    first, second = item_payload(manifest, a), item_payload(manifest, b)
+    if first is None or second is None:
+        return None
+    model_key = active_profile().key
+    config = config_from_manifest(manifest)
+    with _read_only(config) as connection:
+        similarity = memory_similarity(connection, model_key, a, b)
+    ours, theirs = _word_counts(first), _word_counts(second)
+    shared = sorted(ours.keys() & theirs.keys(), key=lambda word: (-min(ours[word], theirs[word]), -len(word), word))
+    sources = sorted(PurePath(path).name for path in _sources(first) & _sources(second))
+    written = [_epoch(item.get("recorded_at") or item.get("modified_at_utc")) for item in (first, second)]
+    # A project and a task as the map has them: an alias is its project, a task's name is not case-sensitive.
+    identities = config.identities
+    projects = [identities.project(item.get("project")) or item.get("project") for item in (first, second)]
+    tasks = [_task_key(project, item["task_id"]) if item.get("task_id") else None
+             for project, item in zip(projects, (first, second))]
+    return {
+        "a": a,
+        "b": b,
+        "similarity": None if similarity is None else round(similarity, 4),
+        "model": model_key,
+        "copy": similarity is not None and similarity >= DUPLICATE_MIN,
+        "shared_words": shared[:LINK_WORDS],
+        "shared_sources": sources[:LINK_SOURCES],
+        "same_project": bool(projects[0]) and projects[0] == projects[1],
+        "same_task": tasks[0] is not None and tasks[0] == tasks[1],
+        "days_apart": None if None in written else round(abs(written[0] - written[1]) / 86400, 1),
+        "mentions": {"a": _mentions(first, second), "b": _mentions(second, first)},
+    }
 
 
 def page() -> bytes:
