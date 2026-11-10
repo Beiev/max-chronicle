@@ -14,6 +14,8 @@ export const KIND_LABEL = { project: "Project", task: "Task", event: "Event", no
 export const EDGE = { task: 0, project: 1, link: 2, fact: 3, similar: 4 };
 export const EDGE_NAME = ["task", "project", "link", "fact", "similar"];
 const SHAPE = { event: 0, task: 1, fact: 2, note: 3, project: 4 };
+/** An event that is a decision or a milestone: still an event to the renderer (below one half), and one with rays. */
+const BRIGHT_STAR = 0.3;
 // How strongly each kind of line is drawn before anything is in focus. A task
 // and its memories are a constellation, in thin lines. What belongs straight to
 // a project is nearly silent: a thousand such lines are a blot, and the place a
@@ -26,6 +28,15 @@ const UNSCOPED = "#8d93a6";
 /** The night chart's two inks: starlight for what is recorded, brass for what the reader or the meaning adds. */
 export const STARLIGHT = "#ece8dd";
 export const BRASS = "#d8b872";
+/**
+ * The light of stars as it is in a real galaxy: the old ones of the heart warm, the young ones of the rim blue-white.
+ * A memory takes its light from its age within its project, and only a tone of the project's own colour over it:
+ * enough to tell one galaxy from the next, never enough to paint it.
+ */
+const OLD_LIGHT = /** @type {[number, number, number]} */ ([1.0, 0.87, 0.69]);
+const YOUNG_LIGHT = /** @type {[number, number, number]} */ ([0.78, 0.86, 1.0]);
+/** How much of its project's colour each kind of node wears. @type {Record<string, number>} */
+const TONE = { project: 0.5, task: 0.42, event: 0.3, note: 0.24, fact: 0 };
 export const SIMILAR_TINT = BRASS;
 /** The day of what is never before the start of a range. */
 const ALWAYS = 1e9;
@@ -110,6 +121,20 @@ export class Graph {
     this.gone = new Uint8Array(n);
     nodes.forEach((node, i) => { this.pinned[i] = node.pi ? 1 : 0; this.stale[i] = node.st ? 1 : 0; });
 
+    // How young each memory is among those of its project: 0 the oldest, 1 the newest.
+    this.youth = new Float32Array(n).fill(0.5);
+    /** @type {Map<number, number[]>} */ const byProject = new Map();
+    nodes.forEach((node, i) => {
+      if (node.p === null || node.k === "project") return;
+      const list = byProject.get(node.p) || [];
+      list.push(i);
+      byProject.set(node.p, list);
+    });
+    for (const list of byProject.values()) {
+      list.sort((a, b) => (nodes[a].t || 0) - (nodes[b].t || 0) || a - b);
+      list.forEach((i, rank) => { this.youth[i] = list.length > 1 ? rank / (list.length - 1) : 0.5; });
+    }
+
     const random = mulberry32(20261029);
     this.random = random;
     this.birth = new Float32Array(n);
@@ -122,7 +147,8 @@ export class Graph {
       this.birth[i] = node.t === null ? 0 : (node.t - this.span0) / DAY;
       this.last[i] = node.u === null ? this.birth[i] : (node.u - this.span0) / DAY;
       this.seed[i] = random();
-      this.shape[i] = SHAPE[/** @type {keyof typeof SHAPE} */ (node.k)];
+      // A decision or a milestone is a bright star: the renderer gives it rays.
+      this.shape[i] = node.k === "event" && BIG_CATEGORIES.has(node.c || "") ? BRIGHT_STAR : SHAPE[/** @type {keyof typeof SHAPE} */ (node.k)];
       this.paint(i);
     });
   }
@@ -160,13 +186,11 @@ export class Graph {
   /** A node's colour and size; a stale memory is greyer and smaller. @param {number} i */
   paint(i) {
     const node = this.nodes[i];
-    // A project is its own hue; what belongs to it is starlight with that hue in it.
-    let c = rgb(this.colorOf(node.p));
-    const light = rgb(STARLIGHT);
-    if (node.k === "event") c = mix(c, light, 0.42);
-    if (node.k === "note") c = mix(c, light, 0.6);
-    if (node.k === "task") c = mix(c, light, 0.2);
-    if (node.k === "fact") c = mix(c, rgb(BRASS), 0.8);
+    // The light of its age, a little its own (no two stars are one colour), and over it a tone of its project.
+    const hue = rgb(this.colorOf(node.p));
+    const light = mix(OLD_LIGHT, YOUNG_LIGHT, clamp(this.youth[i] * 0.85 + (this.seed[i] - 0.5) * 0.5, 0, 1));
+    let c = mix(node.k === "project" ? OLD_LIGHT : light, hue, TONE[node.k] ?? 0.3);
+    if (node.k === "fact") c = mix(hue, rgb(BRASS), 0.8);
     if (this.stale[i]) c = mix(c, STALE_GREY, 0.6);
     this.color.set(c, i * 3);
     const d = this.degree[i];

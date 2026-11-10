@@ -1,37 +1,39 @@
 // @ts-check
 /**
  * What lies behind the memory: the night, the far sky that turns with the
- * camera, the globe the projects hang on, and around each project a nebula
- * of its colour and a hairline ring.
+ * camera, and the globe the galaxies hang in.
  *
  * The far sky is at no distance at all: only the camera's direction moves it,
  * so turning turns the stars and coming closer does not. Sliding the map turns
  * it a little too, or the flat map would hang over a painted backdrop. It
- * holds scattered dust, a denser band of it along one great circle, and a few
- * very faint clouds along that band.
+ * holds scattered dust, a denser band of it along one great circle, a few
+ * very faint clouds along that band, and far galaxies too small to be more
+ * than a smudge.
  *
  * The globe is three great circles through the middle of the memory, as far
- * out as its outermost suns. A project's ring is the same idea at its own
- * scale: one great circle of the ball its memories form, in a plane of its
- * own. Of both, the half behind the middle is fainter, so a turn of the sky
- * reads as a turn. On the flat map they all lie in the plane.
+ * out as its outermost suns. It shows while the sky turns and all but goes
+ * when it rests: of each circle the half behind the middle is fainter, so a
+ * turn reads as a turn.
+ *
+ * The galaxies themselves are not drawn here: their gas and their memories are
+ * lights in space (gas.js, render.js). This module only measures where each
+ * one lies on the screen, for the names that hang by it.
  */
 
 import { rgb, mulberry32, STARLIGHT } from "./model.js";
+import { planeOf } from "./shape.js";
 
-const DUST = 1000;
-const BAND = 1500;
+const DUST = 1100;
+const BAND = 1700;
 const FAR_CLOUDS = 8;
+const FAR_GALAXIES = 70;
 const SLIDE_TURN = 0.00009; // radians of far sky per world unit the target slides
 const NIGHT = "#05070d";
 const INK = rgb(STARLIGHT).map((v) => Math.round(v * 255)).join(", ");
 const CIRCLE_SEGMENTS = 96;
-const RING_SEGMENTS = 64;
-const ORBIT_MIN_NODES = 8;
-const ORBIT_MIN_PX = 9;
+/** A galaxy smaller than this on the screen is not a place to hang a name from. */
+const BODY_MIN_PX = 9;
 const CLOUD_PX = 192;
-/** A nebula reaches this many times further than the ring it is drawn around. */
-const NEBULA_REACH = 2.3;
 /** The far clouds: cold blues and violets, one green, one rose. */
 const FAR_TINTS = ["#4f6fd0", "#6f5fc4", "#3f8fa6", "#8a5fb8", "#4a78c8", "#b0688f"];
 /** The pole of the band of far dust. */
@@ -40,21 +42,14 @@ const BAND_POLE = unit([0.38, 0.84, -0.39]);
 /**
  * @typedef {[number, number, number]} Vec3
  * @typedef {{centre: Vec3, radius: number}} Globe the middle of the memory and how far out it reaches
- * @typedef {{x: number, y: number, r: number}} Ring where the ball of a project was last drawn, in pixels
- * @typedef {{cloud: HTMLCanvasElement, u: Vec3, v: Vec3}} Dress what a project wears whatever the layout: its nebula and the plane of its ring
+ * @typedef {{x: number, y: number, r: number, rx: number, ry: number}} Ring where a galaxy lies on the screen, in
+ *   pixels: its middle, how far it reaches, and its half width and half height as it is turned to the reader
  */
 
 /** @param {number[]} v @returns {Vec3} */
 function unit(v) {
   const length = Math.hypot(v[0], v[1], v[2]) || 1;
   return [v[0] / length, v[1] / length, v[2] / length];
-}
-
-/** Two directions at right angles to a pole and to each other. @param {Vec3} pole @returns {[Vec3, Vec3]} */
-function planeOf(pole) {
-  const aside = Math.abs(pole[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-  const u = unit([aside[1] * pole[2] - aside[2] * pole[1], aside[2] * pole[0] - aside[0] * pole[2], aside[0] * pole[1] - aside[1] * pole[0]]);
-  return [u, [pole[1] * u[2] - pole[2] * u[1], pole[2] * u[0] - pole[0] * u[2], pole[0] * u[1] - pole[1] * u[0]]];
 }
 
 /** @param {() => number} random @returns {Vec3} a direction, any as likely as another */
@@ -64,7 +59,7 @@ function anywhere(random) {
 }
 
 /**
- * A cloud to draw as a nebula: soft lobes in a few tints, lying along a lean
+ * A cloud to draw far off: soft lobes in a few tints, lying along a lean
  * of its own, fading to nothing before the edge of its square.
  * @param {() => number} random @param {number[][]} tints red, green and blue of each, 0 to 255
  */
@@ -99,12 +94,12 @@ const tint = (hex, toward, t) => rgb(hex).map((v, k) => Math.round(v * 255 + (to
 
 export class Sky {
   /**
-   * @param {HTMLCanvasElement} canvas @param {import("./model.js").Graph} graph
+   * @param {HTMLCanvasElement} canvas @param {import("./shape.js").Shaper} shaper whose galaxies are measured for the names
    */
-  constructor(canvas, graph) {
+  constructor(canvas, shaper) {
     this.canvas = canvas;
     this.ctx = /** @type {CanvasRenderingContext2D} */ (canvas.getContext("2d"));
-    this.graph = graph;
+    this.shaper = shaper;
     const random = mulberry32(20261110);
     const [across, along] = planeOf(BAND_POLE);
     /** @param {Vec3} at @param {boolean} inBand */
@@ -127,12 +122,14 @@ export class Sky {
       return { x: at[0], y: at[1], z: at[2], reach: 0.4 + random() * 0.4, a: 0.1 + random() * 0.1,
                cloud: cloud(random, [tint(hue, [0, 0, 0], 0), tint(hue, [40, 60, 140], 0.4), tint(hue, [0, 0, 0], 0.3)]) };
     });
-    /** @type {{x: number, y: number, z: number, r: number, color: string, p: number, total: number, dress: Dress}[]} */
-    this.orbits = [];
-    /** @type {Map<number, Dress>} */ this.dresses = new Map();
-    /** Where the ball of each project was drawn this frame, for the names that sit under it. @type {Map<number, Ring>} */
+    /** Galaxies too far to be anyone's: a smudge each, longer than wide, a few pixels of it. */
+    this.smudges = Array.from({ length: FAR_GALAXIES }, () => {
+      const at = random() < 0.4 ? inBand(0.5) : anywhere(random), hue = FAR_TINTS[Math.floor(random() * FAR_TINTS.length)];
+      return { x: at[0], y: at[1], z: at[2], long: 2.2 + random() * 4.2, flat: 0.25 + random() * 0.6, lean: random() * Math.PI,
+               a: 0.1 + random() * 0.2, color: tint(hue, [236, 232, 221], 0.45 + random() * 0.4).join(", ") };
+    });
+    /** Where each galaxy lies on the screen this frame, for the names that hang by it. @type {Map<number, Ring>} */
     this.rings = new Map();
-    /** @type {Map<number, number>} */ this.bornShare = new Map();
     this.W = 0; this.H = 0; this.dpr = 1;
   }
 
@@ -143,50 +140,10 @@ export class Sky {
     this.canvas.height = Math.round(H * dpr);
   }
 
-  /** The nebula and the ring plane of a project: made once, the same on every visit. @param {number} project @returns {Dress} */
-  #dress(project) {
-    let dress = this.dresses.get(project);
-    if (!dress) {
-      const random = mulberry32(7000 + project * 31), hue = this.graph.colorOf(project);
-      const [u, v] = planeOf(anywhere(random));
-      dress = { u, v, cloud: cloud(random, [tint(hue, [0, 0, 0], 0), tint(hue, rgb(STARLIGHT).map((c) => c * 255), 0.3), tint(hue, [110, 100, 215], 0.4)]) };
-      this.dresses.set(project, dress);
-    }
-    return dress;
-  }
-
-  /** How far the memories of each project of eight nodes or more keep from its sun. @param {Float32Array} positions */
-  updateOrbits(positions) {
-    const graph = this.graph, nodes = graph.nodes, sums = new Map();
-    for (let i = 0; i < nodes.length; i++) {
-      const p = nodes[i].p, sun = p === null ? undefined : graph.projectNode.get(p);
-      if (p === null || sun === undefined || sun === i) continue;
-      const s = sums.get(p) || { spread: 0, count: 0 };
-      const dx = positions[i * 3] - positions[sun * 3], dy = positions[i * 3 + 1] - positions[sun * 3 + 1],
-            dz = positions[i * 3 + 2] - positions[sun * 3 + 2];
-      s.spread += dx * dx + dy * dy + dz * dz; s.count++;
-      sums.set(p, s);
-    }
-    this.orbits = [...sums.entries()].filter(([, s]) => s.count >= ORBIT_MIN_NODES).map(([p, s]) => {
-      const sun = /** @type {number} */ (graph.projectNode.get(p));
-      const [r, g, b] = rgb(graph.colorOf(p)).map((v) => Math.round(v * 255));
-      return { x: positions[sun * 3], y: positions[sun * 3 + 1], z: positions[sun * 3 + 2],
-               r: Math.sqrt(s.spread / s.count) * 1.1 + 4, color: `${r}, ${g}, ${b}`, p, total: s.count, dress: this.#dress(p) };
-    });
-  }
-
-  /** How much of each project exists on the day the time machine shows. @param {number} play */
-  updateBornShare(play) {
-    const counts = new Map(), nodes = this.graph.nodes, birth = this.graph.birth;
-    for (let i = 0; i < nodes.length; i++) {
-      if (nodes[i].p !== null && nodes[i].k !== "project" && birth[i] <= play) counts.set(nodes[i].p, (counts.get(nodes[i].p) || 0) + 1);
-    }
-    for (const orbit of this.orbits) this.bornShare.set(orbit.p, (counts.get(orbit.p) || 0) / orbit.total);
-  }
-
   /**
    * @param {number} time seconds @param {import("./camera.js").Camera} camera
-   * @param {{focus: number, travel: number, isolate: number | null, globe: Globe | null}} view focus and travel are eased 0..1
+   * @param {{focus: number, turning: number, globe: Globe | null, positions: Float32Array, shown: (i: number) => boolean}} view
+   *   focus and turning are eased 0..1; positions are the nodes as drawn; shown says whether a sun is on the map now
    */
   draw(time, camera, view) {
     const ctx = this.ctx, W = this.W, H = this.H;
@@ -213,7 +170,8 @@ export class Sky {
       if (depth < 0.12) return null;
       return [cx + ((cy * d.x - sy * d.z) / depth) * focal, cyc - ((-sp * sy * d.x + cp * d.y - sp * cy * d.z) / depth) * focal, focal / depth];
     };
-    const dim = 1 - 0.7 * view.focus;
+    // With a memory in focus the rest of the sky steps back, and stays a sky.
+    const dim = 1 - 0.4 * view.focus;
     ctx.globalCompositeOperation = "lighter";
     for (const far of this.far) {
       const at = farAt(far);
@@ -224,6 +182,16 @@ export class Sky {
       ctx.drawImage(far.cloud, at[0] - r, at[1] - r, r * 2, r * 2);
     }
     ctx.globalAlpha = 1;
+    for (const smudge of this.smudges) {
+      const at = farAt(smudge);
+      if (!at || at[0] < -8 || at[0] > W + 8 || at[1] < -8 || at[1] > H + 8) continue;
+      ctx.fillStyle = `rgba(${smudge.color}, ${(smudge.a * dim).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.ellipse(at[0], at[1], smudge.long, smudge.long * smudge.flat, smudge.lean, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = `rgba(${smudge.color}, ${(smudge.a * 1.6 * dim).toFixed(3)})`;
+      ctx.fillRect(at[0] - 0.5, at[1] - 0.5, 1, 1);
+    }
     for (const star of this.dust) {
       const at = farAt(star);
       if (!at || at[0] < -2 || at[0] > W + 2 || at[1] < -2 || at[1] > H + 2) continue;
@@ -234,16 +202,15 @@ export class Sky {
 
     ctx.globalCompositeOperation = "source-over";
     if (view.globe) {
-      ctx.lineWidth = 1;
+      ctx.lineWidth = 0.6;
       const [u, v, w] = /** @type {Vec3[]} */ ([[1, 0, 0], [0, 1, 0], [0, 0, 1]]);
-      const { centre, radius } = view.globe;
+      const { centre, radius } = view.globe, shows = dim * (0.2 + 0.8 * view.turning);
       /** @type {[Vec3, Vec3, number][]} */
       const circles = camera.flat ? [[u, v, radius], [u, v, radius / 2]] : [[u, w, radius], [u, v, radius], [w, v, radius]];
-      for (const [a, b, r] of circles) this.#circle(camera, centre, a, b, r, CIRCLE_SEGMENTS, `rgba(${INK}, ${(0.085 * dim).toFixed(3)})`, `rgba(${INK}, ${(0.035 * dim).toFixed(3)})`);
+      for (const [a, b, r] of circles) this.#circle(camera, centre, a, b, r, CIRCLE_SEGMENTS, `rgba(${INK}, ${(0.11 * shows).toFixed(3)})`, `rgba(${INK}, ${(0.045 * shows).toFixed(3)})`);
     }
-    this.#projects(camera, view, dim);
+    this.#measure(camera, view);
     ctx.globalAlpha = 1;
-    ctx.globalCompositeOperation = "source-over";
   }
 
   /**
@@ -270,41 +237,22 @@ export class Sky {
   }
 
   /**
-   * The nebula of each project, then its ring.
+   * Where each galaxy lies on the screen: a disc as it is turned to the reader, never thinner than it is tall.
    * @param {import("./camera.js").Camera} camera
-   * @param {{travel: number, isolate: number | null}} view @param {number} dim
+   * @param {{positions: Float32Array, shown: (i: number) => boolean}} view
    */
-  #projects(camera, view, dim) {
-    const ctx = this.ctx, W = this.W, H = this.H, at = [0, 0, 0];
-    const here = camera.focal / camera.dist, window = Math.min(W, H);
+  #measure(camera, view) {
+    const at = [0, 0, 0], right = camera.right, up = camera.up, positions = view.positions;
     this.rings.clear();
-    /** @type {{orbit: Sky["orbits"][number], alpha: number}[]} */ const ringed = [];
-    ctx.globalCompositeOperation = "lighter";
-    for (const orbit of this.orbits) {
-      if (!camera.project(orbit.x, orbit.y, orbit.z, at)) continue;
-      const x = at[0], y = at[1], r = orbit.r * at[2], reach = r * NEBULA_REACH;
-      if (x + reach < 0 || x - reach > W || y + reach < 0 || y - reach > H) continue;
-      const share = view.travel > 0.01 ? (this.bornShare.get(orbit.p) || 0) : 1;
-      if (share <= 0) continue;
-      if (r >= ORBIT_MIN_PX) this.rings.set(orbit.p, { x, y, r });
-      const lit = view.isolate === null || view.isolate === orbit.p ? 1 : 0.3;
-      // What is further than the point in view is fainter, as the lights are.
-      const depth = Math.min(1, Math.max(0.35, at[2] / here));
-      const strength = dim * lit * Math.sqrt(share) * depth;
-      // A nebula the reader is inside of is a haze, not a wall: it thins as it outgrows the window.
-      ctx.globalAlpha = Math.min(1, 0.5 * strength * Math.max(0.3, Math.min(1, window / reach)));
-      ctx.drawImage(orbit.dress.cloud, x - reach, y - reach, reach * 2, reach * 2);
-      // A ring wider than the window is no ring any more.
-      const within = Math.min(1, (window * 0.6) / r);
-      if (r >= ORBIT_MIN_PX && strength * within > 0.05) ringed.push({ orbit, alpha: strength * within * within });
-    }
-    ctx.globalAlpha = 1;
-    ctx.globalCompositeOperation = "source-over";
-    ctx.lineWidth = 0.6;
-    const flatU = /** @type {Vec3} */ ([1, 0, 0]), flatV = /** @type {Vec3} */ ([0, 1, 0]);
-    for (const { orbit, alpha } of ringed) {
-      this.#circle(camera, [orbit.x, orbit.y, orbit.z], camera.flat ? flatU : orbit.dress.u, camera.flat ? flatV : orbit.dress.v,
-                   orbit.r, RING_SEGMENTS, `rgba(${orbit.color}, ${(0.42 * alpha).toFixed(3)})`, `rgba(${orbit.color}, ${(0.16 * alpha).toFixed(3)})`);
+    for (const [project, galaxy] of this.shaper.galaxies) {
+      const sun = galaxy.sun * 3;
+      if (!view.shown(galaxy.sun) || !camera.project(positions[sun], positions[sun + 1], positions[sun + 2], at)) continue;
+      const scale = at[2], r = galaxy.reach * scale, tall = galaxy.tall * scale;
+      if (r < BODY_MIN_PX) continue;
+      const { u, v } = galaxy;
+      const ux = u[0] * right[0] + u[1] * right[1] + u[2] * right[2], uy = u[0] * up[0] + u[1] * up[1] + u[2] * up[2];
+      const vx = v[0] * right[0] + v[1] * right[1] + v[2] * right[2], vy = v[0] * up[0] + v[1] * up[1] + v[2] * up[2];
+      this.rings.set(project, { x: at[0], y: at[1], r, rx: Math.max(Math.hypot(ux, vx) * r, tall), ry: Math.max(Math.hypot(uy, vy) * r, tall) });
     }
   }
 }

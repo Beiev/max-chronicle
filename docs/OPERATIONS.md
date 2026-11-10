@@ -173,14 +173,34 @@ Quarantined events never appear.
 
 ### Atlas
 
-`/ui/atlas` is the same memory as a sky to wander through. Projects are suns,
-each in a nebula of its colour with a thin ring around the ball its memories
-form; tasks are ringed points, events stars, notes small squares, fact slots
-diamonds. The colour is the project, the brightness how recent. The row under
-the header is the key: it shows each symbol and switches its kind on and off.
+`/ui/atlas` is the same memory as a sky to wander through. Every project is a
+galaxy around its sun, and the kind of galaxy is read off the project: a large
+one still being written is a spiral (three arms when its tasks are many, some
+with a bar), a large one gone quiet a great ball; a middling one a barred
+spiral or a ring while it is written and a lens once it is quiet; a small one a
+cloud, or a tight cluster once quiet. A project of fewer than eight memories
+keeps a plain ball. Within a galaxy the oldest memories are the heart and the
+newest the rim, the memories of one task stand on one side, and a galaxy turns
+slowly about its own pole while nothing is held (a memory open, or under the
+pointer). Tasks are ringed points, events stars, notes small squares, fact
+slots diamonds; a decision or a milestone is a bright star with rays. The light
+of a memory is the light of its age (warm at the heart, blue-white at the rim)
+with a tone of its project's colour over it. The row under the header is the
+key: it shows each symbol and switches its kind on and off.
+
+Not every light is a memory. The gas of a galaxy, the dust of faint stars
+through it, the bridges between galaxies and the specks between them are drawn
+from the memories and cannot be pointed at: the gas and the dust lie where the
+memories lie and come with them as the time machine plays, and a bridge joins
+two galaxies whose memories are joined, by links written in notes and by
+resemblance in meaning, the brighter the more they share. Where two galaxies
+overlap on the screen the nearer lies over the further.
+
 Lines are what the memory records (an event
 in its task, a task in its project, a note linking another note, an event that
-set a fact) and, as a separate layer, resemblance in meaning.
+set a fact) and, as a separate layer, resemblance in meaning. The lines inside
+a galaxy show once the reader has come close to it; a memory under the pointer
+shows its own, and a memory that is open holds its lines in brass.
 
 The memory is laid out in three dimensions. A drag turns the sky around the
 point in view, `Shift`-drag (or the right button) slides it, the wheel comes
