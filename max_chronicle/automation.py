@@ -60,6 +60,10 @@ class AutomationConfig:
     backup_retention: RetentionPolicy = RetentionPolicy()
     # The server runs the jobs on schedule; launchd keeps only the server.
     scheduler_enabled: bool = False
+    # The launchd service that keeps the HTTP server alive ([server] launchd_label).
+    # Its plist is the installation's own, so only the installation can name it;
+    # with the name, `chronicle doctor` says whether launchd has it loaded.
+    server_launchd_label: str | None = None
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -112,6 +116,7 @@ def load_automation_config(path: Path | None = None) -> AutomationConfig:
         },
         backup_retention=RetentionPolicy.from_mapping(raw.get("backup_retention")),
         scheduler_enabled=bool((raw.get("scheduler") or {}).get("enabled", False)),
+        server_launchd_label=str((raw.get("server") or {}).get("launchd_label") or "").strip() or None,
     )
 
 
