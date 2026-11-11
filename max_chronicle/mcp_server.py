@@ -608,6 +608,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             case ["api", "item"]:
                 identifier = request.query_params.get("id", "")
                 work = lambda: atlas.item_payload(manifest(), identifier)  # noqa: E731
+            case ["api", "atlas", "link"]:
+                ends = request.query_params.get("a", ""), request.query_params.get("b", "")
+                work = lambda: atlas.link_payload(manifest(), *ends)  # noqa: E731
             case _:
                 return PlainTextResponse("Not found\n", status_code=404, headers=headers)
 

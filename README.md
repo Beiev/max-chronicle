@@ -64,9 +64,11 @@ anything is stored.
   checkpoint history, facts with every value a slot had, search that says why each
   hit matched, and single records with their evidence. Read-only, no script,
   answered only on this machine.
-- **Atlas:** `http://127.0.0.1:8093/ui/atlas` draws the whole memory as a map:
-  projects, tasks, events, notes and fact slots, joined by what the memory records
-  and by resemblance in meaning, with a time machine that replays how it grew.
+- **Atlas:** `http://127.0.0.1:8093/ui/atlas` draws the whole memory as a sky to
+  turn around in three dimensions, or as a flat map: projects, tasks, events,
+  notes and fact slots, joined by what the memory records and by resemblance in
+  meaning. A click on a line says why two memories are joined; a river of time
+  frames any stretch of days and replays how the memory grew.
   The operator can pin a memory to the brief, mark it stale or hide a copy of it
   there; each action is an event by the operator, and undoing it is another.
 - **CLI:** `chronicle query-memory`, `chronicle timeline --as-of`, `chronicle record`;

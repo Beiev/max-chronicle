@@ -15,6 +15,11 @@
 <header class="bar">
   <a class="brand glass" href="/ui" title="Back to the overview"><span class="mark" aria-hidden="true"></span><b>Chronicle</b><span class="sub">Atlas</span></a>
   <button id="search-open" class="search-btn glass" type="button"><span>Search the memory</span><kbd>⌘K</kbd></button>
+  <div class="mode glass" role="group" aria-label="How the memory is laid out">
+    <button id="mode-3d" type="button" class="on" title="A sky to turn around (3)">3D</button>
+    <button id="mode-2d" type="button" title="A flat map (2)">2D</button>
+  </div>
+  <button id="help" class="icon-btn glass help" type="button" title="How to move around (?)" aria-controls="hint">?</button>
   <div id="stats" class="stats glass"></div>
 </header>
 
@@ -22,6 +27,10 @@
 <aside id="legend" class="legend glass" aria-label="Projects"></aside>
 
 <div id="tip" class="tip" hidden></div>
+<div id="hint" class="hint glass" hidden>
+  <div id="hint-text" class="hint-text"></div>
+  <button id="hint-close" class="icon-btn" type="button" title="Got it">×</button>
+</div>
 
 <aside id="panel" class="panel glass" aria-hidden="true">
   <div class="panel-head">
@@ -41,15 +50,17 @@
 <footer class="time glass">
   <div class="time-controls">
     <button id="play" class="icon-btn play" type="button" title="Play the memory growing (Space)">▶</button>
-    <div id="time-label" class="time-label"></div>
+    <button id="time-label" class="time-label" type="button" title="Go to a date"></button>
+    <input id="time-date" class="time-date" type="date" aria-label="Go to a date" tabindex="-1">
     <div class="speed" role="group" aria-label="Playback speed">
       <button type="button" data-speed="1" class="on">1×</button>
       <button type="button" data-speed="4">4×</button>
       <button type="button" data-speed="16">16×</button>
     </div>
+    <button id="range" class="chip range" type="button" hidden></button>
     <button id="now" class="chip now" type="button" hidden>Back to now</button>
   </div>
-  <canvas id="river" aria-label="Activity over time; drag to travel"></canvas>
+  <canvas id="river" aria-label="Activity over time: drag to travel, drag the left grip to set where the range starts, scroll to zoom"></canvas>
 </footer>
 
 <div id="search" class="search" hidden>

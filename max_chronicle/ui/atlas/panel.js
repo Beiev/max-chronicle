@@ -104,7 +104,8 @@ export function markdown(source, resolve, title = "") {
 
 /**
  * @typedef {{label: string, title: string, run: () => void}} RowAction
- * @typedef {{index: number, label: string, color: string, when: string, note?: string, action?: RowAction}} Row
+ * @typedef {{index: number, label: string, color: string, when: string, note?: string, action?: RowAction,
+ *   why?: () => void}} Row a node to go to; why opens the line that joins it to the memory in the panel
  */
 
 /**
@@ -128,10 +129,18 @@ export function relations(title, rows, go) {
       dot.style.background = row.color;
       dot.style.boxShadow = `0 0 8px ${row.color}`;
       button.append(dot, el("span", "label", row.label));
-      if (row.note) button.append(el("span", "sim", row.note));
+      if (row.note && !row.why) button.append(el("span", "sim", row.note));
       button.append(el("span", "when", row.when));
       button.addEventListener("click", () => go(row.index));
       li.append(button);
+      const why = row.why;
+      if (why) {
+        const line = el("button", "row-act why", row.note || "line");
+        line.setAttribute("type", "button");
+        line.title = "Why these two are joined";
+        line.addEventListener("click", () => why());
+        li.append(line);
+      }
       const action = row.action;
       if (action) {
         const act = el("button", "row-act", action.label);
