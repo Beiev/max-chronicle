@@ -2,24 +2,30 @@
 /**
  * The Atlas: Chronicle's memory as a sky to turn and wander, and a river of time.
  *
- * Projects are suns, each in a nebula of its colour, tasks ringed points
- * around them, events stars, notes small squares and fact slots diamonds. Lines
- * are what the memory records; dashed brass between memories is resemblance by
- * meaning. Drag turns
- * the sky, the wheel comes closer, a click opens a memory or the line between
- * two. The river at the bottom is how much each project recorded per day: its
- * two handles frame a stretch of time and the sky shows what was known then.
+ * Projects are galaxies: a sun, and around it the memories of the project in a
+ * form of its own (a spiral, a ring, a great ball, a cloud), the oldest at the
+ * heart, lit by its own gas and turning slowly. Tasks are ringed points,
+ * events stars, notes small squares and fact slots diamonds.
+ * Lines are what the memory records; dashed brass between memories is
+ * resemblance by meaning. Drag turns the sky, the wheel comes closer, a click
+ * opens a memory or the line between two. The river at the bottom is how much
+ * each project recorded per day: its two handles frame a stretch of time and
+ * the sky shows what was known then.
  *
- * This file is the wiring. What a thing is lives in model.js, where it is
- * drawn in camera.js, and each surface has a module of its own: the sky, the
- * lights (render.js), the names (ink.js), the panel's cards, the river.
+ * This file is the wiring. What a thing is lives in model.js, where the layout
+ * puts it in layout.worker.js, the form of its galaxy in shape.js and its gas
+ * in gas.js, where it is drawn in camera.js, and each surface has a module of
+ * its own: the far sky, the lights (render.js), the names and the brass lines
+ * (ink.js), the panel's cards, the river.
  */
 
 import { Renderer } from "./render.js";
 import { Camera } from "./camera.js";
 import { Graph, DAY, EDGE, EDGE_NAME, KIND_LABEL, SIMILAR_TINT, clamp, mulberry32, percent } from "./model.js";
+import { Shaper } from "./shape.js";
+import { Gas } from "./gas.js";
 import { Sky } from "./sky.js";
-import { Ink, cut } from "./ink.js";
+import { Ink, cut, LINK_BOW } from "./ink.js";
 import { pickNode, pickEdge } from "./pick.js";
 import { Timeline, momentAt } from "./timeline.js";
 import { el, kindChip } from "./panel.js";
@@ -45,6 +51,29 @@ const NARROW = 760;
 const OPENING_TURN = [-0.5, 0.3];
 const IDLE_TURN_AFTER_MS = 14000;
 const IDLE_TURN = 0.03; // radians a second: the sky drifts when nobody touches it
+/** With a memory open the drift is a slow walk around it. */
+const IDLE_TURN_HELD = 0.014;
+/**
+ * The overture: a page opened on no place in particular first plays the memory from its first day to now, seen from
+ * further off and a little aside, and comes in as the sky fills. Any touch ends it.
+ */
+const OVERTURE_MS = 5600;
+const OVERTURE_FROM = { back: 1.6, yaw: -0.75, pitch: 0.14 };
+/** The group that is the hole and what circles it, in place of a sun. */
+const HOLE = -2;
+/** A memory joined to more than this many others keeps its lines as plain light: brass is for a handful. */
+const INKED_MAX = 40;
+/** How much light is left to what is not in focus: beside a memory or a line, and beside a project shown alone. */
+const DIM_BESIDE_FOCUS = 0.34;
+const DIM_BESIDE_PROJECT = 0.12;
+/** The lines inside a galaxy can be pointed at from this near: the renderer has them well in view by then. */
+const LINES_FROM = 2.2;
+/** A memory in focus is seen with this much of the way to its sun, so it is seen in its place. */
+const LEAN_TO_SUN = 0.55;
+/** A galaxy showing less of its face than this (1 face on, 0 edge on) is turned to when a memory of it is opened. */
+const FACE_SHOWN = 0.42;
+/** How far the camera then leans from where it looked toward the pole of the disc. */
+const FACE_TURNED_TO = 0.5;
 /** @type {Record<string, string>} */
 const DONE = {
   pin: "Pinned to the brief.", unpin: "Unpinned from the brief.", stale: "Marked stale.", fresh: "Marked current again.",
@@ -54,7 +83,7 @@ const DONE = {
 const HOW = [
   [["Drag"], "turn the sky"], [["Shift", "drag"], "slide it"], [["Scroll"], "come closer"],
   [["Click"], "a memory, or a line to see why two are joined"], [["F"], "all of it"], [["2", "3"], "flat map or sky"],
-  [["M"], "lines of meaning"], [["Space"], "play"], [["←", "→"], "a day back or on"], [["/"], "search"],
+  [["M"], "lines of meaning"], [["Space"], "play"], [["←", "→"], "a day back or on"], [["/"], "search"], [["I"], "the sky alone"],
 ];
 const LINE_HINT = ["part of a task", "part of a project", "a link in a note", "a fact it set", "close in meaning"];
 const number = new Intl.NumberFormat("en");
@@ -119,15 +148,51 @@ async function main() {
   }
   renderer.setNodes(graph);
   const camera = new Camera();
-  const sky = new Sky(/** @type {HTMLCanvasElement} */ ($("sky")), graph);
+  const shaper = new Shaper(graph);
+  let gas = new Gas(graph, shaper);
+  /**
+   * What is drawn together, a galaxy's gas and then its memories: one group to a project, and one of what belongs to
+   * none. Each has the node its distance is measured by: its sun.
+   * @type {{sun: number, nodes: number[], gas: import("./render.js").Range | null, dust: import("./render.js").Range | null}[]}
+   */
+  let groups = [];
+  /** The gas again, once the memory has changed what it rests on: the lines by meaning bridge galaxies too. */
+  function layGas() {
+    gas = new Gas(graph, shaper);
+    renderer.setGas(gas.look, gas.count);
+    /** @type {Map<number | null, number[]>} */ const members = new Map();
+    /** @type {number[]} */ const fallen = [];
+    nodes.forEach((node, i) => {
+      // What was let go is drawn with the hole it circles, not with the galaxy it left.
+      if (shaper.fallen[i]) { fallen.push(i); return; }
+      const key = node.p !== null && graph.projectNode.has(node.p) ? node.p : null;
+      const list = members.get(key) || [];
+      list.push(i);
+      members.set(key, list);
+    });
+    groups = [...members].map(([project, list]) => ({
+      sun: project === null ? -1 : /** @type {number} */ (graph.projectNode.get(project)), nodes: list,
+      gas: project === null ? null : gas.ranges.get(project) || null, dust: project === null ? null : gas.dust.get(project) || null,
+    }));
+    if (gas.hole) groups.push({ sun: HOLE, nodes: fallen, gas: null, dust: gas.hole });
+    renderer.setGroups(groups);
+  }
+  layGas();
+  /** @type {number[]} */ const order = [];
+  const sky = new Sky(/** @type {HTMLCanvasElement} */ ($("sky")), shaper);
   const ink = new Ink(/** @type {HTMLCanvasElement} */ ($("ink")), graph);
   const projected = new Float32Array(n * 3);
   const nodeHl = new Float32Array(n);
   /** @type {Float32Array} */ let edgeHl = new Float32Array(edges.length);
+  /** The lines of the memory in focus that the ink draws in brass. @type {number[]} */
+  const inked = [];
+  /** The two ends of every line drawn: the edges of the memory, then the figures of the tasks. */
+  let drawnEnds = new Int32Array(0);
   const uploadEdges = () => {
     const buffers = graph.edgeBuffers();
     renderer.setEdges(buffers.ends, buffers);
-    edgeHl = new Float32Array(edges.length);
+    drawnEnds = buffers.ends;
+    edgeHl = new Float32Array(buffers.ends.length / 2);
   };
   uploadEdges();
 
@@ -142,6 +207,8 @@ async function main() {
   let panelOpen = false, rangeOpen = false, legendOpen = storageGet(LEGEND_KEY) !== false;
   let W = window.innerWidth, H = window.innerHeight, dpr = Math.min(window.devicePixelRatio || 1, 2);
   let userMoved = false, lastInput = performance.now();
+  /** When the overture began, 0 when none plays; and whether only the sky is shown. */
+  let overture = 0, immersed = false;
   const calm = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   /** The line an address asked for before the lines by meaning had arrived; any move of the reader's drops it. @type {import("./urlstate.js").Place | null} */
   let awaitedLine = null;
@@ -164,30 +231,48 @@ async function main() {
 
   function updateHighlight() {
     for (let i = 0; i < n; i++) nodeHl[i] = kindOn[graph.kind[i]] && !graph.gone[i] ? 0 : -1;
-    edges.forEach((e, index) => { edgeHl[index] = nodeHl[e.s] < 0 || nodeHl[e.t] < 0 ? -1 : 0; });
+    // A line is drawn while both its ends are: an edge of the memory, or a stroke of a task's figure.
+    for (let index = 0; index < edgeHl.length; index++) {
+      edgeHl[index] = nodeHl[drawnEnds[index * 2]] < 0 || nodeHl[drawnEnds[index * 2 + 1]] < 0 ? -1 : 0;
+    }
+    inked.length = 0;
     if (focus >= 0) {
+      // Its own galaxy stays half lit around it: a memory is seen in its place.
+      const home = nodes[focus].p;
+      if (home !== null) for (let i = 0; i < n; i++) if (nodes[i].p === home && nodeHl[i] === 0) nodeHl[i] = 0.5;
       nodeHl[focus] = 2;
-      for (const link of graph.adj[focus]) {
-        if (nodeHl[link.o] < 0) continue;
+      const links = graph.adj[focus].filter((link) => nodeHl[link.o] >= 0);
+      const brass = links.length <= INKED_MAX;
+      for (const link of links) {
         nodeHl[link.o] = Math.max(nodeHl[link.o], 1);
-        edgeHl[link.e] = 1;
+        edgeHl[link.e] = brass ? 2 : 1;
+        if (brass) inked.push(link.e);
       }
     } else if (line >= 0) {
       const e = edges[line];
       nodeHl[e.s] = nodeHl[e.t] = 2;
       edgeHl[line] = 1;
     } else if (isolate !== null) {
+      // A project shown alone keeps its lines as they are: lit all at once they are a web over the galaxy.
       for (let i = 0; i < n; i++) if (nodes[i].p === isolate && nodeHl[i] >= 0) nodeHl[i] = 1;
-      edges.forEach((e, index) => { if (nodeHl[e.s] > 0 && nodeHl[e.t] > 0) edgeHl[index] = 1; });
+      for (let index = 0; index < edgeHl.length; index++) {
+        if (nodeHl[drawnEnds[index * 2]] > 0 && nodeHl[drawnEnds[index * 2 + 1]] > 0) edgeHl[index] = 0.5;
+      }
     }
     renderer.setHighlight(nodeHl, edgeHl);
   }
   updateHighlight();
 
   // ---------- positions and layout ----------
-  /** Where the lights are drawn; they glide to where the layout puts them. */
+  /** Where the lights would be had no galaxy turned; they glide to where the layout and the form of their galaxy put them. */
   let positions = new Float32Array(n * 3);
   let goal = positions;
+  /** Where the lights are drawn: the same, each galaxy turned as far as it has turned. */
+  const drawn = new Float32Array(n * 3);
+  /** Whether the lights must be put again where they are drawn, though nothing glides and nothing turns. */
+  let stale = true;
+  /** Where the layout puts the nodes, before each galaxy is given its form: what the layout starts from and what is kept. */
+  let laid = positions;
   let gliding = false;
   /** @type {Worker | null} */ let worker = null;
   /** @type {2 | 3} */ let dims = 3;
@@ -206,7 +291,8 @@ async function main() {
     } else {
       seeded = graph.seedPositions(dims, (cached && cached.positions) || {});
     }
-    goal = seeded.positions;
+    laid = seeded.positions;
+    goal = shaper.shape(laid, dims);
     if (first) positions = goal.slice();
     gliding = true;
     const ticks = seeded.warm ? WARM_TICKS : COLD_TICKS;
@@ -216,7 +302,8 @@ async function main() {
     worker = running;
     running.onmessage = (message) => {
       if (worker !== running) return;
-      goal = message.data.positions;
+      laid = message.data.positions;
+      goal = shaper.shape(laid, dims);
       gliding = true;
       const narrowed = focus >= 0 || line >= 0 || isolate !== null;
       // While the map forms the whole of it stays in view; a memory in focus is flown to once it has its place.
@@ -224,7 +311,7 @@ async function main() {
       if (message.data.done) {
         running.terminate();
         const saved = /** @type {Record<string, number[]>} */ ({});
-        nodes.forEach((node, i) => { saved[node.id] = [0, 1, 2].map((a) => Math.round(goal[i * 3 + a] * 10) / 10); });
+        nodes.forEach((node, i) => { saved[node.id] = [0, 1, 2].map((a) => Math.round(laid[i * 3 + a] * 10) / 10); });
         storageSet(`${LAYOUT_KEY}.${dims}d`, { positions: saved });
         $("loading").classList.add("done");
       } else {
@@ -232,15 +319,16 @@ async function main() {
         $("loading").classList.remove("done");
       }
     };
-    running.postMessage({ n, dims, kinds: graph.kind, edges: explicit, init: goal.slice(), ticks, warm: seeded.warm });
+    running.postMessage({ n, dims, kinds: graph.kind, edges: explicit, init: laid.slice(), ticks, warm: seeded.warm });
   }
 
   // ---------- the frame and the fit ----------
+  /** How much of the window the panels cover on each side. @returns {[number, number]} */
+  const covered = () => [legendOpen && !immersed && W > 900 ? LEGEND_W : 0, panelOpen && W > NARROW ? PANEL_W : 0];
   function frameOf() {
-    const wide = W > NARROW;
-    const left = legendOpen && W > 900 ? LEGEND_W : 0, right = panelOpen && wide ? PANEL_W : 0;
-    return { cx: left + (W - left - right) / 2, cy: 56 + (H - 56 - TIMELINE_H) / 2,
-             w: Math.max(W - left - right - Math.min(LABEL_ROOM, W * 0.2), 160), h: Math.max(H - 56 - TIMELINE_H - 40, 160), height: H };
+    const [left, right] = covered(), top = immersed ? 0 : 56, bottom = immersed ? 0 : TIMELINE_H;
+    return { cx: left + (W - left - right) / 2, cy: top + (H - top - bottom) / 2,
+             w: Math.max(W - left - right - Math.min(LABEL_ROOM, W * 0.2), 160), h: Math.max(H - top - bottom - 40, 160), height: H };
   }
   let radius = 800;
   /** The middle of everything shown and how far out it reaches: the globe the sky draws. @type {import("./sky.js").Globe | null} */
@@ -263,25 +351,72 @@ async function main() {
     return { centre: /** @type {[number, number, number]} */ ([cx, cy, cz]),
              radius: Math.max(far[Math.floor((far.length - 1) * 0.98)], suns, 40) };
   }
-  /** @param {number} i @returns {[number, number, number]} where the layout puts a node */
-  const placeOf = (i) => [goal[i * 3], goal[i * 3 + 1], goal[i * 3 + 2]];
-  /** How much closer than the whole memory the camera comes to a node of each kind. */
-  const CLOSER = { project: 2.2, task: 4.5, event: 7, note: 7, fact: 7 };
+  /** @param {number} i @returns {[number, number, number]} where a node comes to rest, its galaxy turned as it is now */
+  const placeOf = (i) => shaper.turned(goal, i);
+  /**
+   * Where the camera looks to see a memory in its place, and from how far: the
+   * memory, what it is joined to within reach, and the heart of its galaxy all
+   * in the frame, the memory a little off the middle toward its own side.
+   * A galaxy seen nearly edge on is turned to, as far as shows its face.
+   * @param {number} i @returns {{target: [number, number, number], dist: number, turn: {yaw?: number, pitch?: number}}}
+   */
+  function placeToSee(i) {
+    // What was let go is seen where it is now, with the hole it circles, not with the galaxy it left.
+    const hole = shaper.fallen[i] ? shaper.hole : null;
+    const at = placeOf(i), home = hole ? null : nodes[i].p, sun = home === null ? undefined : graph.projectNode.get(home);
+    const galaxy = home === null ? undefined : shaper.galaxies.get(home);
+    const away = (/** @type {number} */ o) => { const there = placeOf(o); return Math.hypot(there[0] - at[0], there[1] - at[1], there[2] - at[2]); };
+    // What it is joined to, the nearer four fifths: a line to another galaxy does not set the frame.
+    const near = graph.neighbours(i).filter((link) => nodeHl[link.o] >= 0 && nodes[link.o].k !== "project").map((link) => away(link.o))
+      .sort((a, b) => a - b);
+    let need = near.length ? near[Math.floor((near.length - 1) * 0.8)] * 1.25 : 0;
+    /** @type {[number, number, number]} */ let target = at;
+    if (sun !== undefined && sun !== i) {
+      const far = away(sun), lean = LEAN_TO_SUN;
+      target = [at[0] + (goal[sun * 3] - at[0]) * lean, at[1] + (goal[sun * 3 + 1] - at[1]) * lean, at[2] + (goal[sun * 3 + 2] - at[2]) * lean];
+      need = Math.max(need, Math.min(far, galaxy ? galaxy.reach : far) * (1 - lean) * 1.12);
+    }
+    // Never so close that its galaxy is a fog around it: the whole galaxy stays in the frame, and the memory is
+    // found in it by its ring, its name and its lines.
+    need = Math.max(need, galaxy ? galaxy.reach * 1.1 : 0, 45);
+    if (hole) { target = hole.centre; need = hole.shadow * 5.5; }
+    /** @type {{yaw?: number, pitch?: number}} */ const turn = {};
+    if (galaxy && !camera.flat) {
+      const back = camera.back, side = galaxy.n[0] * back[0] + galaxy.n[1] * back[1] + galaxy.n[2] * back[2];
+      if (Math.abs(side) < FACE_SHOWN) {
+        // Lean the way the camera looks from toward the pole of the disc on its own side, until the face shows.
+        const sign = side < 0 ? -1 : 1, lean = FACE_TURNED_TO;
+        const b = [0, 1, 2].map((a) => back[a] * (1 - lean) + sign * galaxy.n[a] * lean), length = Math.hypot(b[0], b[1], b[2]) || 1;
+        turn.yaw = Math.atan2(b[0], b[2]);
+        turn.pitch = clamp(Math.asin(clamp(b[1] / length, -1, 1)), -1.2, 1.2);
+      }
+    }
+    // The hole and what circles it are taken whole, however small the memory around them is.
+    return { target, dist: hole ? camera.distanceToFit(need) : Math.min(camera.distanceToFit(need), camera.fitDist / 2.2), turn };
+  }
   /**
    * Turns the camera to what the reader is on: a memory, the line between two,
    * one project alone, or all of it. It never backs away from a memory the
    * reader is already closer to.
    * @param {boolean} smooth a flight, or a jump
+   * @param {boolean} [afresh] the memory in focus has moved: it is seen from as far as shows it in its new place
    */
-  function aim(smooth) {
+  function aim(smooth, afresh = false) {
     const whole = ball();
     radius = whole.radius;
     globe = whole;
     camera.fitDist = camera.distanceToFit(whole.radius * 1.06);
     let target = whole.centre, dist = camera.fitDist;
-    if (focus >= 0) {
-      target = placeOf(focus);
-      dist = Math.min(camera.dist, camera.fitDist / CLOSER[/** @type {keyof typeof CLOSER} */ (nodes[focus].k)]);
+    /** @type {{yaw?: number, pitch?: number}} */ let turn = {};
+    if (focus >= 0 && nodes[focus].k === "project") {
+      const own = ball((i) => nodes[i].p === nodes[focus].p && nodeHl[i] >= 0);
+      target = own.centre;
+      dist = Math.min(camera.dist, camera.distanceToFit(own.radius * 1.15), camera.fitDist);
+    } else if (focus >= 0) {
+      const see = placeToSee(focus);
+      target = see.target;
+      dist = afresh ? see.dist : Math.min(camera.dist, see.dist);
+      turn = see.turn;
     } else if (line >= 0) {
       const a = placeOf(edges[line].s), b = placeOf(edges[line].t);
       target = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
@@ -291,8 +426,13 @@ async function main() {
       target = alone.centre;
       dist = Math.min(camera.distanceToFit(alone.radius * 1.15), camera.fitDist);
     }
-    if (smooth) camera.flyTo(target, dist, performance.now());
-    else camera.jumpTo(target, dist);
+    // While the overture plays the camera is on its way in: where it is going changes, the flight goes on.
+    if (overture && !smooth && camera.bend(target, dist)) return;
+    if (smooth) camera.flyTo(target, dist, performance.now(), turn);
+    else {
+      camera.jumpTo(target, dist);
+      if (turn.yaw !== undefined && turn.pitch !== undefined) { camera.yaw = turn.yaw; camera.pitch = turn.pitch; camera.update(); }
+    }
   }
 
   // ---------- the hover card ----------
@@ -487,16 +627,30 @@ async function main() {
     const marks = body.marks || {};
     graph.pinned[i] = marks.pinned ? 1 : 0;
     if (graph.pinned[i]) pins.add(i); else pins.delete(i);
-    const wasStale = graph.stale[i];
+    const wasStale = graph.stale[i], circled = shaper.fallen[i];
     graph.stale[i] = marks.stale ? 1 : 0;
-    if (graph.stale[i] !== wasStale) {
-      graph.paint(i);
-      renderer.setNodes(graph);
-      renderer.setPositions(positions);
-    }
     const hide = body.hidden ? 1 : 0;
     if (graph.gone[i] !== hide) counts[graph.kind[i]] += hide ? -1 : 1;
     graph.gone[i] = hide;
+    if (graph.stale[i] !== wasStale) {
+      graph.paint(i);
+      renderer.setNodes(graph);
+      stale = true;
+    }
+    if ((graph.stale[i] && !graph.gone[i] ? 1 : 0) !== circled) {
+      // It leaves its galaxy for the hole, or comes back from it, or is gone from the map and from the hole with it.
+      // It is put where it was last seen, in the company it now keeps, and glides from there to where it belongs.
+      /** @type {[number, number, number]} */ const seenAt = [drawn[i * 3], drawn[i * 3 + 1], drawn[i * 3 + 2]];
+      shaper.restale(graph.letGo());
+      goal = shaper.shape(laid, dims);
+      positions.set(shaper.unturned(positions, i, seenAt), i * 3);
+      gliding = true;
+      layGas();
+      gas.updateBorn(play);
+      stale = true;
+      // The reader goes with the memory they are on.
+      if (focus === i && !graph.gone[i]) aim(true, true);
+    }
     updateHighlight();
     renderFilters();
     if (!graph.gone[i]) return;
@@ -603,7 +757,7 @@ async function main() {
   }
   function renderKnown() {
     known.hidden = true;
-    if (play >= days - 0.01 || panelOpen) return;
+    if (play >= days - 0.01 || panelOpen || overture) return;
     knownDate.textContent = dayFormat.format(dateAt(play));
     const now = momentAt([graph.span0, graph.span1], play);
     const current = new Map();
@@ -643,7 +797,7 @@ async function main() {
     play = clamp(day, 0, days);
     if (from > play - 1) setFrom(Math.max(0, play - 1));
     timeline.setPlay(play);
-    sky.updateBornShare(play);
+    gas.updateBorn(play);
     renderTime();
     if (!knownTimer) knownTimer = window.setTimeout(() => { knownTimer = 0; renderKnown(); if (rangeOpen) redrawPanel(); }, 120);
   }
@@ -752,14 +906,20 @@ async function main() {
   // ---------- pointer ----------
   /** @param {number} i */
   const radiusOf = (i) => ink.radius(i, view);
-  /** A node the pointer may take: shown, and lit when a focus dims the rest. @param {number} i */
-  const takes = (i) => shown(i) && !((focus >= 0 || line >= 0) && !lit(i) && focusMix > 0.5);
+  /** A node the pointer may take: whatever is shown. Beside a focus the rest is dimmer, and still a step away. @param {number} i */
+  const takes = (i) => shown(i);
+  /** How far a line is bowed: the brass ones leave the memory in focus all turning the same way. @param {number} index */
+  const bowOf = (index) => (edgeHl[index] > 1.5 ? (edges[index].s === focus ? LINK_BOW : -LINK_BOW) : 0);
   /** A line the pointer may take: drawn brightly enough to be aimed at. @param {number} index */
   const takesLine = (index) => {
     const e = edges[index];
     if (edgeHl[index] < 0 || !shown(e.s) || !shown(e.t)) return false;
     if (focus >= 0 || line >= 0) return edgeHl[index] > 0;
-    return e.k !== EDGE.similar || meaningOn;
+    if (e.k === EDGE.similar) return meaningOn;
+    // That a memory belongs to a task or a project is drawn only for what is in focus: nothing to point at.
+    if (e.k === EDGE.task || e.k === EDGE.project) return false;
+    // A line inside a galaxy is drawn once the reader is close enough to tell it from its neighbours.
+    return Math.min(projected[e.s * 3 + 2], projected[e.t * 3 + 2]) / view.fit > LINES_FROM;
   };
   /** @type {{x: number, y: number, moved: boolean, slide: boolean, vx: number, vy: number, t: number} | null} */
   let drag = null;
@@ -784,7 +944,7 @@ async function main() {
       return;
     }
     hovered = pickNode(event.clientX, event.clientY, projected, radiusOf, takes);
-    hoveredLine = hovered >= 0 ? -1 : pickEdge(event.clientX, event.clientY, edges, projected, takesLine);
+    hoveredLine = hovered >= 0 ? -1 : pickEdge(event.clientX, event.clientY, edges, projected, takesLine, bowOf);
     glCanvas.classList.toggle("pointing", hovered >= 0 || hoveredLine >= 0);
     if (hovered >= 0) tipNode(hovered, event.clientX, event.clientY);
     else if (hoveredLine >= 0) tipLine(hoveredLine, event.clientX, event.clientY);
@@ -793,7 +953,7 @@ async function main() {
   glCanvas.addEventListener("pointerup", (event) => {
     if (drag && !drag.moved) {
       const i = pickNode(event.clientX, event.clientY, projected, radiusOf, takes);
-      const index = i >= 0 ? -1 : pickEdge(event.clientX, event.clientY, edges, projected, takesLine);
+      const index = i >= 0 ? -1 : pickEdge(event.clientX, event.clientY, edges, projected, takesLine, bowOf);
       if (i >= 0) focusOn(i);
       else if (index >= 0) chooseLine(index);
       else if (focus >= 0 || line >= 0 || rangeOpen) clearFocus();
@@ -822,6 +982,42 @@ async function main() {
     if (!open) storageSet(HINT_KEY, true);
   }
 
+  // ---------- the sky alone ----------
+  const whisper = $("whisper");
+  /** What steps out when the sky is left alone: everything but the sky, the panel of what is open, and the way back. */
+  const chrome = /** @type {HTMLElement[]} */ ([...document.querySelectorAll(".bar > :not(.immerse), .filters, .legend, .time, .known, .hint")]);
+  let whisperTimer = 0;
+  /** Hides everything but the sky and what the reader opens, or brings it back. @param {boolean} on */
+  function setImmersed(on) {
+    immersed = on;
+    document.body.classList.toggle("immersed", on);
+    // Out of sight is out of reach: the keyboard and a screen reader pass over what has stepped out.
+    for (const part of chrome) part.inert = on;
+    $("immerse").setAttribute("aria-pressed", String(on));
+    whisper.classList.toggle("on", on);
+    clearTimeout(whisperTimer);
+    if (on) whisperTimer = window.setTimeout(() => whisper.classList.remove("on"), 3200);
+    if (!userMoved && !camera.flight) aim(true);
+  }
+  $("immerse").addEventListener("click", () => setImmersed(!immersed));
+  // Reading the panel is being here: the sky does not start to drift under a reader who is scrolling.
+  for (const type of ["pointermove", "wheel", "keydown"]) panel.addEventListener(type, () => { lastInput = performance.now(); }, { passive: true });
+
+  // ---------- the overture ----------
+  /** The days on which the memories were written, in order: the overture fills the sky at an even pace, not the calendar's. */
+  const written = Float32Array.from(graph.birth).sort();
+  function endOverture() {
+    if (!overture) return;
+    overture = 0;
+    // The camera was on its way in: it arrives now, and does not go on for seconds after the reader has spoken.
+    const flight = camera.flight;
+    if (flight) camera.flyTo(flight.to.target, flight.to.dist, performance.now(), { yaw: flight.to.yaw, pitch: flight.to.pitch, ms: 600 });
+    jumpTo(days);
+    dateBig.classList.remove("on");
+    renderKnown();
+  }
+  for (const type of ["pointerdown", "wheel", "keydown"]) window.addEventListener(type, endOverture, { capture: true, passive: true });
+
   // ---------- keys ----------
   window.addEventListener("keydown", (event) => {
     const typing = event.target instanceof HTMLInputElement;
@@ -831,10 +1027,12 @@ async function main() {
     const turn = (/** @type {number} */ dx, /** @type {number} */ dy) => { if (!camera.flat) { camera.drag(dx, dy); userMoved = true; } };
     if (event.key === "/") { event.preventDefault(); openSearch(); }
     else if (event.key === "?") setHint(hint.hidden);
+    else if (event.key === "i") setImmersed(!immersed);
     else if (event.key === "Escape") {
       if (!search.hidden) closeSearch();
       else if (!hint.hidden) setHint(false);
       else if (focus >= 0 || line >= 0 || rangeOpen) clearFocus();
+      else if (immersed) setImmersed(false);
       else if (isolate !== null) { setIsolate(null); remember(true); }
     }
     else if (event.key === " ") { event.preventDefault(); setPlaying(!playing); }
@@ -909,6 +1107,7 @@ async function main() {
   }
   /** Goes where an address says. @param {import("./urlstate.js").Place} place */
   function goTo(place) {
+    endOverture();
     setFlat(Boolean(place.flat), false);
     const end = place.day ? dayEnd(place.day) : null, start = place.from ? dayStart(place.from) : null;
     jumpTo(end === null ? days : clamp((end - graph.span0) / DAY, 0, days));
@@ -958,11 +1157,17 @@ async function main() {
   $("mode-3d").classList.toggle("on", !camera.flat);
   $("mode-2d").classList.toggle("on", camera.flat);
   layout(camera.flat ? 2 : 3, true);
-  renderer.setPositions(positions);
-  sky.updateOrbits(positions);
   resize();
   jumpTo(days);
   if (Object.keys(arrival).length) goTo(arrival);
+  else if (!calm && !camera.flat && written.length) {
+    overture = performance.now();
+    const fit = camera.dist, to = [...camera.target];
+    camera.dist = fit * OVERTURE_FROM.back; camera.yaw += OVERTURE_FROM.yaw; camera.pitch += OVERTURE_FROM.pitch;
+    camera.update();
+    camera.flyTo(/** @type {[number, number, number]} */ (to), fit, overture, { yaw: OPENING_TURN[0], pitch: OPENING_TURN[1], ms: OVERTURE_MS });
+    jumpTo(0);
+  }
   for (const [keys, what] of HOW) {
     const way = el("span", "how");
     way.append(...keys.map((key) => el("kbd", "", key)), what);
@@ -982,8 +1187,12 @@ async function main() {
         if (body.status === "ready" || ((body.status === "stale" || body.status === "failed") && body.edges.length)) {
           graph.addSimilar(body.edges);
           similarReady = true;
+          // What a memory is joined to has changed, and with it which are the bright stars and which have a twin.
+          renderer.setNodes(graph);
           uploadEdges();
-          renderer.setPositions(positions);
+          layGas();
+          gas.updateBorn(play);
+          stale = true;
           updateHighlight();
           renderFilters();
           // The line an address asked for, if the reader has not gone elsewhere since.
@@ -1007,13 +1216,22 @@ async function main() {
   // ---------- the loop ----------
   /** @type {import("./ink.js").View} */
   const view = { projected, fit: 1, lights: 1, zoom: 1, focus, hovered, hoveredEdge: hoveredLine, chosenEdge: line, isolate, focusMix, trail, pins,
-                 rings: sky.rings, shown, lit };
-  let then = performance.now(), frames = 0;
+                 rings: sky.rings, inked, span: [0, W], shown, lit, hole: null };
+  let then = performance.now(), turning = 0, spinning = 0, holeMix = 0;
   /** @param {number} now */
   function frame(now) {
     const dt = Math.min((now - then) / 1000, 0.05);
     then = now;
     const time = now / 1000;
+    if (overture) {
+      const t = clamp((now - overture) / OVERTURE_MS, 0, 1), eased = t * t * (3 - 2 * t);
+      if (t >= 1) endOverture();
+      else {
+        jumpTo(Math.min(written[Math.floor(eased * (n - 1))] + 0.5, days));
+        dateBig.replaceChildren(dayFormat.format(dateAt(play)), el("small", "", `${number.format(bornCount())} memories`));
+        dateBig.classList.add("on");
+      }
+    }
     if (playing) {
       jumpTo(play + dt * PLAY_DAYS_PER_S * speed);
       dateBig.replaceChildren(dayFormat.format(dateAt(play)), el("small", "", `${number.format(bornCount())} memories`));
@@ -1039,28 +1257,78 @@ async function main() {
         if (d > apart) apart = d; else if (-d > apart) apart = -d;
       }
       if (apart < 0.05) { positions.set(goal); gliding = false; }
-      renderer.setPositions(positions);
-      if (!gliding || frames % 12 === 0) { sky.updateOrbits(positions); sky.updateBornShare(play); }
+      stale = true;
+    }
+    // The galaxies turn while the reader looks around, and hold still while the reader holds something: a memory
+    // open in the panel, a line, or whatever is under the pointer.
+    const held = calm || focus >= 0 || line >= 0 || hovered >= 0 || hoveredLine >= 0;
+    spinning += ((held ? 0 : 1) - spinning) * (1 - Math.exp(-dt * 4));
+    if (spinning > 0.002) { shaper.spin(dt * spinning); stale = true; }
+    if (stale) {
+      shaper.turn(positions, drawn);
+      renderer.setPositions(drawn);
+      stale = false;
     }
 
     // The frame slides with the panels instead of jumping when one opens.
     const want = frameOf(), have = camera.frame, f = 1 - Math.exp(-dt * 10);
     camera.setFrame({ cx: have.cx + (want.cx - have.cx) * f, cy: have.cy + (want.cy - have.cy) * f, w: want.w, h: want.h, height: want.height });
     const moved = camera.step(now, dt);
-    const idle = !calm && !camera.flat && !drag && !moved && !playing && focus < 0 && line < 0 && hovered < 0 && hoveredLine < 0
+    const idle = !calm && !camera.flat && !drag && !moved && !playing && !overture && hovered < 0 && hoveredLine < 0
       && search.hidden && now - lastInput > IDLE_TURN_AFTER_MS;
-    if (idle) camera.yaw += dt * IDLE_TURN;
+    // Left alone the sky drifts; with a memory open it is a slow walk around it.
+    if (idle) camera.yaw += dt * (focus >= 0 || line >= 0 ? IDLE_TURN_HELD : IDLE_TURN);
+    // The globe shows while the reader turns the sky, and fades when it rests.
+    const turned = Boolean(drag && drag.moved && !drag.slide) || Math.abs(camera.spin.yaw) + Math.abs(camera.spin.pitch) > 0.0004;
+    turning += ((turned && !camera.flat ? 1 : 0) - turning) * (1 - Math.exp(-dt * (turned ? 9 : 1.6)));
     camera.update();
-    camera.projectAll(positions, projected);
+    camera.projectAll(drawn, projected);
 
     view.fit = camera.focal / camera.fitDist; view.zoom = camera.zoom;
     view.lights = clamp(Math.min(camera.frame.w, camera.frame.h) / FULL_LIGHTS_FRAME, 0.5, 1);
     view.focus = focus; view.hovered = hovered; view.hoveredEdge = hoveredLine; view.chosenEdge = line;
     view.isolate = isolate; view.focusMix = focusMix;
-    sky.draw(time, camera, { focus: focusMix, travel, isolate, globe });
-    renderer.draw({ res: [W, H], camera, radius, dpr, time, play, from, travel, focus: focusMix, similar: similarMix, lights: view.lights });
+    view.span = [covered()[0], W - covered()[1]];
+    // Beside a memory in focus the other galaxies step back and its own stays lit; beside a project shown alone
+    // the others all but go.
+    const narrowed = focus >= 0 || line >= 0 ? focusMix : 0, home = focus >= 0 ? nodes[focus].p : null;
+    const whole = globe || { centre: /** @type {[number, number, number]} */ ([0, 0, 0]), radius };
+    // The hole: how its disc lies to the reader, how near it is, and where its name goes.
+    // It is there while something circles it that is on the map now: on the day shown, its kind switched on.
+    const pit = shaper.hole;
+    let circling = 0;
+    if (pit) for (const i of pit.members) if (shown(i)) circling++;
+    holeMix += ((circling ? 1 : 0) - holeMix) * (1 - Math.exp(-dt * 1.2));
+    /** @type {[number, number, number]} */ let holeLies = [1, 0, 1];
+    let holeNear = -1;
+    view.hole = null;
+    if (pit) {
+      const b = camera.back, side = pit.n[0] * b[0] + pit.n[1] * b[1] + pit.n[2] * b[2], way = side < 0 ? -1 : 1;
+      const x = way * (pit.n[0] * camera.right[0] + pit.n[1] * camera.right[1] + pit.n[2] * camera.right[2]);
+      const y = way * (pit.n[0] * camera.up[0] + pit.n[1] * camera.up[1] + pit.n[2] * camera.up[2]), length = Math.hypot(x, y);
+      // The pole of the disc, as it lies on the screen, points to the far half of the disc; the long axis is across it.
+      holeLies = length > 1e-4 ? [y / length, -x / length, Math.abs(side)] : [1, 0, 1];
+      const on = camera.project(pit.centre[0], pit.centre[1], pit.centre[2]);
+      if (on) {
+        holeNear = on[2];
+        view.hole = { x: on[0], y: on[1], r: pit.shadow * on[2], count: circling, shows: holeMix * (1 - 0.6 * narrowed) };
+      }
+    }
+    renderer.setGasAt(gas.place(drawn, {
+      hole: holeMix, seen: shown,
+      time, play, flat: camera.flat, centre: whole.centre, radius: whole.radius, beside: 1 - 0.3 * narrowed,
+      shows: (project) => (isolate === null || isolate === project ? 1 : 1 - 0.8 * focusMix) * (1 - (project === home ? 0.3 : 0.66) * narrowed),
+    }));
+    sky.draw(time, camera, { focus: narrowed, turning, globe, positions: drawn, shown });
+    // The galaxies from the furthest to the nearest, by how near their suns are; what belongs to none goes first.
+    order.length = 0;
+    for (let k = 0; k < groups.length; k++) order.push(k);
+    const nearness = (/** @type {number} */ k) => (groups[k].sun === HOLE ? holeNear : groups[k].sun < 0 ? -1 : projected[groups[k].sun * 3 + 2]);
+    order.sort((a, b) => nearness(a) - nearness(b));
+    renderer.draw({ res: [W, H], camera, radius, dpr, time, play, from, travel, focus: focusMix, similar: similarMix, lights: view.lights,
+                    dim: focus < 0 && line < 0 && isolate !== null ? DIM_BESIDE_PROJECT : DIM_BESIDE_FOCUS, order, field: gas.field,
+                    hole: holeLies });
     ink.draw(time, view);
-    frames++;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

@@ -1,37 +1,52 @@
 // @ts-check
 /**
  * What is written and drawn over the sky: names, rings around what the
- * pointer and the focus are on, the path walked, and the line under the
- * pointer made bright.
+ * pointer and the focus are on, the lines of the memory in focus, the path
+ * walked, and the line under the pointer made bright.
  *
- * Names are lettered as on a chart: a project in a serif, under the ball of its memories;
- * everything smaller in a sans beside its light. They are placed greedily,
- * the important first, and one that would cover another is left out: a name
- * nobody can read is worse than no name. From afar only the larger projects
- * are named; the rest get their names as the reader comes closer.
+ * A memory in focus holds its lines in brass: each leaves it heavy and arrives
+ * light, all bowed the same way round. A memory under the pointer shows its
+ * lines thin, in starlight, for as long as the pointer stays.
+ *
+ * Names are lettered as on a chart: a project in a serif, by the disc of its
+ * galaxy; everything smaller in a sans beside its light. They are placed
+ * greedily, the important first, and one that would cover another is left
+ * out: a name nobody can read is worse than no name. How much is named goes
+ * with how close the reader is: from afar the larger projects, closer every
+ * project and its tasks, close by the memories that matter most. A long name
+ * is cut short until the pointer or the focus is on it.
  */
 
 import { clamp, rgb, EDGE, SIMILAR_TINT, STARLIGHT, BRASS } from "./model.js";
+import { bowPoint } from "./pick.js";
 
 const SANS = "-apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif";
 const SERIF = "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif";
 const INK = rgb(STARLIGHT).map((v) => Math.round(v * 255)).join(", ");
 const GOLD = rgb(BRASS).map((v) => Math.round(v * 255)).join(", ");
 const PLATE = "5, 7, 13";
-const NEIGHBOUR_NAMES = 14;
+const NEIGHBOUR_NAMES = 9;
 /** How many projects, the largest first, are named when the whole memory is in view. */
 const NAMED_FROM_AFAR = 14;
-/** An orbit wider than this is too far from its sun to carry the name: it goes under the sun instead. */
-const ORBIT_NAME_MAX_PX = 150;
+/** A disc wider than this is too far from its sun to carry the name: it goes under the sun instead. */
+const ORBIT_NAME_MAX_PX = 170;
+/** How far a brass line is bowed, as a share of its length. */
+export const LINK_BOW = 0.1;
+/** A memory under the pointer shows its lines when it has no more than this many. */
+const HOVER_LINES = 48;
+const TASK_NAMES = 24;
+const SINGLE_NAMES = 28;
 
 /**
  * @typedef {{
  *   projected: Float32Array, fit: number, lights: number, zoom: number, focus: number, hovered: number, hoveredEdge: number,
  *   chosenEdge: number, isolate: number | null, focusMix: number, trail: number[], pins: Set<number>,
- *   rings: Map<number, {x: number, y: number, r: number}>,
+ *   rings: Map<number, import("./sky.js").Ring>, inked: number[], span: [number, number],
+ *   hole: {x: number, y: number, r: number, count: number, shows: number} | null,
  *   shown: (i: number) => boolean, lit: (i: number) => boolean,
  * }} View what the page shows this frame; fit is the pixels per world unit when everything fits, lights the scale of
- *   every light, rings the orbits the sky drew
+ *   every light, rings the discs the sky drew, inked the edges of the focus drawn here in brass, span the stretch of
+ *   the window the panels leave free, from its left to its right
  */
 
 /** @param {string} text @param {number} max */
@@ -87,11 +102,59 @@ export class Ink {
       ctx.restore();
     }
 
+    // what the memory under the pointer is joined to: thin, for as long as the pointer stays
+    if (view.hovered >= 0 && view.hovered !== view.focus && p[view.hovered * 3 + 2] > 0) {
+      const links = graph.neighbours(view.hovered);
+      if (links.length <= HOVER_LINES) {
+        ctx.save();
+        ctx.lineWidth = 0.8;
+        ctx.strokeStyle = `rgba(${INK}, 0.34)`;
+        ctx.beginPath();
+        for (const link of links) {
+          if (!view.shown(link.o) || p[link.o * 3 + 2] === 0) continue;
+          ctx.moveTo(sx(view.hovered), sy(view.hovered));
+          ctx.lineTo(sx(link.o), sy(link.o));
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // what the memory in focus is joined to: brass, heavy where it leaves and light where it arrives
+    // What is in focus may not be on the map on the day shown: then it holds no lines, no ring and no name here.
+    const held = view.focus >= 0 && view.shown(view.focus);
+    if (held && view.inked.length && p[view.focus * 3 + 2] > 0) {
+      const fx = sx(view.focus), fy = sy(view.focus);
+      ctx.save();
+      ctx.lineCap = "round";
+      for (const index of view.inked) {
+        const e = graph.edges[index], o = e.s === view.focus ? e.t : e.s;
+        if (!view.shown(o) || p[o * 3 + 2] === 0) continue;
+        const ox = sx(o), oy = sy(o), [bx, by] = bowPoint(fx, fy, ox, oy, LINK_BOW);
+        const trace = () => { ctx.beginPath(); ctx.moveTo(fx, fy); ctx.quadraticCurveTo(bx, by, ox, oy); ctx.stroke(); };
+        const along = ctx.createLinearGradient(fx, fy, ox, oy);
+        along.addColorStop(0, `rgba(${GOLD}, 0.95)`);
+        along.addColorStop(1, `rgba(${GOLD}, 0.34)`);
+        ctx.strokeStyle = along;
+        ctx.lineWidth = 1.1;
+        ctx.setLineDash(e.k === EDGE.similar ? [4, 4] : []);
+        trace();
+        const leaving = ctx.createLinearGradient(fx, fy, ox, oy);
+        leaving.addColorStop(0, `rgba(${GOLD}, 0.9)`);
+        leaving.addColorStop(0.32, `rgba(${GOLD}, 0)`);
+        ctx.strokeStyle = leaving;
+        ctx.lineWidth = 2.6;
+        ctx.setLineDash([]);
+        trace();
+      }
+      ctx.restore();
+    }
+
     // the line under the pointer, and the one open in the panel
     for (const [index, alpha] of /** @type {[number, number][]} */ ([[view.chosenEdge, 0.95], [view.hoveredEdge, 0.7]])) {
       if (index < 0 || (index === view.chosenEdge && alpha < 0.9)) continue;
       const e = graph.edges[index];
-      if (!e || p[e.s * 3 + 2] === 0 || p[e.t * 3 + 2] === 0) continue;
+      if (!e || p[e.s * 3 + 2] === 0 || p[e.t * 3 + 2] === 0 || !view.shown(e.s) || !view.shown(e.t)) continue;
       ctx.save();
       ctx.strokeStyle = e.k === EDGE.similar ? SIMILAR_TINT : graph.colorOf(nodes[e.s].p);
       ctx.globalAlpha = alpha;
@@ -99,21 +162,29 @@ export class Ink {
       if (e.k === EDGE.similar) ctx.setLineDash([4, 4]);
       ctx.beginPath();
       ctx.moveTo(sx(e.s), sy(e.s));
-      ctx.lineTo(sx(e.t), sy(e.t));
+      if (view.inked.includes(index)) {
+        // A brass line under the pointer is drawn over along its own bow.
+        const bow = e.s === view.focus ? LINK_BOW : -LINK_BOW;
+        const [bx, by] = bowPoint(sx(e.s), sy(e.s), sx(e.t), sy(e.t), bow);
+        ctx.quadraticCurveTo(bx, by, sx(e.t), sy(e.t));
+      } else ctx.lineTo(sx(e.t), sy(e.t));
       ctx.stroke();
       ctx.restore();
     }
 
     // rings: what is in focus is held in brass, what the pointer is on in starlight
     const ring = (/** @type {number} */ i, /** @type {string} */ stroke, /** @type {number} */ grow) => {
-      if (p[i * 3 + 2] === 0) return;
+      if (p[i * 3 + 2] === 0 || !view.shown(i)) return;
       ctx.beginPath();
       ctx.arc(sx(i), sy(i), this.radius(i, view) * 1.9 + 5 + grow, 0, Math.PI * 2);
       ctx.strokeStyle = stroke;
       ctx.lineWidth = 1;
       ctx.stroke();
     };
-    if (view.focus >= 0) ring(view.focus, `rgba(${GOLD}, ${(0.75 + 0.2 * Math.sin(time * 2.2)).toFixed(3)})`, 2);
+    if (view.focus >= 0) {
+      ring(view.focus, `rgba(${GOLD}, ${(0.78 + 0.18 * Math.sin(time * 2.2)).toFixed(3)})`, 2);
+      ring(view.focus, `rgba(${GOLD}, 0.2)`, 7);
+    }
     if (view.hovered >= 0 && view.hovered !== view.focus) ring(view.hovered, `rgba(${INK}, 0.55)`, 0);
     for (const index of [view.chosenEdge, view.hoveredEdge]) {
       if (index < 0) continue;
@@ -147,12 +218,18 @@ export class Ink {
      */
     const name = (i, text, font, fill, how = {}) => {
       ctx.font = font;
-      const w = ctx.measureText(text).width, r = this.radius(i, view);
-      const x = how.under ? how.under[0] - w / 2 : how.below ? sx(i) - w / 2 : sx(i) + r * 1.6 + 7;
-      const y = how.under ? how.under[1] : how.below ? sy(i) + r * 2.2 + 12 : sy(i);
-      // A name that would run off the side of the window is tried elsewhere, or left out.
-      if (!how.force && (x < 4 || x + w > W - 4 || !free(x - 5, y - 10, w + 10, 20))) return false;
-      boxes.push([x - 5, y - 10, w + 10, 20]);
+      const w = ctx.measureText(text).width, r = this.radius(i, view), [left, right] = view.span;
+      let x = how.under ? how.under[0] - w / 2 : how.below ? sx(i) - w / 2 : sx(i) + r * 1.6 + 7;
+      let y = how.under ? how.under[1] : how.below ? sy(i) + r * 2.2 + 12 : sy(i);
+      // A name that would run under a panel is tried elsewhere, or left out. One that must be written goes to the
+      // other side of its light, or under it, and is held inside the free stretch whatever happens.
+      if (!how.force && (x < left + 4 || x + w > right - 4 || !free(x - 8, y - 12, w + 16, 24))) return false;
+      if (how.force && !how.under && !how.below && x + w > right - 8) {
+        x = sx(i) - r * 1.6 - 7 - w;
+        if (x < left + 8) { x = sx(i) - w / 2; y = sy(i) + r * 2.2 + 14; }
+      }
+      if (how.force) x = clamp(x, left + 8, Math.max(left + 8, right - 8 - w));
+      boxes.push([x - 8, y - 12, w + 16, 24]);
       if (how.plate) {
         ctx.fillStyle = `rgba(${PLATE}, ${how.plate})`;
         ctx.beginPath();
@@ -170,21 +247,22 @@ export class Ink {
       return true;
     };
 
-    if (view.focus >= 0 && p[view.focus * 3 + 2] > 0) {
-      name(view.focus, cut(graph.title(view.focus), 64), `600 13px ${SANS}`, `rgb(${INK})`, { force: true, plate: 0.8 });
+    if (held && p[view.focus * 3 + 2] > 0) {
+      name(view.focus, cut(graph.title(view.focus), 44), `600 13px ${SANS}`, `rgb(${INK})`, { force: true, plate: 0.8 });
       // The neighbours a reader most likely came for: the latest first, the routine ones last.
-      const around = graph.neighbours(view.focus).map((link) => link.o).filter((i) => view.shown(i) && seen(i))
+      // A sun among them is named as the projects are, further down.
+      const around = graph.neighbours(view.focus).map((link) => link.o).filter((i) => view.shown(i) && seen(i) && nodes[i].k !== "project")
         .sort((a, b) => Number(graph.routine(a)) - Number(graph.routine(b)) || (nodes[b].t || 0) - (nodes[a].t || 0));
       let written = 0;
       for (const i of around) {
         if (written >= NEIGHBOUR_NAMES) break;
-        if (name(i, cut(graph.title(i), 44), `12px ${SANS}`, `rgba(${INK}, 0.86)`, { plate: 0.66 })) written++;
+        if (name(i, cut(graph.title(i), 34), `12px ${SANS}`, `rgba(${INK}, 0.86)`, { plate: 0.66 })) written++;
       }
     }
     if (chosen) {
       // Both ends of the line are named; the second goes under its node when the first is in its way.
       const say = (/** @type {number} */ i, /** @type {{force?: boolean, below?: boolean}} */ how) =>
-        p[i * 3 + 2] > 0 && name(i, cut(graph.title(i), 56), `600 12px ${SANS}`, `rgb(${INK})`, { ...how, plate: 0.8 });
+        p[i * 3 + 2] > 0 && view.shown(i) && name(i, cut(graph.title(i), 56), `600 12px ${SANS}`, `rgb(${INK})`, { ...how, plate: 0.8 });
       say(chosen.s, { force: true });
       if (!say(chosen.t, {})) say(chosen.t, { force: true, below: true });
     }
@@ -212,16 +290,23 @@ export class Ink {
       const text = graph.projects[project], font = `500 ${rank < 6 ? 14 : 12.5}px ${SERIF}`;
       ctx.font = font;
       const half = ctx.measureText(text).width / 2;
-      // A name hangs under its orbit; when that place is taken it goes over it, or beside it.
-      const orbit = view.rings.get(project);
-      const hold = orbit && orbit.r < ORBIT_NAME_MAX_PX ? orbit : { x: sx(i), y: sy(i), r: this.radius(i, view) * 2.2 };
+      // A name hangs under the disc of its galaxy; when that place is taken it goes over it, or beside it.
+      const disc = view.rings.get(project), own = this.radius(i, view) * 2.2;
+      const hold = disc && disc.r < ORBIT_NAME_MAX_PX ? disc : { x: sx(i), y: sy(i), rx: own, ry: own };
       /** @type {[number, number][]} */
-      const places = [[hold.x, hold.y + hold.r + 13], [hold.x, hold.y - hold.r - 13],
-                      [hold.x + hold.r + 9 + half, hold.y], [hold.x - hold.r - 9 - half, hold.y]];
-      const fill = `rgba(${INK}, ${alpha.toFixed(3)})`;
-      if (!places.some((under) => name(i, text, font, fill, { under })) && (rank < 6 || alone)) {
-        name(i, text, font, fill, { under: places[0], force: true });
+      const places = [[hold.x, hold.y + hold.ry + 14], [hold.x, hold.y - hold.ry - 14],
+                      [hold.x + hold.rx + 10 + half, hold.y], [hold.x - hold.rx - 10 - half, hold.y]];
+      const fill = `rgba(${INK}, ${alpha.toFixed(3)})`, plate = 0.42 * Math.min(alpha * 1.4, 1);
+      if (!places.some((under) => name(i, text, font, fill, { under, plate })) && (rank < 6 || alone)) {
+        name(i, text, font, fill, { under: places[0], force: true, plate });
       }
+    }
+    // The hole is named by what circles it, once it is large enough on the screen to be looked at.
+    const hole = view.hole;
+    if (hole && hole.count > 0 && hole.r > 5 && hole.shows > 0.05) {
+      const alpha = 0.8 * hole.shows * clamp((hole.r - 5) / 6, 0, 1);
+      name(0, `${hole.count} stale`, `italic 500 12.5px ${SERIF}`, `rgba(${INK}, ${alpha.toFixed(3)})`,
+           { under: [hole.x, hole.y + hole.r * 3.9 + 14], plate: 0.42 * alpha });
     }
     if (narrowed) return;
 
@@ -235,14 +320,16 @@ export class Ink {
       else if (nodes[i].k !== "project" && z > 5 && !graph.routine(i)) singles.push(i);
     }
     tasks.sort((a, b) => graph.degree[b] * near(b) - graph.degree[a] * near(a));
-    for (const i of tasks.slice(0, 48)) {
+    for (const i of tasks.slice(0, TASK_NAMES)) {
       const alpha = clamp((near(i) - 1.9) / 1.2, 0, 1) * 0.74;
-      name(i, cut(nodes[i].l, 34), `11px ${SANS}`, `rgba(${INK}, ${alpha.toFixed(3)})`);
+      name(i, cut(nodes[i].l, 28), `11px ${SANS}`, `rgba(${INK}, ${alpha.toFixed(3)})`);
     }
-    singles.sort((a, b) => near(b) - near(a));
-    for (const i of singles.slice(0, 70)) {
+    // Of single memories the pinned and the weighty (a decision, a milestone) are named before the merely near.
+    const weight = (/** @type {number} */ i) => near(i) * graph.size[i] * (view.pins.has(i) ? 2 : 1);
+    singles.sort((a, b) => weight(b) - weight(a));
+    for (const i of singles.slice(0, SINGLE_NAMES)) {
       const alpha = clamp((near(i) - 5) / 2, 0, 1) * 0.7;
-      name(i, cut(nodes[i].l, 42), `11px ${SANS}`, `rgba(${INK}, ${alpha.toFixed(3)})`);
+      name(i, cut(nodes[i].l, 32), `11px ${SANS}`, `rgba(${INK}, ${alpha.toFixed(3)})`);
     }
   }
 }

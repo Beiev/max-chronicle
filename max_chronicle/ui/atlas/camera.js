@@ -189,6 +189,17 @@ export class Camera {
     this.spin = { yaw: 0, pitch: 0 };
   }
 
+  /**
+   * Changes where a flight under way is going, without starting it again.
+   * @param {Vec3} target @param {number} dist @returns {boolean} whether there was a flight to change
+   */
+  bend(target, dist) {
+    if (!this.flight) return false;
+    this.flight.to.target = [...target];
+    this.flight.to.dist = dist;
+    return true;
+  }
+
   /** Jumps there at once. @param {Vec3} target @param {number} dist */
   jumpTo(target, dist) {
     this.flight = null;
