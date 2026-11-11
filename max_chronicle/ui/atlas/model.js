@@ -294,13 +294,14 @@ export class Graph {
   /**
    * The figure of each task, as a constellation is drawn: from the task to the first of its memories, and from each
    * memory to the next in the order they were written. Lines of the drawing, not edges of the memory: nothing new is
-   * said by them, they only show the task as one thing with a beginning and an end.
+   * said by them, they only show the task as one thing with a beginning and an end. A memory let go has left its
+   * galaxy for the hole, and one hidden as a copy has left the map: the figure goes through those that stay.
    * @returns {[number, number][]} pairs of nodes
    */
   figures() {
     /** @type {Map<number, number[]>} */ const of = new Map();
     for (const e of this.edges) {
-      if (e.k !== EDGE.task) continue;
+      if (e.k !== EDGE.task || this.stale[e.s] || this.gone[e.s]) continue;
       const list = of.get(e.t) || [];
       list.push(e.s);
       of.set(e.t, list);

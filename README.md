@@ -14,6 +14,12 @@ vector search is optional; the core works without Ollama or paid APIs.
 A stored assertion is not automatically a verified fact. Its author, evidence,
 and kind (`observed`, `decision`, or `assumption`) remain visible.
 
+[![The Atlas: the whole memory as a sky, every project a galaxy](docs/images/atlas-sky.jpg)](docs/OPERATIONS.md#atlas)
+
+*The Atlas, the memory as a sky to wander through: every project a galaxy, every
+memory a light in it, and a river of time underneath. The pictures on this page
+show a made-up memory.*
+
 ## Quick start
 
 ```bash
@@ -75,6 +81,10 @@ anything is stored.
   frames any stretch of days and replays how the memory grew.
   The operator can pin a memory to the brief, mark it stale or hide a copy of it
   there; each action is an event by the operator, and undoing it is another.
+
+  | Close to a galaxy: tasks by name, two of them comets | Where stale memories go |
+  | --- | --- |
+  | ![A galaxy from close by, with its tasks named and comets among them](docs/images/atlas-galaxy.jpg) | ![The black hole with the stale memories that circle it](docs/images/atlas-hole.jpg) |
 - **CLI:** `chronicle query-memory`, `chronicle timeline --as-of`, `chronicle record`;
   `chronicle doctor --summary` answers "is everything running" on one screen.
 
