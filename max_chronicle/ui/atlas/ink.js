@@ -121,7 +121,9 @@ export class Ink {
     }
 
     // what the memory in focus is joined to: brass, heavy where it leaves and light where it arrives
-    if (view.focus >= 0 && view.inked.length && p[view.focus * 3 + 2] > 0) {
+    // What is in focus may not be on the map on the day shown: then it holds no lines, no ring and no name here.
+    const held = view.focus >= 0 && view.shown(view.focus);
+    if (held && view.inked.length && p[view.focus * 3 + 2] > 0) {
       const fx = sx(view.focus), fy = sy(view.focus);
       ctx.save();
       ctx.lineCap = "round";
@@ -152,7 +154,7 @@ export class Ink {
     for (const [index, alpha] of /** @type {[number, number][]} */ ([[view.chosenEdge, 0.95], [view.hoveredEdge, 0.7]])) {
       if (index < 0 || (index === view.chosenEdge && alpha < 0.9)) continue;
       const e = graph.edges[index];
-      if (!e || p[e.s * 3 + 2] === 0 || p[e.t * 3 + 2] === 0) continue;
+      if (!e || p[e.s * 3 + 2] === 0 || p[e.t * 3 + 2] === 0 || !view.shown(e.s) || !view.shown(e.t)) continue;
       ctx.save();
       ctx.strokeStyle = e.k === EDGE.similar ? SIMILAR_TINT : graph.colorOf(nodes[e.s].p);
       ctx.globalAlpha = alpha;
@@ -172,7 +174,7 @@ export class Ink {
 
     // rings: what is in focus is held in brass, what the pointer is on in starlight
     const ring = (/** @type {number} */ i, /** @type {string} */ stroke, /** @type {number} */ grow) => {
-      if (p[i * 3 + 2] === 0) return;
+      if (p[i * 3 + 2] === 0 || !view.shown(i)) return;
       ctx.beginPath();
       ctx.arc(sx(i), sy(i), this.radius(i, view) * 1.9 + 5 + grow, 0, Math.PI * 2);
       ctx.strokeStyle = stroke;
@@ -245,7 +247,7 @@ export class Ink {
       return true;
     };
 
-    if (view.focus >= 0 && p[view.focus * 3 + 2] > 0) {
+    if (held && p[view.focus * 3 + 2] > 0) {
       name(view.focus, cut(graph.title(view.focus), 44), `600 13px ${SANS}`, `rgb(${INK})`, { force: true, plate: 0.8 });
       // The neighbours a reader most likely came for: the latest first, the routine ones last.
       // A sun among them is named as the projects are, further down.
@@ -260,7 +262,7 @@ export class Ink {
     if (chosen) {
       // Both ends of the line are named; the second goes under its node when the first is in its way.
       const say = (/** @type {number} */ i, /** @type {{force?: boolean, below?: boolean}} */ how) =>
-        p[i * 3 + 2] > 0 && name(i, cut(graph.title(i), 56), `600 12px ${SANS}`, `rgb(${INK})`, { ...how, plate: 0.8 });
+        p[i * 3 + 2] > 0 && view.shown(i) && name(i, cut(graph.title(i), 56), `600 12px ${SANS}`, `rgb(${INK})`, { ...how, plate: 0.8 });
       say(chosen.s, { force: true });
       if (!say(chosen.t, {})) say(chosen.t, { force: true, below: true });
     }
@@ -301,7 +303,7 @@ export class Ink {
     }
     // The hole is named by what circles it, once it is large enough on the screen to be looked at.
     const hole = view.hole;
-    if (hole && hole.r > 5 && hole.shows > 0.05) {
+    if (hole && hole.count > 0 && hole.r > 5 && hole.shows > 0.05) {
       const alpha = 0.8 * hole.shows * clamp((hole.r - 5) / 6, 0, 1);
       name(0, `${hole.count} stale`, `italic 500 12.5px ${SERIF}`, `rgba(${INK}, ${alpha.toFixed(3)})`,
            { under: [hole.x, hole.y + hole.r * 3.9 + 14], plate: 0.42 * alpha });

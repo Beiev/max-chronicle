@@ -106,7 +106,7 @@ export class Gas {
      * and how far toward the sun it is drawn.
      */
     /** @type {number[]} */ const anchor = [];
-    /** @type {import("./shape.js").Galaxy[]} */ const home = [];
+    /** @type {import("./shape.js").Ball[]} */ const home = [];
     /** @type {number[]} */ const share = [];
     /** @type {number[]} */ const off = [];
     /** @type {number[]} */ const inward = [];
@@ -152,6 +152,24 @@ export class Gas {
       hang(galaxy.sun, 0.15, toned(CREAM, 0.08), 0.42, 0, 0, false);
       this.ranges.set(project, { start, count: anchor.length - start });
     }
+    /**
+     * The tails of the comets of one project, drawn sharp as the dust is. The lights of a tail leave the head one
+     * after another, so the tail streams; each comet in its own time.
+     * @param {import("./shape.js").Ball} body @param {() => number} random @param {Vec3} hue
+     */
+    const tails = (body, random, hue) => {
+      for (const node of body.members) {
+        if (!(Number(graph.mark[node]) & MARK.working)) continue;
+        const blue = mix(mix(ICE, AZURE, 0.8), hue, 0.08), warm = mix(mix(CREAM, GOLD, 0.6), hue, 0.1), phase = random();
+        for (let k = 0; k < ION_LIGHTS + DRIFT_LIGHTS; k++) {
+          const ion = k < ION_LIGHTS, tint = ion ? blue : warm;
+          anchor.push(node); home.push(body); share.push(1); inPlane.push(ion ? ION : DRIFT);
+          inward.push(phase + (ion ? k / ION_LIGHTS : (k - ION_LIGHTS) / DRIFT_LIGHTS));
+          off.push(0, 0, 0);
+          look.push(tint[0], tint[1], tint[2], ion ? 0.52 : 0.22, 1, -1, NO_CAP);
+        }
+      }
+    };
     // the dust of stars, galaxy by galaxy: each point close by one memory, lying as the galaxy lies
     /** The dust of each galaxy, by project: drawn sharp, over its gas and under its memories. @type {Map<number, Range>} */
     this.dust = new Map();
@@ -170,20 +188,14 @@ export class Gas {
         // many faint, few bright
         look.push(tint[0], tint[1], tint[2], 0.16 + 0.7 * Math.pow(random(), 2.6), 1, -1, DUST_PX);
       }
-      // The tails of its comets, drawn sharp as the dust is. The lights of a tail leave the head one after another,
-      // so the tail streams; each comet in its own time.
-      for (const node of galaxy.members) {
-        if (!(Number(graph.mark[node]) & MARK.working)) continue;
-        const blue = mix(mix(ICE, AZURE, 0.8), hue, 0.08), warm = mix(mix(CREAM, GOLD, 0.6), hue, 0.1), phase = random();
-        for (let k = 0; k < ION_LIGHTS + DRIFT_LIGHTS; k++) {
-          const ion = k < ION_LIGHTS, tint = ion ? blue : warm;
-          anchor.push(node); home.push(galaxy); share.push(1); inPlane.push(ion ? ION : DRIFT);
-          inward.push(phase + (ion ? k / ION_LIGHTS : (k - ION_LIGHTS) / DRIFT_LIGHTS));
-          off.push(0, 0, 0);
-          look.push(tint[0], tint[1], tint[2], ion ? 0.52 : 0.22, 1, -1, NO_CAP);
-        }
-      }
+      tails(galaxy, random, hue);
       this.dust.set(project, { start, count: anchor.length - start });
+    }
+    // A project too small for a galaxy has no dust of stars, and its comets have their tails all the same.
+    for (const [project, ball] of shaper.balls) {
+      const start = anchor.length;
+      tails(ball, mulberry32(5151 + project * 61), rgb(graph.colorOf(project)));
+      if (anchor.length > start) this.dust.set(project, { start, count: anchor.length - start });
     }
     this.motes = anchor.length;
     this.anchor = Int32Array.from(anchor);
@@ -240,9 +252,10 @@ export class Gas {
   /** Counts how much of each galaxy exists on a day. @param {number} play */
   updateBorn(play) {
     for (const galaxy of new Set(this.home)) {
+      if (!galaxy.members.length) continue;
       let born = 0;
       for (const i of galaxy.members) if (this.graph.birth[i] <= play) born++;
-      this.born.set(galaxy.project, born / Math.max(galaxy.members.length, 1));
+      this.born.set(galaxy.project, born / galaxy.members.length);
     }
   }
 
@@ -250,10 +263,11 @@ export class Gas {
    * Puts every light where it is this frame.
    * @param {Float32Array} drawn x, y, z per node, as drawn
    * @param {{time: number, play: number, flat: boolean, centre: Vec3, radius: number, beside: number,
-   *   shows: (project: number) => number, hole?: number}} view time in seconds; play is the day the time machine
-   *   shows; centre and radius are of the ball the suns hang in; shows says how much of a galaxy's gas shows (less
-   *   beside a focus, or beside a project shown alone) and beside the same for the specks; hole is how much of the
-   *   hole shows
+   *   shows: (project: number) => number, seen: (node: number) => boolean, hole?: number}} view time in seconds;
+   *   play is the day the time machine shows; centre and radius are of the ball the suns hang in; shows says how
+   *   much of a galaxy's gas shows (less beside a focus, or beside a project shown alone) and beside the same for
+   *   the specks; seen says whether a node is on the map now (a comet's tails go where its head goes); hole is how
+   *   much of the hole shows
    * @returns {Float32Array}
    */
   place(drawn, view) {
@@ -272,11 +286,13 @@ export class Gas {
         at[o] = drawn[node] + dx * out; at[o + 1] = drawn[node + 1] + dy * out; at[o + 2] = drawn[node + 2] + dz * out;
         if (!ion) {
           // The tail of dust falls behind: it bends against the way the comet goes round with its galaxy.
-          const n = galaxy.n, way = (galaxy.rate < 0 ? -1 : 1) * t * t * TAIL_LONG * 0.42 * reach;
+          const n = galaxy.n, way = Math.sign(galaxy.rate) * t * t * TAIL_LONG * 0.42 * reach;
           at[o] -= (n[1] * dz - n[2] * dy) * way; at[o + 1] -= (n[2] * dx - n[0] * dz) * way; at[o + 2] -= (n[0] * dy - n[1] * dx) * way;
         }
         at[o + 3] = (ion ? 0.006 + 0.026 * t : 0.01 + 0.04 * t) * reach;
-        at[o + 4] = Math.pow(1 - along, 1.5) * (view.play >= birth[this.anchor[j]] ? 1 : 0) * view.shows(galaxy.project);
+        // A tail is there while its head is: born by the day shown, and not switched off with its kind.
+        const there = view.play >= birth[this.anchor[j]] && view.seen(this.anchor[j]) ? 1 : 0;
+        at[o + 4] = Math.pow(1 - along, 1.5) * there * view.shows(galaxy.project);
         continue;
       }
       let ox = this.off[j * 3] * reach, oy = this.off[j * 3 + 1] * reach, oz = this.off[j * 3 + 2] * reach;

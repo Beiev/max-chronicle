@@ -391,7 +391,8 @@ async function main() {
         turn.pitch = clamp(Math.asin(clamp(b[1] / length, -1, 1)), -1.2, 1.2);
       }
     }
-    return { target, dist: Math.min(camera.distanceToFit(need), camera.fitDist / 2.2), turn };
+    // The hole and what circles it are taken whole, however small the memory around them is.
+    return { target, dist: hole ? camera.distanceToFit(need) : Math.min(camera.distanceToFit(need), camera.fitDist / 2.2), turn };
   }
   /**
    * Turns the camera to what the reader is on: a memory, the line between two,
@@ -626,25 +627,30 @@ async function main() {
     const marks = body.marks || {};
     graph.pinned[i] = marks.pinned ? 1 : 0;
     if (graph.pinned[i]) pins.add(i); else pins.delete(i);
-    const wasStale = graph.stale[i];
+    const wasStale = graph.stale[i], circled = shaper.fallen[i];
     graph.stale[i] = marks.stale ? 1 : 0;
-    if (graph.stale[i] !== wasStale) {
-      graph.paint(i);
-      renderer.setNodes(graph);
-      // It leaves its galaxy for the hole, or comes back from it: the lights glide to where they now belong.
-      shaper.restale(graph.stale);
-      goal = shaper.shape(laid, dims);
-      gliding = true;
-      layGas();
-      gas.updateBorn(play);
-      updateHighlight();
-      stale = true;
-      // The reader goes with the memory they are on.
-      if (focus === i) aim(true, true);
-    }
     const hide = body.hidden ? 1 : 0;
     if (graph.gone[i] !== hide) counts[graph.kind[i]] += hide ? -1 : 1;
     graph.gone[i] = hide;
+    if (graph.stale[i] !== wasStale) {
+      graph.paint(i);
+      renderer.setNodes(graph);
+      stale = true;
+    }
+    if ((graph.stale[i] && !graph.gone[i] ? 1 : 0) !== circled) {
+      // It leaves its galaxy for the hole, or comes back from it, or is gone from the map and from the hole with it.
+      // It is put where it was last seen, in the company it now keeps, and glides from there to where it belongs.
+      /** @type {[number, number, number]} */ const seenAt = [drawn[i * 3], drawn[i * 3 + 1], drawn[i * 3 + 2]];
+      shaper.restale(graph.letGo());
+      goal = shaper.shape(laid, dims);
+      positions.set(shaper.unturned(positions, i, seenAt), i * 3);
+      gliding = true;
+      layGas();
+      gas.updateBorn(play);
+      stale = true;
+      // The reader goes with the memory they are on.
+      if (focus === i && !graph.gone[i]) aim(true, true);
+    }
     updateHighlight();
     renderFilters();
     if (!graph.gone[i]) return;
@@ -978,11 +984,15 @@ async function main() {
 
   // ---------- the sky alone ----------
   const whisper = $("whisper");
+  /** What steps out when the sky is left alone: everything but the sky, the panel of what is open, and the way back. */
+  const chrome = /** @type {HTMLElement[]} */ ([...document.querySelectorAll(".bar > :not(.immerse), .filters, .legend, .time, .known, .hint")]);
   let whisperTimer = 0;
   /** Hides everything but the sky and what the reader opens, or brings it back. @param {boolean} on */
   function setImmersed(on) {
     immersed = on;
     document.body.classList.toggle("immersed", on);
+    // Out of sight is out of reach: the keyboard and a screen reader pass over what has stepped out.
+    for (const part of chrome) part.inert = on;
     $("immerse").setAttribute("aria-pressed", String(on));
     whisper.classList.toggle("on", on);
     clearTimeout(whisperTimer);
@@ -999,6 +1009,9 @@ async function main() {
   function endOverture() {
     if (!overture) return;
     overture = 0;
+    // The camera was on its way in: it arrives now, and does not go on for seconds after the reader has spoken.
+    const flight = camera.flight;
+    if (flight) camera.flyTo(flight.to.target, flight.to.dist, performance.now(), { yaw: flight.to.yaw, pitch: flight.to.pitch, ms: 600 });
     jumpTo(days);
     dateBig.classList.remove("on");
     renderKnown();
@@ -1094,6 +1107,7 @@ async function main() {
   }
   /** Goes where an address says. @param {import("./urlstate.js").Place} place */
   function goTo(place) {
+    endOverture();
     setFlat(Boolean(place.flat), false);
     const end = place.day ? dayEnd(place.day) : null, start = place.from ? dayStart(place.from) : null;
     jumpTo(end === null ? days : clamp((end - graph.span0) / DAY, 0, days));
@@ -1146,7 +1160,7 @@ async function main() {
   resize();
   jumpTo(days);
   if (Object.keys(arrival).length) goTo(arrival);
-  else if (!calm && !camera.flat) {
+  else if (!calm && !camera.flat && written.length) {
     overture = performance.now();
     const fit = camera.dist, to = [...camera.target];
     camera.dist = fit * OVERTURE_FROM.back; camera.yaw += OVERTURE_FROM.yaw; camera.pitch += OVERTURE_FROM.pitch;
@@ -1280,8 +1294,11 @@ async function main() {
     const narrowed = focus >= 0 || line >= 0 ? focusMix : 0, home = focus >= 0 ? nodes[focus].p : null;
     const whole = globe || { centre: /** @type {[number, number, number]} */ ([0, 0, 0]), radius };
     // The hole: how its disc lies to the reader, how near it is, and where its name goes.
+    // It is there while something circles it that is on the map now: on the day shown, its kind switched on.
     const pit = shaper.hole;
-    holeMix += ((pit ? 1 : 0) - holeMix) * (1 - Math.exp(-dt * 1.2));
+    let circling = 0;
+    if (pit) for (const i of pit.members) if (shown(i)) circling++;
+    holeMix += ((circling ? 1 : 0) - holeMix) * (1 - Math.exp(-dt * 1.2));
     /** @type {[number, number, number]} */ let holeLies = [1, 0, 1];
     let holeNear = -1;
     view.hole = null;
@@ -1294,11 +1311,11 @@ async function main() {
       const on = camera.project(pit.centre[0], pit.centre[1], pit.centre[2]);
       if (on) {
         holeNear = on[2];
-        view.hole = { x: on[0], y: on[1], r: pit.shadow * on[2], count: pit.members.length, shows: holeMix * (1 - 0.6 * narrowed) };
+        view.hole = { x: on[0], y: on[1], r: pit.shadow * on[2], count: circling, shows: holeMix * (1 - 0.6 * narrowed) };
       }
     }
     renderer.setGasAt(gas.place(drawn, {
-      hole: holeMix,
+      hole: holeMix, seen: shown,
       time, play, flat: camera.flat, centre: whole.centre, radius: whole.radius, beside: 1 - 0.3 * narrowed,
       shows: (project) => (isolate === null || isolate === project ? 1 : 1 - 0.8 * focusMix) * (1 - (project === home ? 0.3 : 0.66) * narrowed),
     }));

@@ -178,7 +178,9 @@ galaxy around its sun, and the kind of galaxy is read off the project: a large
 one still being written is a spiral (three arms when its tasks are many, some
 with a bar), a large one gone quiet a great ball; a middling one a barred
 spiral or a ring while it is written and a lens once it is quiet; a small one a
-cloud, or a tight cluster once quiet. A project of fewer than eight memories
+cloud, or a tight cluster once quiet. A project is still being written when
+some of its memories are of the month before the memory was read, as the
+server's clock had it then. A project of fewer than eight memories
 keeps a plain ball. Within a galaxy the oldest memories are the heart and the
 newest the rim, the memories of one task stand on one side, and a galaxy turns
 slowly about its own pole while nothing is held (a memory open, or under the
@@ -191,9 +193,13 @@ key: it shows each symbol and switches its kind on and off.
 Some lights are more than their kind, and each such thing in the sky is a fact
 about the memory:
 
-- **A comet** is a task at work: open, and touched in the last two weeks. Its
-  head is the task; a thin blue tail points away from the sun of its galaxy and
-  a wider one of dust falls behind the way the galaxy turns.
+- **A comet** is a task at work: open, and touched in the two weeks before the
+  memory was read (the moment the server answered, not the date of the newest
+  memory: in an archive nobody writes in, nothing is at work). Its head is the
+  task; a thin blue tail points away from the sun of its project and, in a
+  galaxy, a wider one of dust falls behind the way the galaxy turns. The tails
+  go where the head goes: out with the Tasks switch, and not there before the
+  task was opened.
 - **A pulsar** is a record the machinery wrote on its own schedule (a daily
   summary, a commit, a digest run, maintenance): it beats evenly instead of
   twinkling.
@@ -201,13 +207,17 @@ about the memory:
   nearly the same words, and a small companion circles it.
 - **A bright star**, with four rays, is among the memories joined to the most
   others by links, facts and resemblance (the top three in a hundred, four
-  others at least). Routine records are never bright stars.
+  other memories at least; two that link each other are joined once, and a
+  copy does not count). Routine records are never bright stars.
 - **A nova** is a decision: when the time machine passes the day it was made,
   a ring of light leaves it.
 - **The hole** is where stale memories go. A memory marked stale leaves its
   galaxy and circles a black hole at the edge of the sky, the oldest nearest
   and fastest; marked current again, it returns. With nothing stale there is
-  no hole. The hole is named by how many circle it.
+  no hole, and the time machine shows it only on days when something already
+  circles it. A stale memory hidden as a copy is gone from the hole as from the
+  map. The hole is named by how many circle it. Every project keeps clear of
+  it by its whole reach, so nothing current lies in its disc.
 
 Not every light is a memory. The gas of a galaxy, the dust of faint stars
 through it, the bridges between galaxies and the specks between them are drawn
@@ -215,7 +225,9 @@ from the memories and cannot be pointed at: the gas and the dust lie where the
 memories lie and come with them as the time machine plays, and a bridge joins
 two galaxies whose memories are joined, by links written in notes and by
 resemblance in meaning, the brighter the more they share. Where two galaxies
-overlap on the screen the nearer lies over the further.
+overlap on the screen the nearer lies over the further. The gas is drawn a few
+galaxies at a time, by depth: between two of the same few, the lights of the
+further one are not veiled by the gas of the nearer.
 
 Behind all of it is the far sky, at no distance: only turning moves it. It has
 stars as the night has them (many faint, few bright, most white, some blue,
@@ -248,9 +260,10 @@ lists the controls.
 
 A page opened on no place in particular begins with an overture of a few
 seconds: the memory from its first day to now, the sky filling at an even pace
-as the camera comes in. Any click, key or turn of the wheel ends it; a page
-opened on a memory, a line or a project, and a browser set to reduce motion,
-skip it. Left alone for a quarter of a minute the sky drifts, and with a memory
+as the camera comes in. Any click, key or turn of the wheel ends it, and so
+does going back or forward in the browser's history: the time goes to the last
+day and the camera arrives at once. A page opened on a memory, a line or a
+project, a browser set to reduce motion, and an empty memory skip it. Left alone for a quarter of a minute the sky drifts, and with a memory
 open it is a slow walk around that memory.
 
 A click flies to a memory and opens it in full, with its links, backlinks and

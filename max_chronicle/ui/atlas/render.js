@@ -497,7 +497,7 @@ uniform float u_play, u_from, u_focus, u_dim, u_similar, u_focal, u_fit;
 ${PROJECT}
 out vec4 v_color;
 out float v_along;
-out float v_hl;
+out float v_bead;
 void main() {
   float depth = depthOf(a_pos, gl_Position);
   float born = smoothstep(-0.5, 0.0, u_play - a_birth) * step(u_from - 0.01, a_since);
@@ -518,22 +518,21 @@ void main() {
   float closeBy = (lit || byMeaning) ? 1.0 : smoothstep(1.5, 3.6, nearness);
   v_color = vec4(a_color.rgb, min(strength, 0.7) * born * meaning * keep * shown * closeBy * fog(depth));
   v_along = a_along;
-  v_hl = a_hl;
+  // A light travels along a lit line, as much of it as the line itself shows: none along a line not yet born, hidden
+  // with its kind, or left to the ink to draw.
+  v_bead = lit ? born * meaning * shown * fog(depth) : 0.0;
 }`;
 
 const EDGE_FS = `#version 300 es
 precision highp float;
 in vec4 v_color;
 in float v_along;
-in float v_hl;
+in float v_bead;
 uniform float u_time;
 out vec4 o;
 void main() {
-  float a = v_color.a;
-  if (v_hl > 0.75) {
-    float bead = smoothstep(0.88, 1.0, fract(v_along * 1.0 - u_time * 0.32));
-    a = min(a + bead * 0.55, 1.0);
-  }
+  float bead = smoothstep(0.88, 1.0, fract(v_along * 1.0 - u_time * 0.32));
+  float a = min(v_color.a + bead * 0.55 * v_bead, 1.0);
   o = vec4(v_color.rgb * a, a);
 }`;
 
@@ -795,6 +794,25 @@ export class Renderer {
     gl.enable(gl.BLEND);
     // Premultiplied colour laid over what is there: lines and lights cover, they do not add up.
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    // Two textures, each in a slot of its own for the whole frame: the sheet of gas in the first, the painted wisps
+    // in the second. Whatever binds a texture says which slot first: a sheet bound into the wisps' slot would be
+    // read by the gas while the gas is drawn into it.
+    const sheet = this.sheet, sw = Math.max(1, Math.round(canvas.width * SHEET_SHARE)), sh = Math.max(1, Math.round(canvas.height * SHEET_SHARE));
+    gl.activeTexture(gl.TEXTURE0);
+    // The sheet the gas is drawn into follows the size of the window.
+    if (sheet.w !== sw || sheet.h !== sh) {
+      sheet.w = sw; sheet.h = sh;
+      gl.bindTexture(gl.TEXTURE_2D, sheet.image);
+      if (this.fineSheet) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, sw, sh, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, sw, sh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, sheet.frame);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sheet.image, 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
 
     const camera = f.camera;
     const k = [(2 * camera.focal) / f.res[0], (2 * camera.focal) / f.res[1]];
@@ -895,21 +913,6 @@ export class Renderer {
     if (!this.groups.length) {
       gl.bindVertexArray(this.nodeVao);
       gl.drawArrays(gl.POINTS, 0, this.nodeCount);
-    }
-    // The sheet the gas is drawn into follows the size of the window.
-    const sheet = this.sheet, sw = Math.max(1, Math.round(canvas.width * SHEET_SHARE)), sh = Math.max(1, Math.round(canvas.height * SHEET_SHARE));
-    if (sheet.w !== sw || sheet.h !== sh) {
-      sheet.w = sw; sheet.h = sh;
-      gl.bindTexture(gl.TEXTURE_2D, sheet.image);
-      if (this.fineSheet) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, sw, sh, 0, gl.RGBA, gl.HALF_FLOAT, null);
-      else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, sw, sh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, sheet.frame);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sheet.image, 0);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
     // From the furthest to the nearest, a few galaxies at a time: their gas, then their memories over it.
     const groups = f.order.map((which) => this.groups[which]).filter(Boolean);

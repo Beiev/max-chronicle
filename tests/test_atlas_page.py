@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -28,6 +29,8 @@ def run(tmp_path) -> Callable[..., Any]:
     for source in atlas.UI_DIR.glob("*.js"):
         text = re.sub(r'(from\s+"\./[\w.]+)\.js"', r'\1.mjs"', source.read_text(encoding="utf-8"))
         (tmp_path / f"{source.stem}.mjs").write_text(text, encoding="utf-8")
+    # A page to run the wiring on: a document, a canvas and a clock, all of them fake.
+    shutil.copy(Path(__file__).with_name("atlas_fake_page.mjs"), tmp_path / "atlas_fake_page.mjs")
 
     def run_script(script: str, *, timezone_name: str = "UTC") -> Any:
         (tmp_path / "script.mjs").write_text(script, encoding="utf-8")
@@ -181,6 +184,7 @@ def test_the_model_reads_the_map_and_takes_the_edges_by_meaning(run) -> None:
           edgeSince: [...buffers.since],
           neighboursOfDecided: graph.neighbours(3).map((link) => [link.o, link.k, link.out]),
           similar: EDGE.similar,
+          letGo: [...graph.letGo()], hiddenToo: (graph.gone[4] = 1, [...graph.letGo()]),
         }));
     """ % _MEMORY)
 
@@ -201,6 +205,8 @@ def test_the_model_reads_the_map_and_takes_the_edges_by_meaning(run) -> None:
     # is gone from day 2 on. A task and a project stay as the frame, so the line between them is in every range.
     assert out["edgeSince"][1:] == [1, 2, 3, 1, 1] and out["edgeSince"][0] > 1e8
     assert out["neighboursOfDecided"] == [[2, 0, True]]  # the note went from the map as a copy
+    # What circles the hole is what is stale and still on the map: hidden as a copy, it is gone from there too.
+    assert out["letGo"] == [0, 0, 0, 0, 1, 0] and out["hiddenToo"] == [0] * 6
 
 
 def test_the_layout_starts_from_what_an_earlier_visit_kept(run) -> None:
@@ -335,6 +341,26 @@ def test_a_flight_arrives_and_the_flat_map_slides_instead_of_turning(run) -> Non
 # ---------------------------------------------------------------------------
 
 
+def test_a_flight_can_be_bent_to_a_new_place_without_starting_again(run) -> None:
+    out = run("""
+        import { Camera } from "./camera.mjs";
+        const camera = new Camera();
+        camera.setFrame({ cx: 400, cy: 300, w: 800, h: 600, height: 600 });
+        const before = [...camera.target, camera.dist], idle = camera.bend([1, 2, 3], 500), unmoved = [...camera.target, camera.dist];
+        camera.flyTo([100, 0, 0], 400, 0, { ms: 1000 });
+        camera.step(500, 0.016);
+        const half = [...camera.target];
+        const bent = camera.bend([0, 200, 0], 800), started = camera.flight.start;
+        camera.step(1000, 0.016);
+        console.log(JSON.stringify({ idle, same: before.every((v, k) => v === unmoved[k]), half, bent, started,
+                                     arrived: [...camera.target, camera.dist], landed: camera.flight === null }));
+    """)
+
+    assert out["idle"] is False and out["same"]  # with no flight under way there is nothing to bend
+    assert 0 < out["half"][0] < 100 and out["bent"] is True and out["started"] == 0  # the same flight, from when it began
+    assert _near(out["arrived"], [0, 200, 0, 800], within=1e-6) and out["landed"]
+
+
 def test_the_pointer_takes_a_node_before_a_line_and_a_line_only_between_its_ends(run) -> None:
     out = run("""
         import { pickNode, pickEdge, distanceToSegment } from "./pick.mjs";
@@ -451,7 +477,10 @@ def test_each_project_is_given_a_galaxy_read_off_the_project_itself(run) -> None
         let closest = Infinity;
         for (const a of suns) for (const b of suns) if (a !== b) closest = Math.min(closest, far(shaped, a.sun, b.sun) / (a.reach + b.reach));
         const again = new Shaper(graph).shape(raw, 3);
+        // The same memory read two hundred days on: nobody is writing in it any more.
+        const aged = new Shaper({ ...graph, now: NOW + 200 * DAY });
         console.log(JSON.stringify({
+          aged: [0, 4].map((p) => aged.galaxies.get(p).form), balls: [[...shaper.balls.keys()], shaper.balls.get(1).members.length],
           shapedFrom: SHAPED_FROM, forms: [0, 1, 2, 3, 4, 5].map((p) => (of(p) ? of(p).form : null)), arms: [0, 2, 3].map((p) => of(p).arms),
           ages: [spiral.age[spiral.members.indexOf(members[0])], spiral.age[spiral.members.indexOf(members[members.length - 1])]],
           oldest: mean(wide.slice(0, 24)), newest: mean(wide.slice(-24)), widest: Math.max(...wide), reach: spiral.reach,
@@ -472,6 +501,9 @@ def test_each_project_is_given_a_galaxy_read_off_the_project_itself(run) -> None
     assert forms[0] in ("spiral", "barred") and forms[1] is None and forms[2] in ("lens", "ball")
     assert forms[3:] == ["ball", "cloud", "cluster"]
     assert out["arms"][0] in (2, 3) and out["arms"][2] == 0
+    # Whether a project is being written is asked of the day the memory is read: long after, the spiral is a great
+    # ball and the cloud a cluster. The project too small for a form is kept as a ball of its five memories.
+    assert out["aged"] == ["ball", "cluster"] and out["balls"] == [[1], 5]
     # The oldest memories are the heart and the newest the rim.
     assert out["ages"] == [0, 1] and out["oldest"] < 0.4 * out["newest"] and out["widest"] <= out["reach"] * 1.001
     # A disc with the thickness of a body: far wider than it is tall, and no memory stands above its heart.
@@ -531,13 +563,15 @@ def test_the_gas_hangs_on_the_memories_and_comes_with_them(run) -> None:
         edges.push({ s: first[4], t: first[5], k: 4, w: 0.9 });
         const birth = Float32Array.from(nodes, (node) => node.t / DAY);
         // One task of the spiral is at work: a comet.
-        const comet = first[0] + 3, mark = new Float32Array(nodes.length);
+        const comet = first[0] + 3, small = first[1] + 3, mark = new Float32Array(nodes.length);
         mark[comet] = 4;
+        // And so is the one task of the project too small for a galaxy.
+        mark[small] = 4;
         const world = { ...graph, edges, birth, mark, colorOf: (p) => ["#8db7e0", "#e0a98a", "#a9c98c", "#c3a6e0", "#e3c27e", "#7fc7cc"][p] };
         const shaper = new Shaper(world), shaped = shaper.shape(new Float32Array(laid), 3), gas = new Gas(world, shaper);
         const runs = [...gas.ranges.values(), ...gas.dust.values(), gas.field].sort((a, b) => a.start - b.start);
         const gapless = runs.every((r, k) => r.start === (k ? runs[k - 1].start + runs[k - 1].count : 0));
-        const view = { time: 0, play: 400, flat: false, centre: [0, 0, 0], radius: 900, beside: 1, shows: () => 1 };
+        const view = { time: 0, play: 400, flat: false, centre: [0, 0, 0], radius: 900, beside: 1, shows: () => 1, seen: () => true };
         gas.updateBorn(400);
         const now = gas.place(shaped, view).slice();
         const spiral = shaper.galaxies.get(0), own = gas.ranges.get(0), dust = gas.dust.get(0);
@@ -566,6 +600,9 @@ def test_the_gas_hangs_on_the_memories_and_comes_with_them(run) -> None:
         gas.updateBorn(400);
         const hidden = gas.place(shaped, { ...view, shows: (p) => (p === 0 ? 0 : 1) }).slice();
         const later = gas.place(shaped, { ...view, time: 7 }).slice();
+        // Tasks switched off: the head of the comet is not on the map.
+        const headless = gas.place(shaped, { ...view, seen: (i) => i !== comet }).slice();
+        const smallTail = gas.dust.get(1), smallHead = at(shaped, small), smallSun = at(shaped, 1);
         const beads = [];
         const bridge = gas.bridges[0], a = at(shaped, bridge.a), b = at(shaped, bridge.b), span = Math.hypot(...a.map((v, k) => v - b[k]));
         for (let j = gas.motes; j < gas.motes + 11; j++) {
@@ -588,19 +625,27 @@ def test_the_gas_hangs_on_the_memories_and_comes_with_them(run) -> None:
           driftAside: Math.max(...drift.map((d) => d[1])), driftOut: Math.min(...drift.map((d) => d[0])),
           streams: [0, 1, 2].some((k) => Math.abs(later[(tail + k) * AT] - now[(tail + k) * AT]) > 1e-3),
           tailPlain: gas.look[tail * LOOK + 5] < 0 && gas.look[tail * LOOK + 6] > 1e5,
+          smallTail: [smallTail.count, gas.anchor[smallTail.start] === small,
+                      dot(where(now, smallTail.start).map((v, k) => v - smallHead[k]), smallHead.map((v, k) => v - smallSun[k])) > 0],
+          tailShows: [now, half, hidden, headless].map((placed) => Math.max(...[...Array(TAILS).keys()].map((k) => placed[(tail + k) * AT + 4]))),
+          cometBorn: birth[comet],
           bridgeHidden: hidden[gas.motes * AT + 4], flatZ: Math.max(...[...flatAt].filter((_, index) => index % AT === 2).slice(0, flatGas.motes).map(Math.abs)),
           finite: [...now].every(Number.isFinite) && [...gas.look].every(Number.isFinite),
         }));
     """)
 
     assert out["sizes"] == [7, 5, 7, 5] and out["gapless"] and out["total"]  # every light is in one run, and the runs meet
-    assert out["galaxies"] == [5, 5]  # one run of gas and one of dust to a galaxy
+    # One run of gas and one of dust to a galaxy; the small project has no gas and no dust, only its comet's tails.
+    assert out["galaxies"] == [5, 6] and out["smallTail"] == [25, True, True]
     assert out["heart"] < 1e-3 and 0.1 < out["heartSize"] < 0.2 and out["plain"] and out["wispy"]
     # The dust of stars: many points to a galaxy, each close by a memory, each a point on the screen however near.
     assert out["dust"][0] >= 90 and out["dust"][1] < 0.16 and out["dust"][2] < 2 and out["inReach"]
     # The comet: both tails hang on the task at work and stream. The blue one runs straight out from the head along
     # the line from the sun, a quarter of the galaxy's reach at most; the one of dust leaves that line to one side.
     assert out["tailOn"] and out["streams"] and out["tailPlain"] and out["noHole"]
+    # A tail is there once its task is (this one was opened after day 352), steps back with its galaxy, and goes
+    # when its head is switched off with its kind.
+    assert out["cometBorn"] > 352 and out["tailShows"][0] > 0.5 and out["tailShows"][1:] == [0, 0, 0]
     assert 0 < out["blueOut"][0] and out["blueOut"][1] < 0.25 and out["blueOut"][2] < 1e-4
     assert out["driftAside"] > 0.01 and out["driftOut"] > 0
     # The gas comes with the memories as the time machine plays, and steps back with its galaxy.
@@ -717,19 +762,29 @@ def test_what_a_light_is_besides_its_kind_is_read_off_the_memory(run) -> None:
           { id: "e:copy", k: "event", l: "copy", p: 0, t: T0 + 13 * DAY, u: null, c: "note" },
         ];
         for (let i = 0; i < 12; i++) nodes.push({ id: "n:" + i, k: "note", l: "n" + i, p: 0, t: T0 + (20 + i) * DAY, u: null });
+        // Four more copies of the decision, and plain events enough that two memories in the whole may be bright stars.
+        for (let i = 0; i < 4; i++) nodes.push({ id: "e:c" + i, k: "event", l: "copy " + i, p: 0, t: T0 + (14 + i) * DAY, u: null, c: "note" });
+        for (let i = 0; i < 12; i++) nodes.push({ id: "e:f" + i, k: "event", l: "plain " + i, p: 0, t: T0 + (40 + i) * DAY, u: null, c: "note" });
         // The task at work has three memories, recorded out of order; the index links to every note; two notes link to each other.
         const edges = [[10, 1, 0], [8, 1, 0], [9, 1, 0]];
         for (let i = 0; i < 12; i++) edges.push([6, 8 + i, 2]);
         edges.push([8, 9, 2]);
+        // Two notes that link each other: a pair, however many lines are drawn between them.
+        edges.push([13, 14, 2], [14, 13, 2]);
         const graph = new Graph({ nodes, projects: ["alpha"], edges, span: [T0, END] });
+        // The same memory read forty days after its last entry.
+        const later = new Graph({ nodes, projects: ["alpha"], edges, span: [T0, END], generated_at: new Date((END + 40 * DAY) * 1000).toISOString() });
         const first = [...graph.mark];
-        // The daybook resembles five notes; the decision has a copy.
-        graph.addSimilar([0, 1, 2, 3, 4].map((i) => ["e:r", "n:" + i, 0.9, 0]).concat([["e:d", "e:copy", 0.99, 1]]));
+        // The daybook resembles thirteen memories, more than anything else is joined to; the decision has five copies.
+        graph.addSimilar([...Array(12).keys()].map((i) => ["e:r", "n:" + i, 0.9, 0]).concat([["e:r", "e:f0", 0.9, 0]],
+          [["e:d", "e:copy", 0.99, 1]], [0, 1, 2, 3].map((i) => ["e:d", "e:c" + i, 0.99, 1])));
         const buffers = graph.edgeBuffers(), lines = buffers.kind.length;
         console.log(JSON.stringify({
-          marks: MARK, figure: FIGURE, first: first.slice(0, 8), then: [...graph.mark].slice(0, 8), notes: [...graph.mark].slice(8),
+          marks: MARK, figure: FIGURE, first: first.slice(0, 8), then: [...graph.mark].slice(0, 8), notes: [...graph.mark].slice(8, 20),
+          copies: [...graph.mark].slice(20, 24), plain: [...graph.mark].slice(24),
           figures: graph.figures(), drawn: [...buffers.kind].slice(lines - 3), ends: [...buffers.ends].slice(lines * 2 - 6),
           ofIndex: buffers.color[3 * 4 + 3], ofPair: buffers.color[15 * 4 + 3],
+          read: [graph.now - END, later.now - END], later: later.mark[1],
         }));
     """)
 
@@ -738,10 +793,15 @@ def test_what_a_light_is_besides_its_kind_is_read_off_the_memory(run) -> None:
     # A comet is a task open and touched lately, not one left idle and not one closed. A decision is marked as one,
     # what the machinery wrote as routine, and the memory joined to the most others is the bright star.
     assert out["first"] == [0, marks["working"], 0, 0, marks["decided"], marks["routine"], marks["hub"], 0]
-    # With the lines by meaning: the decision and its copy are twins. The daybook resembles five notes and is no
-    # bright star for it: the machinery resembles itself.
+    # With the lines by meaning: the decision and its copies are twins. Two memories might be bright stars here and
+    # one is. The daybook resembles thirteen memories and is none: the machinery resembles itself. The decision is
+    # joined to five and is none either: they are its copies, not other things it is joined to.
     assert out["then"] == [0, marks["working"], 0, 0, marks["decided"] + marks["twin"], marks["routine"], marks["hub"], marks["twin"]]
-    assert set(out["notes"]) == {0}
+    # The note that links another and is linked back is joined to three memories, not to four: no bright star.
+    assert set(out["notes"]) == {0} and out["copies"] == [marks["twin"]] * 4 and set(out["plain"]) == {0}
+    # Lately is counted back from the day the memory is read: with no word of it, from its last entry. Read forty
+    # days on, the task touched "yesterday" is at work no more.
+    assert out["read"] == [0, 40 * DAY] and out["later"] == 0
     # The figure of a task goes from the task to its first memory and on in the order they were written.
     assert out["figures"] == [[1, 8], [8, 9], [9, 10]]
     assert out["drawn"] == [out["figure"]] * 3 and out["ends"] == [1, 8, 8, 9, 9, 10]
@@ -769,17 +829,22 @@ def test_what_was_let_go_circles_a_hole_apart_from_the_galaxies(run) -> None:
           return Math.acos(Math.max(-1, Math.min(1, dot(a, b) / (Math.hypot(...a) * Math.hypot(...b)))));
         };
         const clear = Math.min(...shaper.suns.map(({ sun }) => fromHole(shaped, sun)));
+        // The middle of the suns as the layout left them, and how far from it the hole and the outermost sun are drawn.
+        const middle = [0, 1, 2].map((a) => mean(shaper.suns.map(({ sun }) => raw[sun * 3 + a])));
+        const fromMiddle = (point) => Math.hypot(...point.map((v, a) => v - middle[a]));
+        const outmost = Math.max(...shaper.suns.map(({ sun }) => fromMiddle(at(shaped, sun))));
         const again = new Shaper({ ...graph, stale }).shape(raw, 3);
         const birth = Float32Array.from(nodes, (node) => node.t / DAY);
         const world = { ...graph, stale, edges: [], birth, mark: new Float32Array(nodes.length), colorOf: () => "#8db7e0" };
         const gas = new Gas(world, shaper);
         gas.updateBorn(400);
-        const placed = gas.place(after, { time: 0, play: 400, flat: false, centre: [0, 0, 0], radius: 900, beside: 1, shows: () => 1, hole: 0.5 });
+        const placed = gas.place(after, { time: 0, play: 400, flat: false, centre: [0, 0, 0], radius: 900, beside: 1, shows: () => 1, seen: () => true, hole: 0.5 });
         const light = gas.hole.start;
         const runs = [...gas.ranges.values(), ...gas.dust.values(), gas.field, gas.hole].sort((a, b) => a.start - b.start);
         const flat = new Shaper({ ...graph, stale }), flatShaped = flat.shape(new Float32Array(laid.map((v, i) => (i % 3 === 2 ? 0 : v))), 2);
         flat.spin(30);
         const flatTurned = flat.turn(flatShaped);
+        /** @type {Record<string, any>} */
         const report = {
           noHole: none.hole === null, members: [...hole.members].sort((a, b) => a - b), fallen: gone.every((i) => shaper.fallen[i] === 1),
           left: [spiral.members.length, spiral.all.length, gone.slice(0, 3).some((i) => spiral.members.includes(i))],
@@ -793,7 +858,52 @@ def test_what_was_let_go_circles_a_hole_apart_from_the_galaxies(run) -> None:
           wide: placed[light * AT + 3] / hole.shadow, shows: placed[light * AT + 4], seed: gas.look[light * LOOK + 5],
           holeSeed: HOLE_SEED, holeWide: HOLE_WIDE, total: runs.reduce((sum, r) => sum + r.count, 0) === gas.count,
           flatZ: Math.max(...gone.flatMap((i) => [flatShaped[i * 3 + 2], flatTurned[i * 3 + 2]]).map(Math.abs)), flatPole: flat.hole.n,
+          apart: fromMiddle(hole.centre) / outmost,
         };
+        // One more is let go while the others are already circling: it starts from where it is put, with no leap.
+        const late = first[0] + 5, more = Uint8Array.from(stale);
+        more[late] = 1;
+        shaper.restale(more);
+        const reshaped = shaper.shape(raw, 3);
+        report.late = shaper.turned(reshaped, late).map((v, k) => v - at(reshaped, late)[k]);
+        // A light is put where it must be to be seen at a given place, whatever it turns with: one at the hole, one in the spiral.
+        report.put = [gone[0], first[0] + 9].map((i) => {
+          const moved = Float32Array.from(reshaped);
+          moved.set(shaper.unturned(reshaped, i, [30, -40, 50]), i * 3);
+          return shaper.turned(moved, i).map((v, k) => v - [30, -40, 50][k]);
+        });
+        report.turns = [shaper.galaxies.get(0).angle !== 0, Math.hypot(...shaper.unturned(reshaped, first[0] + 9, [30, -40, 50]).map((v, k) => v - [30, -40, 50][k])) > 1];
+        // Nothing current lies in the disc of the hole.
+        const outOfDisc = (which, positions) => Math.min(...[...positions.keys()].filter((k) => k % 3 === 0 && !which.fallen[k / 3])
+          .map((k) => Math.hypot(positions[k] - which.hole.centre[0], positions[k + 1] - which.hole.centre[1], positions[k + 2] - which.hole.centre[2]) / which.hole.shadow));
+        report.disc = outOfDisc(shaper, reshaped);
+        report.early = Math.hypot(...shaper.turned(reshaped, gone[0]).map((v, k) => v - at(reshaped, gone[0])[k]));
+        // Three small projects laid in one place, one memory of them stale: the hole would lie among their suns.
+        const crowd = [0, 1, 2].map((p) => ({ k: "project", p, t: 0 })), crowded = [0, 0, 0, 1, 0, 0, 0, 1, 0];
+        for (let p = 0; p < 3; p++) for (let i = 0; i < 10; i++) {
+          crowd.push({ k: "event", p, t: NOW - (p * 10 + i) * DAY });
+          crowded.push(crowded[p * 3] + Math.cos(i) * 10, crowded[p * 3 + 1] + Math.sin(i) * 10, Math.cos(i * 2.4) * 10);
+        }
+        // With them a project too small for a galaxy, of three memories; and one memory of no project.
+        const tiny = crowd.length;
+        crowd.push({ k: "project", p: 3, t: 0 }, { k: "event", p: 3, t: NOW }, { k: "event", p: 3, t: NOW }, { k: "event", p: 3, t: NOW }, { k: "note", p: null, t: NOW });
+        crowded.push(0.5, 0.5, 0, 5, 0.5, 0, 0.5, 5, 0, 0.5, 0.5, 5, 400, 400, 400);
+        const forgotten = new Uint8Array(crowd.length);
+        forgotten[3] = 1;
+        const tight = new Shaper({ nodes: crowd, projectNode: new Map([[0, 0], [1, 1], [2, 2], [3, tiny]]), stale: forgotten });
+        let tightShaped = tight.shape(new Float32Array(crowded), 3);
+        // One memory of the small project is laid far from its sun, on the side where the hole is.
+        const toHole = tight.hole.centre.map((v, a) => v - tightShaped[tiny * 3 + a]), length = Math.hypot(...toHole);
+        toHole.forEach((v, a) => { crowded[(tiny + 1) * 3 + a] = crowded[tiny * 3 + a] + (v / length) * 150; });
+        tightShaped = tight.shape(new Float32Array(crowded), 3);
+        // And the memory of no project is laid where it would be drawn in the middle of the hole (everything is drawn
+        // 0.78 as far from the middle of the suns as it is laid).
+        const amid = [0, 1, 2].map((a) => mean([0, 1, 2, tiny].map((sun) => crowded[sun * 3 + a])));
+        tight.hole.centre.forEach((v, a) => { crowded[(tiny + 4) * 3 + a] = amid[a] + (v - amid[a]) / 0.78; });
+        tightShaped = tight.shape(new Float32Array(crowded), 3);
+        report.tight = Math.min(...[0, 1, 2, tiny].map((sun) => Math.hypot(...at(tightShaped, sun).map((v, a) => v - tight.hole.centre[a])) / tight.hole.shadow));
+        report.tightDisc = outOfDisc(tight, tightShaped);
+        report.ball = [tight.balls.get(3).reach, [...tightShaped].every(Number.isFinite)];
         // Marked current again, they are back in their galaxies and the hole is gone.
         shaper.restale(new Uint8Array(nodes.length));
         console.log(JSON.stringify({ ...report, back: [shaper.hole === null, spiral.members.length, shaper.fallen.some((v) => v === 1)] }));
@@ -808,13 +918,92 @@ def test_what_was_let_go_circles_a_hole_apart_from_the_galaxies(run) -> None:
     # They circle: as far from the hole as before, the nearest faster than the furthest.
     assert all(abs(change) < 1e-2 for change in out["kept"]) and out["went"][0] > out["went"][1] > 0.2
     assert _near(out["one"], [0, 0, 0], within=1e-2)
-    # No sun lies through the hole's disc.
-    assert out["clear"] > 3 and abs(out["pole"] - 1) < 1e-6 and out["same"] and out["finite"]
+    # The hole is out at the edge of the sky, not in the middle of it, and no sun lies through its disc: not as the
+    # galaxies happen to lie here, and not when their suns crowd the place the hole takes.
+    assert out["apart"] > 0.6 and out["clear"] > 3 and out["tight"] > 3
+    # Nothing current lies in the disc (it reaches three and a half shadows out): not the rim of a galaxy, not a far
+    # memory of a project too small for one, which keeps clear by its whole reach, and not a memory of no project.
+    assert out["disc"] > 3.5 and out["tightDisc"] > 3.5 and abs(out["ball"][0] - 150 * 0.78) < 1e-3 and out["ball"][1]
+    # A light whose company changes is put where it will be seen in the place it was seen: at the hole or in a
+    # galaxy that has turned (where that is not the place itself).
+    assert all(_near(put, [0, 0, 0], within=1e-2) for put in out["put"]) and out["turns"] == [True, True]
+    assert abs(out["pole"] - 1) < 1e-6 and out["same"] and out["finite"]
+    # A memory let go later begins its circle where it is put; those before it have gone on.
+    assert _near(out["late"], [0, 0, 0], within=1e-3) and out["early"] > 1
     # The hole is one light of its own, where the hole is, a few shadows wide, and shows as much as the page says.
     assert _near(out["light"], [0, 0, 0]) and abs(out["wide"] - out["holeWide"]) < 1e-3 and out["shows"] == 0.5
     assert out["seed"] == out["holeSeed"] == -2 and out["total"]
     assert out["flatZ"] == 0 and out["flatPole"] == [0, 0, 1]
     assert out["back"] == [True, 240, False]
+
+
+# ---------------------------------------------------------------------------
+# The page's own wiring, on a fake document
+# ---------------------------------------------------------------------------
+
+
+def test_the_page_runs_on_an_empty_memory_and_the_overture_gives_way_to_the_reader(run) -> None:
+    out = run("""
+        import { openPage, memory } from "./atlas_fake_page.mjs";
+        import { writePlace, dayOf } from "./urlstate.mjs";
+        const text = (error) => (error ? String(error.stack || error) : null);
+        // An empty memory: there is nothing to play, and the frames go on.
+        const empty = await openPage({ data: { nodes: [], projects: [], edges: [], span: null, facts: [], actions: { enabled: false, token: null } } });
+        const first = empty.frame(16), second = empty.frame(16);
+        // A memory of two projects opened on no place in particular: the overture plays.
+        const data = memory([{ name: "alpha", events: 60 }, { name: "beta", events: 40 }], { days: 100 });
+        const page = await openPage({ data });
+        page.finishLayout();
+        let failed = null;
+        for (let k = 0; k < 30; k++) failed = failed || page.frame(16);
+        const during = page.uniform.u_play;
+        // The reader goes back to an entry of an earlier day while it plays.
+        page.location.hash = "#" + writePlace({ day: dayOf(data.span[0] + 49.5 * 86400) });
+        page.window("popstate");
+        failed = failed || page.frame(16);
+        const restored = page.uniform.u_play;
+        for (let k = 0; k < 400; k++) failed = failed || page.frame(16);
+        const kept = page.uniform.u_play;
+        // Another visit: a key ends the overture, and the camera is in within the second.
+        const again = await openPage({ data });
+        again.finishLayout();
+        for (let k = 0; k < 30; k++) failed = failed || again.frame(16);
+        const coming = again.uniform.u_fog[0];
+        again.window("keydown", { key: "?" });
+        failed = failed || again.frame(16);
+        const ended = again.uniform.u_play;
+        for (let k = 0; k < 50; k++) failed = failed || again.frame(16);
+        const settled = again.uniform.u_fog[0];
+        for (let k = 0; k < 120; k++) failed = failed || again.frame(16);
+        // A page opened on the last memory of a project: it holds its line in brass. Then the reader is taken to a
+        // day long before that memory was written.
+        const held = await openPage({ data, hash: "#" + writePlace({ node: "e:0-59" }) });
+        held.finishLayout();
+        for (let k = 0; k < 10; k++) failed = failed || held.frame(16);
+        const bowed = () => { held.inkLog.length = 0; failed = failed || held.frame(16); return held.inkLog.filter((call) => call[0] === "quadraticCurveTo").length; };
+        const shown = bowed();
+        held.location.hash = "#" + writePlace({ node: "e:0-59", day: dayOf(data.span[0] + 10 * 86400) });
+        held.window("popstate");
+        const before = bowed(), rings = held.inkLog.filter((call) => call[0] === "arc").length;
+        console.log(JSON.stringify({
+          shown, before, rings,
+          first: text(first), second: text(second), failed: text(failed), errors: [...empty.errors, ...page.errors, ...again.errors, ...held.errors].map(String),
+          during, restored, kept, ended, coming, settled, rested: again.uniform.u_fog[0],
+          draws: page.glLog.length, feedback: page.glLog.filter((draw) => draw.feedback).length,
+        }));
+        process.exit(0);
+    """)
+
+    assert out["first"] is None and out["second"] is None and out["failed"] is None and out["errors"] == []
+    # The overture is under way after half a second; the day the address names is taken and kept to the end.
+    assert 0 < out["during"] < 100 and 49 < out["restored"] < 51 and out["kept"] == out["restored"]
+    # A key ends it: the time is at the last day at once, and the camera, which was still coming in, is at rest
+    # within the second.
+    assert out["ended"] == 100 and out["coming"] > out["settled"] * 1.05 and abs(out["settled"] - out["rested"]) < 1e-3 * out["rested"]
+    # A memory not yet written on the day shown holds no line in brass and wears no ring.
+    assert out["shown"] > 0 and out["before"] == 0 and out["rings"] == 0
+    # The gas is never drawn into the sheet it is reading.
+    assert out["draws"] > 100 and out["feedback"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -25,9 +25,9 @@ const SHAPE = { event: 0, task: 1, fact: 2, note: 3, project: 4 };
  *   decided  a decision: a nova with a ring when the time machine passes the day it was made
  */
 export const MARK = { routine: 1, twin: 2, working: 4, hub: 8, decided: 16 };
-/** A task is at work when it is open and something of it was written in the last so many days. */
+/** A task is at work when it is open and something of it was written in the last so many days before the memory was read. */
 const WORKING_DAYS = 14;
-/** The share of memories that are bright stars, and the fewest others a memory must be joined to to be one. */
+/** The share of memories that are bright stars, and the fewest other memories one must be joined to to be one. */
 const HUB_SHARE = 0.03;
 const HUB_FROM = 4;
 // How strongly each kind of line is drawn. That a memory belongs to a task or to a
@@ -110,6 +110,10 @@ export class Graph {
     this.span0 = data.span ? data.span[0] : Date.now() / 1000;
     this.span1 = data.span ? data.span[1] : this.span0 + DAY;
     this.days = Math.max(1, Math.ceil((this.span1 - this.span0) / DAY));
+    // The moment the server read the memory at. What is "lately" is counted back from it, not from the newest
+    // memory: in an archive last written to in spring nothing is at work in autumn.
+    const read = Date.parse(data.generated_at || "");
+    this.now = Number.isFinite(read) ? read / 1000 : this.span1;
 
     this.kind = new Int8Array(n);
     /** @type {Map<number, number>} */ this.projectNode = new Map();
@@ -183,11 +187,16 @@ export class Graph {
    */
   remark() {
     const nodes = this.nodes, n = this.n, joined = new Float32Array(n), twin = new Uint8Array(n);
+    /** The pairs already counted: two notes that link each other, or are joined in two ways, are joined once. @type {Set<number>} */
+    const counted = new Set();
     for (const e of this.edges) {
       // Belonging to a task or a project joins a memory to nothing in particular; a link, a fact, a resemblance does.
-      if (e.k === EDGE.task || e.k === EDGE.project) continue;
+      if (e.k === EDGE.task || e.k === EDGE.project || e.s === e.t) continue;
       // A copy is a twin, not one more thing a memory is joined to.
       if (e.dup) { twin[e.s] = 1; twin[e.t] = 1; continue; }
+      const pair = Math.min(e.s, e.t) * n + Math.max(e.s, e.t);
+      if (counted.has(pair)) continue;
+      counted.add(pair);
       joined[e.s]++; joined[e.t]++;
     }
     // What the machinery writes on its schedule resembles itself a hundred times over: that makes no bright star.
@@ -195,12 +204,21 @@ export class Graph {
       && joined[i] >= HUB_FROM);
     memories.sort((a, b) => joined[b] - joined[a] || a - b);
     const hubs = new Set(memories.slice(0, Math.ceil(n * HUB_SHARE)));
-    const lately = this.span1 - WORKING_DAYS * DAY;
+    const lately = this.now - WORKING_DAYS * DAY;
     nodes.forEach((node, i) => {
       this.mark[i] = (this.routine(i) ? MARK.routine : 0) + (twin[i] ? MARK.twin : 0) + (hubs.has(i) ? MARK.hub : 0)
         + (node.k === "task" && node.o && (node.u || node.t || 0) >= lately ? MARK.working : 0)
         + (node.k === "event" && node.c === "decision" ? MARK.decided : 0);
     });
+  }
+
+  /**
+   * Which memories circle the hole: those marked stale and still on the map. A copy hidden since the map loaded is
+   * gone from it, stale or not.
+   * @returns {Uint8Array} one per node
+   */
+  letGo() {
+    return Uint8Array.from(this.stale, (stale, i) => (stale && !this.gone[i] ? 1 : 0));
   }
 
   /** @param {number} index of an edge */
