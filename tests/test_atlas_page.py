@@ -783,6 +783,7 @@ def test_what_a_light_is_besides_its_kind_is_read_off_the_memory(run) -> None:
           marks: MARK, figure: FIGURE, first: first.slice(0, 8), then: [...graph.mark].slice(0, 8), notes: [...graph.mark].slice(8, 20),
           copies: [...graph.mark].slice(20, 24), plain: [...graph.mark].slice(24),
           figures: graph.figures(), drawn: [...buffers.kind].slice(lines - 3), ends: [...buffers.ends].slice(lines * 2 - 6),
+          withoutStale: (graph.stale[9] = 1, graph.figures()), withoutHidden: (graph.gone[8] = 1, graph.figures()),
           ofIndex: buffers.color[3 * 4 + 3], ofPair: buffers.color[15 * 4 + 3],
           read: [graph.now - END, later.now - END], later: later.mark[1],
         }));
@@ -804,6 +805,8 @@ def test_what_a_light_is_besides_its_kind_is_read_off_the_memory(run) -> None:
     assert out["read"] == [0, 40 * DAY] and out["later"] == 0
     # The figure of a task goes from the task to its first memory and on in the order they were written.
     assert out["figures"] == [[1, 8], [8, 9], [9, 10]]
+    # A memory let go has left for the hole, and one hidden as a copy has left the map: the figure closes over them.
+    assert out["withoutStale"] == [[1, 8], [8, 10]] and out["withoutHidden"] == [[1, 10]]
     assert out["drawn"] == [out["figure"]] * 3 and out["ends"] == [1, 8, 8, 9, 9, 10]
     # A link of the index is one of twelve and is drawn faint; a link between two notes of few links is drawn in full.
     assert abs(out["ofIndex"] - 0.18 * 5 / 12) < 1e-4 and abs(out["ofPair"] - 0.18) < 1e-4

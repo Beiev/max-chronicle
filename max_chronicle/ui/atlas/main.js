@@ -629,12 +629,17 @@ async function main() {
     if (graph.pinned[i]) pins.add(i); else pins.delete(i);
     const wasStale = graph.stale[i], circled = shaper.fallen[i];
     graph.stale[i] = marks.stale ? 1 : 0;
-    const hide = body.hidden ? 1 : 0;
-    if (graph.gone[i] !== hide) counts[graph.kind[i]] += hide ? -1 : 1;
+    const hide = body.hidden ? 1 : 0, wasGone = graph.gone[i];
+    if (wasGone !== hide) counts[graph.kind[i]] += hide ? -1 : 1;
     graph.gone[i] = hide;
     if (graph.stale[i] !== wasStale) {
       graph.paint(i);
       renderer.setNodes(graph);
+      stale = true;
+    }
+    if (graph.stale[i] !== wasStale || wasGone !== hide) {
+      // The figure of its task is drawn through the memories that stay: drawn again without it, or with it back.
+      uploadEdges();
       stale = true;
     }
     if ((graph.stale[i] && !graph.gone[i] ? 1 : 0) !== circled) {

@@ -245,7 +245,8 @@ shows its own, and a memory that is open holds its lines in brass. That a
 memory belongs to a task or a project is drawn only for the memory in focus:
 its place in its galaxy already says it. A task is drawn as a figure instead,
 as a constellation is: from the task to its first memory and on to each next in
-the order they were written. A note that links to very many others (an index)
+the order they were written; a memory marked stale or hidden as a copy is left
+out of it. A note that links to very many others (an index)
 has its links drawn faint until the reader is on it.
 
 The memory is laid out in three dimensions. A drag turns the sky around the
