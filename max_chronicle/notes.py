@@ -38,7 +38,7 @@ import sqlite3
 import time
 from typing import Any
 
-from . import embeddings
+from . import curation, embeddings
 from .embeddings import BACKFILL_TIMEOUT_S, active_profile, pack_vector
 from .identity import Registry
 from .lexical import covers, query_terms
@@ -706,12 +706,12 @@ def notes_status(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_note(manifest: dict[str, Any], identifier: str) -> dict[str, Any] | None:
-    """A live note's redacted text and fields, as indexed; None for an unknown or deleted note."""
+    """A live note's redacted text and fields, as indexed; None for an unknown or deleted note, or a hidden copy."""
     config = config_from_manifest(manifest)
     with open_connection(config) as connection:
         row = connection.execute(
             "SELECT * FROM documents WHERE id = ? AND deleted_at_utc IS NULL", (identifier,)).fetchone()
-        if row is None:
+        if row is None or identifier in curation.marks(connection).hidden_notes():
             return None
         chunks = connection.execute(
             "SELECT heading, text FROM document_chunks WHERE document_id = ? ORDER BY ordinal", (identifier,)).fetchall()
@@ -735,7 +735,11 @@ def recall_notes(
     threshold: float,
     limit: int,
 ) -> dict[str, Any]:
-    """Notes matching *query*, best chunk per note; in a project scope, project notes first (FR-10)."""
+    """Notes matching *query*, best chunk per note; in a project scope, project notes first (FR-10).
+
+    A note the operator hid as a copy is left out, and one they marked stale
+    ranks lower; a note comes back with its marks (``pinned``, ``stale``).
+    """
     from .embeddings import similarity_scorer, unpack_vector  # noqa: PLC0415 - read at call time
 
     profile = active_profile()
@@ -751,12 +755,14 @@ def recall_notes(
         # the reads could reuse a chunk id for other text.
         connection.execute("BEGIN")
         try:
+            marks = curation.marks(connection)  # in the snapshot the pool is read from
+            hidden = marks.hidden_notes()
             pool = {row["id"]: dict(row) for row in connection.execute(
                 """SELECT c.id, c.document_id, c.heading, c.text, d.path, d.title, d.project, d.kind, d.modified_at_utc,
                           v.dim, v.vector
                    FROM document_chunks c JOIN documents d ON d.id = c.document_id AND d.deleted_at_utc IS NULL
                    LEFT JOIN chunk_vectors v ON v.chunk_id = c.id AND v.model_key = ?
-                   WHERE """ + where, (profile.key, *params))}
+                   WHERE """ + where, (profile.key, *params)) if row["document_id"] not in hidden}
             if not pool:
                 return nothing
             terms = query_terms(query)
@@ -799,8 +805,10 @@ def recall_notes(
     admitted.sort(key=lambda cid: (scope.project is not None and pool[cid]["project"] is None, -similarities[cid]))
     admitted = admitted[:cap]
     vector_ranks = {chunk_id: rank for rank, chunk_id in enumerate(admitted)}
+    stale = marks.stale
     scores = {chunk_id: sum(1 / (60 + rank) for rank in (fts_ranks.get(chunk_id), vector_ranks.get(chunk_id))
                             if rank is not None)
+              * (curation.STALE_WEIGHT if f"note:{pool[chunk_id]['document_id']}" in stale else 1)
               for chunk_id in set(fts_ranks) | set(vector_ranks)}
     best: dict[str, str] = {}
     for chunk_id in sorted(scores, key=lambda cid: (-scores[cid], cid)):
@@ -822,6 +830,7 @@ def recall_notes(
         "modified_at_utc": pool[cid]["modified_at_utc"],
         "rrf_score": round(scores[cid], 6),
         "channels": {"fts_rank": fts_ranks.get(cid), "vector_similarity": similarities.get(cid)},
+        **marks.labels(f"note:{pool[cid]['document_id']}"),
     } for cid in ordered]
     return {
         "notes": notes,

@@ -8,13 +8,16 @@ records for the ids an agent picks. Each hit says how much stands behind
 it (``trust``): archived evidence, confirmation by more than one agent, a
 single agent's assertion, or an assumption. Ids carry their kind: ``event:<id>``,
 ``note:<id>`` and ``fact:<id>`` (a brief prints fact ids); a bare id is an
-event, or else a fact.
+event, or else a fact. What the operator marked in the Atlas comes along:
+``pinned`` (to the brief) and ``stale`` (out of date, ranked lower); a copy
+they hid is not there.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from . import curation
 from .memory import FACT_SCOPE, event_provenance
 from .notes import read_note
 from .store import config_from_manifest, fetch_event, open_connection
@@ -89,6 +92,7 @@ def _event_hit(hit: dict[str, Any]) -> dict[str, Any]:
     evidence = len(hit.get("source_files") or [])
     if evidence:
         item["evidence_files"] = evidence
+    item.update({key: hit[key] for key in ("pinned", "stale") if hit.get(key)})
     return item
 
 
@@ -106,6 +110,7 @@ def _note_hit(note: dict[str, Any]) -> dict[str, Any]:
     }
     if cut or (note.get("text") or "").endswith("…"):
         item["truncated"] = True
+    item.update({key: note[key] for key in ("pinned", "stale") if note.get(key)})
     return item
 
 
@@ -174,6 +179,7 @@ def get_items(manifest: dict[str, Any], ids: list[str]) -> dict[str, Any]:
     if len(ids) > MAX_GET_IDS:
         raise ValueError(f"at most {MAX_GET_IDS} ids per call")
     config = config_from_manifest(manifest)
+    marks = curation.read_marks(config)
     items: list[dict[str, Any]] = []
     missing: list[str] = []
     seen: set[str] = set()
@@ -194,5 +200,9 @@ def get_items(manifest: dict[str, Any], ids: list[str]) -> dict[str, Any]:
             missing.append(raw)
         elif item["id"] not in seen:  # the same record under two spellings comes back once
             seen.add(item["id"])
-            items.append(item)
+            labels = marks.labels(item["id"])
+            if item["kind"] == "fact":  # marked through the event that asserted it: stale with it
+                item["event"] = item["event"] | marks.labels(item["event"]["id"])
+                labels = {key: value for key, value in item["event"].items() if key == "stale"}
+            items.append(item | labels)
     return {"items": items, "missing": missing}

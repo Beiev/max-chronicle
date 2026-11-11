@@ -12,7 +12,9 @@ Texts (an event's words, a note's title, a fact's value, a record opened in
 full) are redacted again on the way out; names (projects, tasks, fact slots)
 are shown as recorded, as everywhere in Chronicle. The page renders all of it
 as text, never as markup. Quarantined events (the event, or every one of its
-observations) and deleted notes never appear.
+observations), deleted notes and copies hidden in the Atlas never appear;
+neither do the Atlas's own events, whose actions show on the memories they
+were taken on (``curation``).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ import time
 from typing import Any
 import zlib
 
+from . import curation
 from .agent_surface import get_items, gist
 from .brief import _read_only
 from .embeddings import active_profile
@@ -52,8 +55,8 @@ LABEL_CHARS = 140
 # nearest neighbour of a typical event sits at 0.85 with qwen3-embedding.
 SIMILAR_K = 3
 SIMILAR_MIN = 0.80
-# Above this, two memories say the same thing: the page can offer them as duplicates.
-DUPLICATE_MIN = 0.995
+# Above this, two memories say the same thing: the page offers to hide one as a copy.
+DUPLICATE_MIN = curation.DUPLICATE_MIN
 # The cache of neighbours: its format, and when an update is a fresh pass anyway.
 SIMILAR_VERSION = 1
 INCREMENTAL_SHARE = 0.4
@@ -64,12 +67,14 @@ OPEN_TASK_LIMIT = 10_000
 _WIKILINK = re.compile(r"\[\[([^\]|#\n]+)")
 _MD_LINK = re.compile(r"\]\((?:\./)?([^)\s#]+\.md)\)")
 _DATED_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})[-_]")
-_VISIBLE = "e.visibility != 'raw_only' AND o.visibility != 'raw_only'"
-# An event is on the map when neither it nor every one of its observations is quarantined.
+_NOT_ATLAS = f"e.category IS NOT '{curation.CATEGORY}'"
+_VISIBLE = f"e.visibility != 'raw_only' AND o.visibility != 'raw_only' AND {_NOT_ATLAS}"
+# An event is on the map when neither it nor every one of its observations is
+# quarantined, and it is not one of the Atlas's own.
 _SHOWN_EVENT = ("e.visibility != 'raw_only' AND EXISTS (SELECT 1 FROM event_observations o "
-                "WHERE o.event_id = e.id AND o.visibility != 'raw_only')")
+                f"WHERE o.event_id = e.id AND o.visibility != 'raw_only') AND {_NOT_ATLAS}")
 # Identifiers and paths of a record: never free text, so never redacted (as when it was written).
-_ITEM_IDENTIFIERS = _UNREDACTED_ENTRY_KEYS | {"path", "event_id", "observation_id"}
+_ITEM_IDENTIFIERS = _UNREDACTED_ENTRY_KEYS | {"path", "event_id", "observation_id", "pinned", "stale"}
 
 try:
     _dot = math.sumprod  # Python 3.12+: one C loop per pair
@@ -135,7 +140,12 @@ def _task_key(project: str | None, task_id: str) -> str:
     return f"t:{project or ''}/{task_id.casefold()}"
 
 
-def _events(connection, identities, graph: _Graph) -> None:
+def _flags(marks: curation.Marks, target: str) -> dict[str, int | None]:
+    """The marks a node carries: ``pi`` pinned to the brief, ``st`` stale."""
+    return {"pi": 1 if target in marks.pinned else None, "st": 1 if target in marks.stale else None}
+
+
+def _events(connection, identities, graph: _Graph, marks: curation.Marks) -> None:
     rows = connection.execute(
         f"""SELECT e.id, e.recorded_at_utc, e.actor, e.category, e.text, o.project, o.task_id, MAX(o.seq) AS last_seq
         FROM events e JOIN event_observations o ON o.event_id = e.id
@@ -146,7 +156,7 @@ def _events(connection, identities, graph: _Graph) -> None:
         when = _epoch(row["recorded_at_utc"])
         project = identities.project(row["project"]) or row["project"]
         event = graph.add(f"e:{row['id']}", "event", _label(row["text"]), project, when,
-                          c=row["category"], a=row["actor"])
+                          c=row["category"], a=row["actor"], **_flags(marks, f"event:{row['id']}"))
         parent = _project_node(graph, project, when) if project else None
         if row["task_id"]:
             key = _task_key(project, row["task_id"])
@@ -166,19 +176,22 @@ def _note_targets(texts: Iterable[str]) -> set[str]:
     return targets
 
 
-def _notes(connection, identities, graph: _Graph) -> None:
+def _notes(connection, identities, graph: _Graph, marks: curation.Marks) -> None:
     documents = connection.execute(
         """SELECT id, path, project, title, kind, modified_at_utc FROM documents
         WHERE deleted_at_utc IS NULL ORDER BY modified_at_utc""").fetchall()
+    hidden = marks.hidden_notes()
     by_name: dict[str, int] = {}
     for document in documents:
+        if document["id"] in hidden:
+            continue
         # An imported archive is modified on the day of the import; a note named
         # after its day (2026-06-18-….md) is dated by its name.
         dated = _DATED_NAME.match(PurePath(document["path"]).name)
         when = _epoch(f"{dated[1]}T12:00:00Z" if dated else document["modified_at_utc"])
         project = identities.project(document["project"]) or document["project"]
         note = graph.add(f"n:{document['id']}", "note", _label(document["title"]), project, when,
-                         c=document["kind"])
+                         c=document["kind"], **_flags(marks, f"note:{document['id']}"))
         by_name.setdefault(PurePath(document["path"]).stem.casefold(), note)
         by_name.setdefault((document["title"] or "").strip().casefold(), note)
         if project:
@@ -225,8 +238,9 @@ def _facts(connection, identities, graph: _Graph) -> list[dict[str, Any]]:
 def build_graph(connection, identities) -> dict[str, Any]:
     """The map's nodes, recorded edges and fact history, without the edges by meaning."""
     graph = _Graph()
-    _events(connection, identities, graph)
-    _notes(connection, identities, graph)
+    marks = curation.marks(connection)
+    _events(connection, identities, graph, marks)
+    _notes(connection, identities, graph, marks)
     facts = _facts(connection, identities, graph)
     times = [node["t"] for node in graph.nodes if node["t"] is not None]
     return {
@@ -255,14 +269,17 @@ def similar_cache_path(config) -> Path:
 
 
 def _vector_rows(connection, model_key: str) -> Iterator[tuple[str, bytes]]:
-    """The node id and vector of every shown event, then of every section of a live note, in order."""
+    """The node id and vector of every shown event, then of every section of a shown note, in order."""
+    hidden = {f"n:{key}" for key in curation.marks(connection).hidden_notes()}
     yield from connection.execute(
         f"""SELECT 'e:' || v.event_id, v.vector FROM event_vectors v JOIN events e ON e.id = v.event_id
         WHERE v.model_key = ? AND {_SHOWN_EVENT}""", (model_key,))
-    yield from connection.execute(
-        """SELECT 'n:' || c.document_id, v.vector FROM chunk_vectors v
-        JOIN document_chunks c ON c.id = v.chunk_id JOIN documents d ON d.id = c.document_id
-        WHERE v.model_key = ? AND d.deleted_at_utc IS NULL ORDER BY c.document_id, c.ordinal""", (model_key,))
+    for key, blob in connection.execute(
+            """SELECT 'n:' || c.document_id, v.vector FROM chunk_vectors v
+            JOIN document_chunks c ON c.id = v.chunk_id JOIN documents d ON d.id = c.document_id
+            WHERE v.model_key = ? AND d.deleted_at_utc IS NULL ORDER BY c.document_id, c.ordinal""", (model_key,)):
+        if key not in hidden:
+            yield key, blob
 
 
 def vector_digest(connection, model_key: str) -> tuple[list[Any], set[str]]:
@@ -313,6 +330,35 @@ def memory_vectors(connection, model_key: str) -> tuple[dict[str, list[float]], 
         if norm:
             vectors[key] = [value / norm for value in values]
     return vectors, {key: checksums[key] for key in vectors}
+
+
+def _memory_vector(connection, model_key: str, target: str) -> list[float] | None:
+    """The unit vector the map compares for one memory (``event:<id>``/``note:<id>``), made as memory_vectors makes it."""
+    kind, _, key = target.partition(":")
+    if kind == "event":
+        rows = connection.execute("SELECT vector FROM event_vectors WHERE event_id = ? AND model_key = ?",
+                                  (key, model_key))
+    else:
+        rows = connection.execute(
+            """SELECT v.vector FROM chunk_vectors v JOIN document_chunks c ON c.id = v.chunk_id
+            WHERE c.document_id = ? AND v.model_key = ? ORDER BY c.ordinal""", (key, model_key))
+    total: list[float] | None = None
+    for (blob,) in rows:
+        values = _unpack(blob)
+        if total is None:
+            total = values
+        elif len(values) == len(total):
+            total = [a + b for a, b in zip(total, values)]
+    norm = math.sqrt(_dot(total, total)) if total else 0.0
+    return [value / norm for value in total] if total and norm else None
+
+
+def memory_similarity(connection, model_key: str, a: str, b: str) -> float | None:
+    """How alike two memories are by meaning, as the map compares them; None without vectors to compare."""
+    first, second = _memory_vector(connection, model_key, a), _memory_vector(connection, model_key, b)
+    if first is None or second is None or len(first) != len(second):
+        return None
+    return _dot(first, second)
 
 
 def _standing(keys: list[str], moved: set[str], old_lists: dict[str, list[tuple[float, str]]],
@@ -606,16 +652,35 @@ def graph_payload(manifest: dict[str, Any]) -> dict[str, Any]:
     return graph
 
 
+def _copy_label(connection, target: str) -> str | None:
+    """A hidden copy's label; None when it is gone, or hidden since for another reason than being a copy."""
+    kind, _, key = target.partition(":")
+    if kind == "event":
+        row = connection.execute(
+            "SELECT text FROM events WHERE id = ? AND visibility = 'raw_only' "
+            "AND json_extract(payload_json, '$.memory_guard.source') = ?", (key, curation.GUARD_SOURCE)).fetchone()
+    else:
+        row = connection.execute("SELECT title FROM documents WHERE id = ? AND deleted_at_utc IS NULL",
+                                 (key,)).fetchone()
+    return None if row is None else _label(row[0])
+
+
 def item_payload(manifest: dict[str, Any], identifier: str) -> dict[str, Any] | None:
-    """One event or note in full for the side panel, redacted again on the way out; None when hidden or unknown."""
+    """One event or note in full for the side panel, redacted again on the way out; None when hidden or unknown.
+
+    ``copies`` are the memories hidden as copies of it, to restore.
+    """
     kind, _, key = identifier.partition(":")
     if kind not in ("event", "note"):
         raise ValueError("id must be event:<id> or note:<id>")
-    if kind == "event":
-        with _read_only(config_from_manifest(manifest)) as connection:
-            if connection.execute(f"SELECT 1 FROM events e WHERE e.id = ? AND {_SHOWN_EVENT}", (key,)).fetchone() is None:
-                return None
+    with _read_only(config_from_manifest(manifest)) as connection:
+        if kind == "event" and connection.execute(
+                f"SELECT 1 FROM events e WHERE e.id = ? AND {_SHOWN_EVENT}", (key,)).fetchone() is None:
+            return None
+        copies = [{"id": copy, "label": label, **mark.public()}
+                  for copy, mark in curation.marks(connection).copies_of(identifier)
+                  if (label := _copy_label(connection, copy)) is not None]
     found = get_items(manifest, [identifier])["items"]
     if not found:
         return None
-    return redact_value(found[0], skip_keys=_ITEM_IDENTIFIERS)[0]
+    return redact_value(found[0], skip_keys=_ITEM_IDENTIFIERS)[0] | {"copies": copies}

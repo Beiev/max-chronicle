@@ -9,6 +9,7 @@ import struct
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import curation
 from .notes import recall_notes
 from .store import (
     _parse_iso,
@@ -63,6 +64,10 @@ def query_memory(
     says ``no_confident_match`` unless a result holds every query term or
     reaches the profile's confident similarity (FR-2).
 
+    A memory the operator marked stale in the Atlas still comes back, marked
+    ``stale`` and with its relevance weighed down; one they pinned is marked
+    ``pinned``.
+
     The query's vector may wait QUERY_WAIT_S for Ollama to start and load the
     model. A caller that holds the write slot passes ``wait_for_backend=False``:
     it waits DOCUMENT_TIMEOUT_S at most and never starts Ollama.
@@ -90,6 +95,7 @@ def query_memory(
     confident_floor = _similarity_setting(ENV_CONFIDENT_SIMILARITY, profile.confident_similarity)
     config = config_from_manifest(manifest)
     scope = dict(domain=domain, project=project, task_id=task_id)
+    marks = curation.read_marks(config)
     pool = fetch_recall_pool(config, model_key=profile.key, **scope)
     eligible = {row["id"]: row for row in pool}
     errors: dict[str, str] = {}
@@ -174,6 +180,7 @@ def query_memory(
     # Relevance alone scores a candidate; recency only breaks ties (FR-1).
     scores = {
         eid: sum(1 / (60 + rank) for rank in (fts.get(eid), vector_ranks.get(eid)) if rank is not None)
+        * (curation.STALE_WEIGHT if f"event:{eid}" in marks.stale else 1)
         for eid in candidates
     }
     ranked = sorted(candidates, key=lambda eid: (-scores[eid], recency[eid], eid))[
@@ -210,6 +217,7 @@ def query_memory(
                     "recency_rank": recency[eid],
                 },
                 "provenance": event_provenance(config, eid),
+                **marks.labels(f"event:{eid}"),
             }
         )
     channels = (

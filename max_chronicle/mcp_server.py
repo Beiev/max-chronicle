@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import functools
+import hmac
 import json
 import logging
 import os
+import secrets
 import signal
 import sqlite3
 import sys
@@ -28,7 +30,7 @@ from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from . import __version__, atlas, embeddings, viewer
+from . import __version__, atlas, curation, embeddings, viewer
 
 from .automation import load_automation_config
 from .config import (
@@ -123,6 +125,8 @@ STARTUP_MODE_ARG = Annotated[
 ]
 BRIEF_TIMEOUT_S = 2.0  # a session-start hook waits for this, so it must stay short
 VIEW_TIMEOUT_S = 30.0  # a page reads a few queries; recall may wait QUERY_WAIT_S for Ollama to start
+ACTION_TOKEN_HEADER = "x-chronicle-token"
+ACTION_MAX_BYTES = 4096
 # /brief is for processes on this machine. A browser page must not read it: its
 # fetch always sends Origin, and DNS rebinding arrives with a foreign Host (O4).
 _LOOPBACK_HOST = re.compile(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?")
@@ -580,6 +584,9 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                              "uptime_s": round(time.time() - _PROCESS_STARTED_AT), **_runtime_health()})
 
     similar_refresher = atlas.SimilarRefresher(resolved_manifest_path)
+    # One secret per server process: the page reads it with the map (a page of
+    # another site cannot read that answer) and sends it with every action.
+    action_token = secrets.token_urlsafe(32)
 
     async def route_atlas(request: Request, segments: list[str]) -> Response:
         # The map is a page of scripts: its files, then JSON for them. The same
@@ -594,7 +601,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
                     return PlainTextResponse("Not found\n", status_code=404, headers=headers)
                 return Response(found[0], media_type=found[1], headers=headers)
             case ["api", "atlas"]:
-                work = lambda: atlas.graph_payload(manifest())  # noqa: E731
+                actions = {"enabled": writes_allowed, "token": action_token if writes_allowed else None}
+                work = lambda: atlas.graph_payload(manifest()) | {"actions": actions}  # noqa: E731
             case ["api", "atlas", "similar"]:
                 work = lambda: atlas.similar_payload(manifest(), similar_refresher)  # noqa: E731
             case ["api", "item"]:
@@ -641,6 +649,63 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
 
     server.custom_route("/ui", methods=["GET"])(route_ui)
     server.custom_route("/ui/{rest:path}", methods=["GET"])(route_ui)
+
+    async def route_atlas_action(request: Request) -> Response:
+        # The page's one write. Besides the machine-only check of every page: the
+        # Origin a browser sends with every request of its own (a tool on this
+        # machine can send it too), a JSON body (another site's form cannot send
+        # one without asking this server first, and it never agrees) and the token.
+        headers = atlas.SECURITY_HEADERS
+        if (not viewer.allowed(request.headers)
+                or request.headers.get("origin") != f"http://{request.headers.get('host', '')}"
+                or not hmac.compare_digest(request.headers.get(ACTION_TOKEN_HEADER, "").encode(),
+                                           action_token.encode())):
+            return JSONResponse({"error": "Forbidden"}, status_code=403, headers=headers)
+        if not writes_allowed:
+            return JSONResponse({"error": "This server is read-only"}, status_code=403, headers=headers)
+        if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
+            return JSONResponse({"error": "The body must be JSON"}, status_code=415, headers=headers)
+        too_large = JSONResponse({"error": "The body is too large"}, status_code=413, headers=headers)
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > ACTION_MAX_BYTES:
+            return too_large
+        body = b""
+        async for chunk in request.stream():  # read no more than the limit, whatever was declared
+            body += chunk
+            if len(body) > ACTION_MAX_BYTES:
+                return too_large
+        try:
+            fields = json.loads(body)
+        except ValueError:
+            fields = None
+        if not isinstance(fields, dict):
+            return JSONResponse({"error": "The body must be a JSON object"}, status_code=400, headers=headers)
+        embedder = _RUNTIME["embedder"]
+        started = time.monotonic()
+        try:
+            # In the write slot every agent shares, and not abandoned: a write runs to its end.
+            result = await anyio.to_thread.run_sync(
+                lambda: curation.apply_action(
+                    manifest(), action=str(fields.get("action") or ""), target=fields.get("target"),
+                    of=fields.get("of"), request_id=fields.get("request_id"), defer_embedding=embedder is not None),
+                limiter=_get_limiter("write"))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400, headers=headers)
+        except LookupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404, headers=headers)
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409, headers=headers)
+        except Exception as exc:  # noqa: BLE001 — the page says the write failed instead of hanging
+            _LOGGER.exception("atlas action failed")
+            return JSONResponse({"error": f"Unavailable: {type(exc).__name__}"}, status_code=503, headers=headers)
+        if result["status"] == "done":
+            _RUNTIME["last_write"] = {"tool": "atlas_action", "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                      "ms": round((time.monotonic() - started) * 1000)}
+            if embedder is not None and not result["replayed"]:
+                embedder.wake()
+        return JSONResponse(result, headers=headers)
+
+    server.custom_route("/ui/api/atlas/action", methods=["POST"])(route_atlas_action)
 
     @server.custom_route("/brief", methods=["GET"])
     async def route_brief(request: Request):
@@ -850,13 +915,16 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
         name="recent_events",
         description=(
             "Cheap latest-N feed of Chronicle events for a domain — situational awareness "
-            "without search. For 'what do we know about X' use query_memory instead."
+            "without search; an event the operator marked carries `pinned` or `stale`. "
+            "For 'what do we know about X' use query_memory instead."
         ),
     )
     def tool_recent_events(domain: DOMAIN_ARG = "global", limit: LIMIT_ARG = 10) -> list[dict]:
         loaded = manifest()
         config = config_from_manifest(loaded)
-        return fetch_recent_events(config, limit=limit, domain=domain)
+        events = fetch_recent_events(config, limit=limit, domain=domain)
+        curation.annotate(events, curation.read_marks(config))
+        return events
 
     @register_tool(
         writes=False,
@@ -921,7 +989,8 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "matched, and `trust`: assumption if its author said so; else evidence (a source file was "
             "archived), confirmed (more than one agent recorded the same text) or assertion (one "
             "agent's word); note for a note); `get_memory(ids)` returns the full records you pick, and detail='full' returns "
-            "them all at once. `no_confident_match` means no hit is a strong match: treat the hits as "
+            "them all at once. `stale` means the operator marked a hit out of date (it ranks lower), "
+            "`pinned` that they pinned it to the brief. `no_confident_match` means no hit is a strong match: treat the hits as "
             "leads. `relaxed` marks a weaker word-stem match, `degraded` a skipped channel (word "
             "search still works when the embedding model is down). An empty result does not prove "
             "the memory is absent."
@@ -946,6 +1015,7 @@ def build_server(manifest_path: Path | None = None, *, profile: str = CHRONICLER
             "Full records for ids that query_memory (or a brief) returned: `event:<id>` gives the "
             "event with its why, checkpoint or fact, evidence files and provenance; `note:<id>` "
             "gives the whole indexed note; `fact:<id>` gives a fact with the event that asserted it. "
+            "A record the operator marked carries `pinned` or `stale`. "
             "Up to 20 ids; ids that name nothing come back in `missing`."
         ),
     )

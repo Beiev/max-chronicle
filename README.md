@@ -67,6 +67,8 @@ anything is stored.
 - **Atlas:** `http://127.0.0.1:8093/ui/atlas` draws the whole memory as a map:
   projects, tasks, events, notes and fact slots, joined by what the memory records
   and by resemblance in meaning, with a time machine that replays how it grew.
+  The operator can pin a memory to the brief, mark it stale or hide a copy of it
+  there; each action is an event by the operator, and undoing it is another.
 - **CLI:** `chronicle query-memory`, `chronicle timeline --as-of`, `chronicle record`;
   `chronicle doctor --summary` answers "is everything running" on one screen.
 

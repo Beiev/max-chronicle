@@ -17,6 +17,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
 
+from . import curation
 from .db import connect
 from .identity import Registry, fold
 from .memory import open_tasks
@@ -26,6 +27,7 @@ from .store import ChronicleConfig, config_from_manifest
 BRIEF_MAX_CHARS = 8000  # FR-12 ceiling
 BRIEF_DEFAULT_CHARS = 6000  # about 2k tokens even for Cyrillic text
 BRIEF_MIN_CHARS = 1000
+BRIEF_PINS = 5
 BRIEF_TASKS = 3
 BRIEF_FACTS = 10
 # In a project's brief, facts recorded without a project are other work's
@@ -118,10 +120,15 @@ def resolve_project(
     return None, "none"
 
 
-def _facts(connection: sqlite3.Connection, identities: Registry, project: str | None) -> list[dict[str, Any]]:
+def _facts(
+    connection: sqlite3.Connection, identities: Registry, project: str | None, stale: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
     where, params = identities.scope(project=project).where(
         domain="f.domain", project="f.project", task="f.task_id", project_or_unset=True,
     )
+    if stale:  # set by an event the operator marked out of date
+        where += f" AND f.event_id NOT IN ({', '.join('?' for _ in stale)})"
+        params = (*params, *sorted(stale))
     # A project's own facts come first; the unscoped brief is newest first, or
     # ten old project facts would hide a global rule recorded a minute ago.
     project_first = "(f.project IS NULL), " if project else ""
@@ -142,8 +149,37 @@ def _facts(connection: sqlite3.Connection, identities: Registry, project: str | 
     return (own + shared)[:BRIEF_FACTS]
 
 
+def _pins(
+    connection: sqlite3.Connection, identities: Registry, project: str | None, marks: curation.Marks
+) -> list[dict[str, Any]]:
+    """What the operator pinned in the Atlas: this project's, then memories without one; latest pin first.
+
+    A stale memory is not shown, nor one hidden since.
+    """
+    pins = []
+    for target, _mark in sorted(marks.pinned.items(), key=lambda item: item[1].seq, reverse=True):
+        if target in marks.stale:
+            continue
+        kind, _, key = target.partition(":")
+        if kind == "event":
+            row = connection.execute("SELECT text, project FROM events WHERE id = ? AND visibility != 'raw_only'",
+                                     (key,)).fetchone()
+        else:
+            row = None if target in marks.copies else connection.execute(
+                "SELECT title, project FROM documents WHERE id = ? AND deleted_at_utc IS NULL", (key,)).fetchone()
+        if row is None:
+            continue
+        owner = identities.project(row["project"])
+        if project is None or owner is None or owner == project:
+            pins.append({"kind": kind, "id": key, "text": row[0], "project": owner})
+    if project is not None:
+        pins.sort(key=lambda pin: pin["project"] is None)  # stable: latest first within each
+    return pins[:BRIEF_PINS]
+
+
 def _decisions(
-    connection: sqlite3.Connection, identities: Registry, project: str | None, now: datetime
+    connection: sqlite3.Connection, identities: Registry, project: str | None, now: datetime,
+    stale: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     since = (now - timedelta(days=BRIEF_DECISION_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     where, params = identities.scope(project=project).where(
@@ -152,6 +188,9 @@ def _decisions(
         # this project's: it showed up in every project's brief.
         task="e.task_id", project_or_unset=False,
     )
+    if stale:  # the operator marked them out of date
+        where += f" AND e.id NOT IN ({', '.join('?' for _ in stale)})"
+        params = (*params, *sorted(stale))
     rows = connection.execute(
         """SELECT e.id, e.occurred_at_utc, e.actor, e.text, e.project
         FROM events e
@@ -190,16 +229,24 @@ def _warnings(connection: sqlite3.Connection, now: datetime) -> list[str]:
 
 
 def _render(
-    project: str | None, how: str, tasks: list, facts: list, decisions: list, warnings: list[str], clean: _Cleaner
+    project: str | None, how: str, pins: list, tasks: list, facts: list, decisions: list, warnings: list[str],
+    clean: _Cleaner, stale: frozenset[str] = frozenset(),
 ) -> list[tuple[str, list[str]]]:
     heading = (
         f"Project: {clean(project)} ({'from the working directory' if how != 'given' else 'as requested'})."
         if project else "No project matched this directory: the brief covers all projects."
     )
     sections: list[tuple[str, list[str]]] = [("", [FRAMING, heading])]
+    sections.append(("Pinned by the operator", [
+        _line(clean(pin["text"]), prefix=f"[{clean(pin['project'])}] " if pin["project"] and not project else "",
+              suffix=f" ({pin['kind']} {pin['id']})")
+        for pin in pins
+    ]))
     sections.append(("Open tasks (resume with startup_bundle(project, task_id))", [
         _line(clean(task["goal"]), prefix=f"{clean(task['project'])}/{clean(task['task_id'])} "
-              f"({clean(task['agent'])}, {_short_time(task['recorded_at_utc'])}): ")
+              f"({clean(task['agent'])}, {_short_time(task['recorded_at_utc'])}): ",
+              # an open task stays; its last checkpoint is what the operator marked out of date
+              suffix=" [checkpoint marked stale]" if task.get("event_id") in stale else "")
         + ("\n  " + _line(clean("; ".join(step.rstrip(".") for step in task["next_steps"])), prefix="next: ")
            if task["next_steps"] else "")
         for task in tasks
@@ -251,21 +298,25 @@ def build_brief(
     if not config.db_path.exists():  # a fresh installation: nothing recorded, nothing created
         text = _text([("", [FRAMING, "Nothing has been recorded in Chronicle yet."]), ("Protocol", list(PROTOCOL))])
         return {"project": config.identities.project(project), "project_source": "given" if project else "none", "text": text,
-                "counts": {"open_tasks": 0, "facts": 0, "decisions": 0, "warnings": 0},
+                "counts": {"pinned": 0, "open_tasks": 0, "facts": 0, "decisions": 0, "warnings": 0},
                 "omitted": 0, "cut": False, "redactions": 0}
     identities = config.identities
     with _read_only(config) as connection:
         resolved, how = resolve_project(connection, manifest, cwd=cwd, project=project, identities=identities)
+        marks = curation.marks(connection)
+        pins = _pins(connection, identities, resolved, marks)
         tasks = open_tasks(connection, identities, project=resolved, limit=BRIEF_TASKS)
-        facts = _facts(connection, identities, resolved)
-        decisions = _decisions(connection, identities, resolved, now)
+        stale = frozenset(target[6:] for target in marks.stale if target.startswith("event:"))
+        facts = _facts(connection, identities, resolved, stale)
+        decisions = _decisions(connection, identities, resolved, now, stale)
         warnings = _warnings(connection, now)
     clean = _Cleaner()
-    sections = _render(resolved, how, tasks, facts, decisions, warnings, clean)
+    sections = _render(resolved, how, pins, tasks, facts, decisions, warnings, clean, stale)
     omitted = max(len(warnings) - BRIEF_WARNINGS, 0)
     # Over budget: drop the oldest items of the least urgent sections first:
-    # decisions, facts, warnings, then tasks. Framing and protocol always stay.
-    for index in (3, 2, 4, 1):
+    # decisions, facts, warnings, tasks, then what the operator pinned.
+    # Framing and protocol always stay.
+    for index in (4, 3, 5, 2, 1):
         while len(_text(sections)) > max_chars and sections[index][1]:
             sections[index][1].pop()
             omitted += 1
@@ -277,7 +328,8 @@ def build_brief(
         "project": resolved,
         "project_source": how,
         "text": text,
-        "counts": {"open_tasks": len(tasks), "facts": len(facts), "decisions": len(decisions), "warnings": len(warnings)},
+        "counts": {"pinned": len(pins), "open_tasks": len(tasks), "facts": len(facts), "decisions": len(decisions),
+                   "warnings": len(warnings)},
         "omitted": omitted,
         "cut": cut,
         "redactions": clean.redactions,
