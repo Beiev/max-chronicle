@@ -57,6 +57,8 @@ WRITE_TOOLS = ("startup_bundle", "query_memory", "get_memory", "recent_events", 
 READ_TOOLS = tuple(tool for tool in WRITE_TOOLS if tool != "record_event")
 ROLES = {"write": ("/mcp", WRITE_TOOLS), "read": ("/mcp/read", READ_TOOLS)}
 PARTS = ("server", "permissions", "hook", "block")
+SKIPPABLE = ("permissions", "hook", "block")  # the server entry is what a connection is
+SKIPPED_ASKED = "skipped (asked)"
 MIN_SERVER_VERSION = (0, 33, 0)
 HTTP_TIMEOUT_S = 2.0
 HOOK_MODULE = "max_chronicle.brief_hook"
@@ -275,6 +277,13 @@ class Part:
     adoptions: list[dict[str, Any]] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    asked: bool = False  # skipped because the caller said --skip
+    notice: str | None = None
+
+    @property
+    def label(self) -> str:
+        """The status as reported: install, present, skipped, skipped (asked) or refused."""
+        return SKIPPED_ASKED if self.asked else self.status
 
     def install(self, edit: Edit, detail: str) -> None:
         self.edits.append(edit)
@@ -295,14 +304,19 @@ class Part:
     def skip(self, detail: str, manual: str | None = None) -> None:
         self.status, self.detail, self.manual = "skipped", detail, manual
 
+    def skip_asked(self) -> None:
+        self.status, self.asked, self.detail = "skipped", True, "not installed: --skip"
+
     def refuse(self, detail: str, manual: str | None = None) -> None:
         self.status, self.detail, self.manual = "refused", detail, manual
         self.edits.clear()
 
     def as_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"status": self.status, "detail": self.detail, "files": self.files}
+        payload: dict[str, Any] = {"status": self.label, "detail": self.detail, "files": self.files}
         if self.manual:
             payload["manual"] = self.manual
+        if self.notice:
+            payload["notice"] = self.notice
         if self.notes:
             payload["notes"] = self.notes
         return payload
@@ -583,25 +597,31 @@ class Adapter:
             "cursor": {"url": ctx.mcp_url},
         }.get(self.id, {"type": "http", "url": ctx.mcp_url})
 
-    def plan(self, files: Files, ctx: Context, env: Mapping[str, str]) -> dict[str, Part]:
+    def plan(self, files: Files, ctx: Context, env: Mapping[str, str],
+             skip: Iterable[str] = ()) -> dict[str, Part]:
+        """Each part of the connection, planned on *files*; a part in *skip* is not installed."""
         paths = self.paths(env)
+        skip = set(skip)
         parts = {name: Part(name) for name in PARTS}
         planners: dict[str, Callable[[Part], None]] = {
             "server": lambda part: self._plan_server(part, files, ctx, paths),
             "permissions": lambda part: self._plan_permissions(part, files, ctx, paths),
             "hook": lambda part: self._plan_hook(part, files, ctx, paths),
+            "block": lambda part: self._plan_block(part, files, ctx, paths, hook=hook_ready),
         }
+        hook_ready = False
         for name, planner in planners.items():
             part = parts[name]
+            if name == "block":
+                # A hook skipped on request is the operator's own: the block keeps its hook line.
+                hook_ready = parts["hook"].status in ("install", "present") or parts["hook"].asked
+            if name in skip:
+                part.skip_asked()
+                continue
             try:
                 planner(part)
             except EditRefused as exc:
                 part.refuse(f"{exc.path}: {exc.reason}", exc.manual)
-        hook_ready = parts["hook"].status in ("install", "present")
-        try:
-            self._plan_block(parts["block"], files, ctx, paths, hook=hook_ready)
-        except EditRefused as exc:
-            parts["block"].refuse(f"{exc.path}: {exc.reason}", exc.manual)
         return parts
 
     def _plan_server(self, part: Part, files: Files, ctx: Context, paths: dict[str, Path]) -> None:
@@ -952,8 +972,14 @@ class Outcome:
 Ask = Callable[[str, list[str], str], bool]
 
 
-def _plan_connection(adapter: Adapter, ctx: Context, ledger: Ledger, env: Mapping[str, str]):
-    """Undo of a connection of another role or address, then the parts of this one, on the planned files."""
+def _plan_connection(adapter: Adapter, ctx: Context, ledger: Ledger, env: Mapping[str, str],
+                     skip: Iterable[str] = ()):
+    """Undo of a connection of another role or address, then the parts of this one, on the planned files.
+
+    With the same role and address, only the parts in *skip* that connect had
+    installed come out.
+    """
+    skip = set(skip)
     files = Files()
     reverts: list[tuple[Edit, dict[str, Any]]] = []
     lost: list[dict[str, Any]] = []
@@ -970,7 +996,25 @@ def _plan_connection(adapter: Adapter, ctx: Context, ledger: Ledger, env: Mappin
             lost.append({**change, "lost_reason": reason})
         elif switching and edit is not None:
             reverts.append((edit, change))
-    parts = adapter.plan(files, ctx, env)
+    if not switching and skip:
+        lost_ids = {change["id"] for change in lost}
+        for change in reversed(ledger.active(adapter.id)):
+            if change["part"] not in skip or change["id"] in lost_ids:
+                continue
+            if change["status"] == "adopted":
+                if change not in released:
+                    released.append(change)
+                continue
+            path = Path(change["file"])
+            edit = _doc_for(path, change["logical"], files.load(path)).undo(change)
+            files.apply(edit)
+            reverts.append((edit, change))
+    parts = adapter.plan(files, ctx, env, skip)
+    for _, change in reverts:
+        if not switching and change["part"] in skip:
+            parts[change["part"]].detail = "taken out: --skip"
+            if change["file"] not in parts[change["part"]].files:
+                parts[change["part"]].files.append(change["file"])
     return files, parts, reverts, lost, released
 
 
@@ -1003,8 +1047,13 @@ def _display(path: str, env: Mapping[str, str]) -> str:
 
 def run_connect(adapter: Adapter, *, role: str, manifest: Path, url: str | None, by: str | None, yes: bool,
                 dry_run: bool, force: bool, adopt: bool, env: Mapping[str, str], db: Path | None = None,
-                ask: Ask | None = None, server: dict[str, Any] | None = None) -> Outcome:
-    payload: dict[str, Any] = {"command": "connect", "agent": adapter.id, "role": role, "status": None}
+                ask: Ask | None = None, server: dict[str, Any] | None = None,
+                skip: Iterable[str] = ()) -> Outcome:
+    skip = sorted(set(skip))
+    unknown = [name for name in skip if name not in SKIPPABLE]
+    if unknown:
+        raise ValueError(f"--skip takes {', '.join(SKIPPABLE)}, not {', '.join(unknown)}")
+    payload: dict[str, Any] = {"command": "connect", "agent": adapter.id, "role": role, "status": None, "skip": skip}
     if not adapter.installed(env):
         payload.update(status="not_installed", error=f"{adapter.label} is not installed here: "
                        f"{adapter.paths(env).get('home')} does not exist")
@@ -1024,7 +1073,7 @@ def run_connect(adapter: Adapter, *, role: str, manifest: Path, url: str | None,
     for change in ledger.pending():
         _settle_pending(change, ledger)
     try:
-        files, parts, reverts, lost, released = _plan_connection(adapter, ctx, ledger, env)
+        files, parts, reverts, lost, released = _plan_connection(adapter, ctx, ledger, env, skip)
     except EditRefused as exc:
         payload.update(status="refused", error=f"{exc.path}: {exc.reason}", manual=exc.manual)
         return Outcome(payload, EXIT_REFUSED, [f"Refused: {exc.path}: {exc.reason}", exc.manual or ""])
@@ -1041,7 +1090,9 @@ def run_connect(adapter: Adapter, *, role: str, manifest: Path, url: str | None,
     retiring = {change["id"] for _, change in reverts} | {change["id"] for change in lost + released}
     adoptions = [(name, item) for name, part in parts.items() for item in part.adoptions
                  if not _tracked(ledger, adapter.id, name, item, retiring)]
-    if not edits and not adoptions and not lost and not released and _same_connection(ledger, adapter.id, ctx):
+    statuses = {name: _reported(part) for name, part in parts.items()}
+    if (not edits and not adoptions and not lost and not released and _same_connection(ledger, adapter.id, ctx)
+            and _settled(ledger.connections[adapter.id].get("parts") or {}) == _settled(statuses)):
         payload["status"] = "nothing_to_do"
         return Outcome(payload, EXIT_OK, lines, diff, ["Nothing to do: connected as asked."])
     if dry_run:
@@ -1085,16 +1136,16 @@ def run_connect(adapter: Adapter, *, role: str, manifest: Path, url: str | None,
     for name, item in adoptions:
         ledger.adopt(agent=adapter.id, part=name, path=Path(item["path"]), text=item["text"],
                      logical=item["logical"], extra=extra)
-    installed = {name: ("installed" if part.status == "install" else part.status) for name, part in parts.items()}
+    installed = statuses
     for name, status in installed.items():
         payload["parts"][name]["status"] = status
     if not shown:
         lines = lines[:1] + [_part_line(name, part, env, done=True) for name, part in parts.items()]
     ledger.connections[adapter.id] = {"role": role, "url": ctx.mcp_url, "base_url": ctx.base_url,
-                                      "at": _now(), "by": by, "parts": installed}
+                                      "at": _now(), "by": by, "parts": installed, "skip": skip}
     ledger.save()
     connection = {"action": "connect", "target": adapter.id, "role": role, "url": ctx.mcp_url, "parts": installed,
-                  "by": by, "by_self_declared": True}
+                  "skip": skip, "by": by, "by_self_declared": True}
     text = (f"Connected {adapter.label} to Chronicle with role {role}: "
             + ", ".join(f"{name} {status}" for name, status in installed.items())
             + (f". Run by {by} (self-declared)." if by else "."))
@@ -1108,6 +1159,16 @@ def run_connect(adapter: Adapter, *, role: str, manifest: Path, url: str | None,
     if payload.get("event_id"):
         summary.append(f"Event {payload['event_id']} recorded ({EVENT_CATEGORY}).")
     return Outcome(payload, EXIT_OK, lines, diff, summary, shown)
+
+
+def _reported(part: Part) -> str:
+    """A part's outcome as the ledger and the report keep it."""
+    return "installed" if part.status == "install" else part.label
+
+
+def _settled(parts: Mapping[str, str]) -> dict[str, str]:
+    """Part outcomes with installed and present counted alike: both mean the part is in place."""
+    return {name: "in place" if status in ("installed", "present") else status for name, status in parts.items()}
 
 
 def _tracked(ledger: Ledger, agent: str, part: str, item: dict[str, Any], retiring: set[str]) -> bool:
@@ -1144,12 +1205,14 @@ def _now() -> str:
 
 
 def _part_line(name: str, part: Part, env: Mapping[str, str], *, done: bool = False) -> str:
-    label = {"install": "installed" if done else "install", "present": "present", "skipped": "skipped",
+    label = {"install": "installed" if done else "install", "present": "present", "skipped": part.label,
              "refused": "REFUSED"}[part.status]
     detail = part.detail.replace(str(_home(env)) + os.sep, "~" + os.sep)
     line = f"  {name:<12} {label:<9} {detail}"
     if part.manual and part.status in ("refused", "skipped"):
         line += f"\n  {'':<12} {'':<9} by hand: {part.manual}"
+    if part.notice:
+        line += f"\n  {'':<12} {'':<9} notice: {part.notice}"
     return line
 
 
@@ -1348,6 +1411,9 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
     connect.add_argument("--adopt", action="store_true",
                          help="Rename an entry of another name that points at this server to 'chronicle'")
     connect.add_argument("--force", action="store_true", help="Replace a 'chronicle' entry that points elsewhere")
+    connect.add_argument("--skip", action="append", choices=SKIPPABLE, default=[], metavar="PART",
+                         help="Do not install this part (permissions, hook or block; repeatable); a part connect "
+                              "installed before is taken out. The server entry is always installed")
     connect.add_argument("--print", dest="print_only", action="store_true",
                          help="Print the snippets and the protocol block to add by hand; change nothing")
     connect.set_defaults(handler=cmd_connect)
@@ -1418,7 +1484,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
                              ["--json needs --yes or --dry-run"]), True)
     result = run_connect(adapter, role=args.role, manifest=manifest, url=args.url, by=args.by, yes=args.yes,
                          dry_run=args.dry_run, force=args.force, adopt=args.adopt, env=env, db=args.db,
-                         ask=_ask_with_diff)
+                         ask=_ask_with_diff, skip=args.skip)
     return _emit(result, args.json, show_diff=args.dry_run)
 
 

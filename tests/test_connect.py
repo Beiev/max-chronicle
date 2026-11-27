@@ -308,7 +308,7 @@ def test_connect_and_disconnect_record_events_by_the_operator(chronicle_sandbox,
     assert connected["payload"]["connection"] == {
         "action": "connect", "target": "codex", "role": "read", "url": f"{BASE}/mcp/read",
         "parts": {"server": "installed", "permissions": "installed", "hook": "installed", "block": "installed"},
-        "by": "claude", "by_self_declared": True}
+        "skip": [], "by": "claude", "by_self_declared": True}
     assert "self-declared" in connected["text"]
     assert disconnected["payload"]["connection"]["action"] == "disconnect"
 
