@@ -26,6 +26,7 @@ it is made: the file, the piece, sha256 before and after.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,8 +37,9 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import tomllib
-from typing import Any
+from typing import Any, Iterator
 import uuid
 
 DEFAULT_INDENT = "  "
@@ -45,6 +47,9 @@ NEW_CONFIG_MODE = 0o600  # a config file this module creates holds only Chronicl
 NEW_TEXT_MODE = 0o644
 LEDGER_MODE = 0o600  # a replaced entry's original text may hold a header value
 LEDGER_VERSION = 1
+LEDGER_LOCK_SUFFIX = ".lock"  # connect-ledger.json -> connect-ledger.lock, beside it
+LEDGER_LOCK_WAIT_S = 30.0  # how long a run waits for another run's lock
+LEDGER_LOCK_POLL_S = 0.05
 BACKUP_TIME_FORMAT = "%Y%m%d-%H%M%S"
 _NUMBER = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _LITERALS = {"true": True, "false": False, "null": None}
@@ -1297,6 +1302,49 @@ class TextDoc:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class LedgerBusy(Exception):
+    """Another run held the ledger's lock for the whole wait."""
+
+    def __init__(self, path: Path, waited_s: float) -> None:
+        super().__init__(f"another chronicle connect or disconnect run holds the lock {path} "
+                         f"(waited {waited_s:g} s)")
+        self.path = path
+        self.waited_s = waited_s
+
+
+def ledger_lock_path(ledger: Path) -> Path:
+    return Path(ledger).with_suffix(LEDGER_LOCK_SUFFIX)
+
+
+@contextmanager
+def ledger_lock(ledger: Path, *, wait_s: float | None = None) -> Iterator[Path]:
+    """Hold the ledger's lock file exclusively (``flock``) for one whole run.
+
+    A second run waits up to *wait_s* (``LEDGER_LOCK_WAIT_S``) and then raises
+    ``LedgerBusy``. The lock goes with the file descriptor: a run that dies
+    leaves no lock behind.
+    """
+    import fcntl  # POSIX only; connect is refused on Windows before it gets here
+
+    wait_s = LEDGER_LOCK_WAIT_S if wait_s is None else wait_s
+    path = ledger_lock_path(ledger)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, LEDGER_MODE)
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LedgerBusy(path, wait_s) from None
+                time.sleep(LEDGER_LOCK_POLL_S)
+        yield path
+    finally:
+        os.close(descriptor)  # releases the lock
 
 
 class Ledger:

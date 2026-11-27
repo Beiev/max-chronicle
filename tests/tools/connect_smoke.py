@@ -629,6 +629,31 @@ def skip_checks(smoke: Smoke) -> None:
     smoke.check("skip-disconnect", skip_disconnect)
 
 
+def ledger_checks(smoke: Smoke) -> None:
+    def concurrent():
+        home = smoke.new_home()
+        agents = ("claude", "codex")
+        before = {agent: shas(home, agent) for agent in agents}
+
+        def together(*args: str) -> list[int]:
+            processes = [subprocess.Popen([sys.executable, "-m", "max_chronicle.cli", "--manifest", str(smoke.manifest),
+                                           *args, agent, "--yes"], stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL, env=smoke.env(home)) for agent in agents]
+            return [process.wait(timeout=COMMAND_TIMEOUT_S) for process in processes]
+
+        connected = together("connect")
+        ledger = smoke.ledger()
+        recorded = sorted(agent for agent in agents if agent in ledger["connections"]
+                          and any(c["agent"] == agent and c["status"] == "applied" for c in ledger["changes"]))
+        disconnected = together("disconnect")
+        after = {agent: shas(home, agent) for agent in agents}
+        left = [agent for agent in agents if agent in smoke.ledger()["connections"]]
+        return (connected == [0, 0] and recorded == sorted(agents) and disconnected == [0, 0] and after == before
+                and not left), f"connect exits {connected}, in the ledger {recorded}, disconnect exits {disconnected}"
+
+    smoke.check("ledger-concurrent", concurrent)
+
+
 def hook(smoke: Smoke, agent: str, budget: int, session: str) -> subprocess.CompletedProcess:
     payload = json.dumps({"session_id": session, "hook_event_name": "SessionStart", "cwd": str(smoke.workspace)})
     return subprocess.run([sys.executable, "-m", "max_chronicle.brief_hook", "--manifest", str(smoke.manifest),
@@ -709,6 +734,7 @@ def main() -> int:
         doctor_checks(smoke)
         report_checks(smoke)
         skip_checks(smoke)
+        ledger_checks(smoke)
         hook_up_checks(smoke)
         smoke.stop_server()
         down_checks(smoke)

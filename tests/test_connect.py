@@ -18,8 +18,10 @@ import tomllib
 import pytest
 
 from max_chronicle import connect as connect_module
+from max_chronicle import connect_edit
 from max_chronicle.connect import (
     ADAPTERS,
+    EXIT_BUSY,
     EXIT_DRIFT,
     EXIT_OK,
     EXIT_PREFLIGHT,
@@ -35,7 +37,7 @@ from max_chronicle.connect import (
     run_connect,
     run_disconnect,
 )
-from max_chronicle.connect_edit import Ledger, mask_comments
+from max_chronicle.connect_edit import Ledger, ledger_lock, mask_comments
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "connect" / "home"
 AGENTS = ("claude", "codex", "zcode", "opencode", "gemini")
@@ -862,3 +864,55 @@ def test_the_skip_flag_on_the_command_line(stub, monkeypatch, capsys, chronicle_
 
     assert code == 0 and "skipped (asked)" in out
     assert not (home / ".claude" / "CLAUDE.md").read_text().count("chronicle:begin")
+
+
+# ---------------------------------------------------------------------------
+# One run at a time: the ledger's lock
+# ---------------------------------------------------------------------------
+
+
+def test_two_overlapping_runs_keep_both_records(monkeypatch, chronicle_sandbox, home, env) -> None:
+    """The second run starts while the first is between reading the ledger and writing it."""
+    plan = connect_module._plan_connection
+    second: dict[str, object] = {}
+
+    def overlapping(*args, **kwargs):
+        if not second:
+            def run() -> None:
+                second["outcome"] = _connect("claude", chronicle_sandbox, env)
+
+            second["thread"] = threading.Thread(target=run)
+            second["thread"].start()
+            second["thread"].join(timeout=0.5)  # without the lock it runs to its end here
+        return plan(*args, **kwargs)
+
+    monkeypatch.setattr(connect_module, "_plan_connection", overlapping)
+    before = {agent: _shas(home, agent) for agent in ("codex", "claude")}
+
+    first = _connect("codex", chronicle_sandbox, env)
+    second["thread"].join(timeout=60)
+
+    assert first.exit_code == EXIT_OK and second["outcome"].exit_code == EXIT_OK
+    ledger = Ledger(chronicle_sandbox.status_root / "connect-ledger.json")
+    assert set(ledger.connections) == {"codex", "claude"}
+    assert ledger.active("codex") and ledger.active("claude")
+    for agent in ("codex", "claude"):
+        assert _disconnect(agent, chronicle_sandbox, env).exit_code == EXIT_OK
+    assert {agent: _shas(home, agent) for agent in ("codex", "claude")} == before
+
+
+def test_a_run_waits_a_bounded_time_for_the_lock_then_gives_up(monkeypatch, chronicle_sandbox, home, env) -> None:
+    monkeypatch.setattr(connect_edit, "LEDGER_LOCK_WAIT_S", 0.2)
+    ledger_file = chronicle_sandbox.status_root / "connect-ledger.json"
+    before = _shas(home, "gemini")
+
+    with ledger_lock(ledger_file):
+        connected = _connect("gemini", chronicle_sandbox, env)
+        disconnected = _disconnect("gemini", chronicle_sandbox, env)
+
+    for outcome in (connected, disconnected):
+        assert outcome.exit_code == EXIT_BUSY and outcome.payload["status"] == "busy"
+        assert "another chronicle connect or disconnect run holds the lock" in outcome.payload["error"]
+        assert str(ledger_file.with_suffix(".lock")) in outcome.payload["error"]
+    assert _shas(home, "gemini") == before and not ledger_file.exists()
+    assert _connect("gemini", chronicle_sandbox, env).exit_code == EXIT_OK  # the lock went with its holder

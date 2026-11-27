@@ -254,6 +254,10 @@ agent rewrote its file and kept the entry elsewhere (Claude Code saves
 one piece. An entry that was there before `connect` stays. `doctor --agents`
 checks every recorded piece and the server's address, names each part that is not
 as `connect` left it with the command that fixes it, and exits 5 on drift.
+One `connect` or `disconnect` runs at a time per workspace: a run holds
+`connect-ledger.lock` beside the ledger (`flock`) from before it reads the ledger
+until after it writes it; a second run waits up to 30 s, then exits 7 and
+changes nothing.
 
 **The brief hook** is `<absolute python> -m max_chronicle.brief_hook --manifest
 <path> --agent <id> --budget <n>` (`--format zcode|gemini` for JSON output). It
@@ -271,7 +275,8 @@ parts and `--by` as a self-declared label.
 **Exit codes:** 0 done or nothing to do; 1 refused (an entry in the way, a file
 not edited, a file changed while connect ran, the answer was no); 2 the workspace
 is unclear; 4 preflight failed; 5 `doctor --agents` found drift; 6 not supported
-(unknown or uninstalled agent, Cursor without `--print`, Windows).
+(unknown or uninstalled agent, Cursor without `--print`, Windows); 7 another run
+holds the ledger's lock.
 
 **Platforms:** macOS and Linux. On Windows `connect` and `disconnect` refuse with
 a message.

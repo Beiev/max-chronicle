@@ -41,9 +41,11 @@ from .connect_edit import (
     EditRefused,
     JsonDoc,
     Ledger,
+    LedgerBusy,
     Loaded,
     TextDoc,
     TomlDoc,
+    ledger_lock,
     load,
     sha256_file,
     toml_key,
@@ -89,6 +91,7 @@ EXIT_REFUSED = 1  # refused: an entry in the way, a file not edited, an answer o
 EXIT_PREFLIGHT = 4  # the server is not answering, not Chronicle, too old, or has no read endpoint
 EXIT_DRIFT = 5  # doctor --agents: a part is not as connect left it
 EXIT_UNSUPPORTED = 6  # an unknown or uninstalled agent, Cursor without --print, Windows
+EXIT_BUSY = 7  # another connect or disconnect run held the ledger's lock for the whole wait
 
 EXIT_CODES_HELP = """exit codes:
   0  done, or nothing to do
@@ -100,6 +103,7 @@ EXIT_CODES_HELP = """exit codes:
      or /mcp/read does not answer; nothing was changed
   5  doctor --agents: a part is not as connect left it
   6  not supported: unknown or uninstalled agent, Cursor without --print, Windows
+  7  another connect or disconnect run holds the ledger's lock; nothing was changed
 """
 
 
@@ -1107,6 +1111,24 @@ def run_connect(adapter: Adapter, *, role: str, manifest: Path, url: str | None,
                                              "address_from": server["source"]})
     if server.get("notes"):
         payload["notes"] = list(server["notes"])
+    try:
+        with ledger_lock(ledger_path(manifest)):
+            return _connect_locked(adapter, ctx, server, payload, manifest=manifest, by=by, yes=yes,
+                                   dry_run=dry_run, env=env, db=db, ask=ask, skip=skip)
+    except LedgerBusy as exc:
+        return _busy(payload, exc)
+
+
+def _busy(payload: dict[str, Any], exc: LedgerBusy) -> Outcome:
+    payload.update(status="busy", error=str(exc), manual="Run the command again when the other run has finished.")
+    return Outcome(payload, EXIT_BUSY, [f"Refused: {exc}. Nothing was changed.", payload["manual"]])
+
+
+def _connect_locked(adapter: Adapter, ctx: Context, server: dict[str, Any], payload: dict[str, Any], *,
+                    manifest: Path, by: str | None, yes: bool, dry_run: bool, env: Mapping[str, str],
+                    db: Path | None, ask: Ask | None, skip: list[str]) -> Outcome:
+    """A connect run under the ledger's lock: read the ledger, plan, write, record."""
+    role = ctx.role
     ledger = Ledger(ledger_path(manifest))
     for change in ledger.pending():
         _settle_pending(change, ledger)
@@ -1258,6 +1280,17 @@ def _part_line(name: str, part: Part, env: Mapping[str, str], *, done: bool = Fa
 def run_disconnect(adapter: Adapter, *, manifest: Path, by: str | None, yes: bool, dry_run: bool,
                    env: Mapping[str, str], db: Path | None = None, ask: Ask | None = None) -> Outcome:
     payload: dict[str, Any] = {"command": "disconnect", "agent": adapter.id, "status": None}
+    try:
+        with ledger_lock(ledger_path(manifest)):
+            return _disconnect_locked(adapter, payload, manifest=manifest, by=by, yes=yes, dry_run=dry_run,
+                                      env=env, db=db, ask=ask)
+    except LedgerBusy as exc:
+        return _busy(payload, exc)
+
+
+def _disconnect_locked(adapter: Adapter, payload: dict[str, Any], *, manifest: Path, by: str | None, yes: bool,
+                       dry_run: bool, env: Mapping[str, str], db: Path | None, ask: Ask | None) -> Outcome:
+    """A disconnect run under the ledger's lock."""
     ledger = Ledger(ledger_path(manifest))
     for change in ledger.pending():
         _settle_pending(change, ledger)
