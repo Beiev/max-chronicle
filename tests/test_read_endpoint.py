@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
 import sys
 import threading
+import time
+import urllib.request
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,7 +19,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import max_chronicle.mcp_server as mcp_server
-from max_chronicle import __version__
+from max_chronicle import __version__, server_address
 from max_chronicle.mcp_server import (
     MCP_PATH,
     READ_MCP_PATH,
@@ -212,7 +219,7 @@ def test_main_composes_the_app_and_starts_each_job_once(chronicle_sandbox, monke
     monkeypatch.setattr(mcp_server, "_start_embedder", lambda path: started.append("embedder"))
     monkeypatch.setattr(mcp_server, "_start_scheduler", lambda path: started.append("scheduler"))
     monkeypatch.setattr(mcp_server, "_install_stack_dump", lambda: None)
-    monkeypatch.setattr(mcp_server, "_serve_app", lambda app, options: served.append((app, options)))
+    monkeypatch.setattr(mcp_server, "_serve_app", lambda app, options, **_: served.append((app, options)))
     monkeypatch.setattr(sys, "argv", ["chronicle-mcp", "--manifest", str(chronicle_sandbox.manifest_path),
                                       "--transport", "streamable-http"])
 
@@ -235,7 +242,7 @@ def test_stdio_and_the_read_only_http_server_are_served_as_before(chronicle_sand
         run=lambda transport: calls.append(transport), settings=SimpleNamespace(),
         run_streamable_http_async=served))
     monkeypatch.setattr(mcp_server, "_install_stack_dump", lambda: None)
-    monkeypatch.setattr(mcp_server, "_serve_app", lambda app, options: calls.append("composed"))
+    monkeypatch.setattr(mcp_server, "_serve_app", lambda app, options, **_: calls.append("composed"))
     with open_connection(config_from_manifest(load_manifest(chronicle_sandbox.manifest_path))):
         pass  # a read-only server needs a database to exist
 
@@ -244,3 +251,85 @@ def test_stdio_and_the_read_only_http_server_are_served_as_before(chronicle_sand
         assert mcp_server._main() == 0
 
     assert calls == ["stdio", "http"]
+
+
+# ---------------------------------------------------------------------------
+# The address file (item 2)
+# ---------------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _server_env(sandbox, port: int) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("CHRONICLE_", "MCP_"))}
+    env.update({
+        "HOME": str(sandbox.root / "home"),
+        "CHRONICLE_ROOT": str(sandbox.status_root),
+        "CHRONICLE_FEATURE_EVENT_EMBEDDINGS": "0",
+        "OLLAMA_URL": "http://127.0.0.1:1",
+        "MCP_HOST": "127.0.0.1",
+        "MCP_PORT": str(port),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+    })
+    return env
+
+
+def _wait_for(predicate, timeout_s: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_the_server_writes_its_address_and_removes_it_on_a_clean_stop(chronicle_sandbox) -> None:
+    port = _free_port()
+    (chronicle_sandbox.root / "home").mkdir()
+    address = chronicle_sandbox.status_root / server_address.ADDRESS_FILE_NAME
+    process = subprocess.Popen(
+        [sys.executable, "-m", "max_chronicle.mcp_server", "--manifest", str(chronicle_sandbox.manifest_path),
+         "--transport", "streamable-http", "--migrate"],
+        env=_server_env(chronicle_sandbox, port), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        assert _wait_for(address.exists), process.stderr.read1().decode() if process.poll() is not None else ""
+        recorded = json.loads(address.read_text())
+        with urllib.request.urlopen(f"{recorded['url']}/health", timeout=5) as response:
+            health = json.loads(response.read())
+    finally:
+        process.send_signal(signal.SIGTERM)
+        stderr = process.communicate(timeout=30)[1].decode()
+
+    assert recorded["url"] == f"http://127.0.0.1:{port}"
+    assert recorded["pid"] == process.pid and recorded["version"] == __version__
+    assert [item["path"] for item in health["mcp_endpoints"]] == ["/mcp", "/mcp/read"]
+    assert not address.exists(), stderr[-2000:]
+
+
+def test_the_address_resolves_from_the_flag_then_the_environment_then_the_file(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv(server_address.ENV_SERVER_URL, raising=False)
+    assert server_address.resolve_server_url(None, tmp_path) == (None, "none")
+
+    server_address.write_address(tmp_path, "http://127.0.0.1:4100", version="0.33.0", pid=12)
+    assert server_address.resolve_server_url(None, tmp_path)[0] == "http://127.0.0.1:4100"
+
+    monkeypatch.setenv(server_address.ENV_SERVER_URL, "http://127.0.0.1:4200/")
+    assert server_address.resolve_server_url(None, tmp_path) == ("http://127.0.0.1:4200", "CHRONICLE_SERVER_URL")
+    assert server_address.resolve_server_url("http://127.0.0.1:4300", tmp_path) == ("http://127.0.0.1:4300", "--url")
+
+
+def test_only_the_owner_removes_the_address_file(tmp_path) -> None:
+    server_address.write_address(tmp_path, "http://127.0.0.1:4100", version="0.33.0", pid=12)
+
+    assert server_address.remove_address(tmp_path, pid=13) is False
+    assert server_address.remove_address(tmp_path, pid=12) is True
+    assert server_address.read_address(tmp_path) is None
+
+
+def test_a_server_bound_to_every_interface_is_reached_on_loopback() -> None:
+    assert server_address.base_url("0.0.0.0", 4100) == "http://127.0.0.1:4100"
+    assert server_address.base_url("::1", 4100) == "http://[::1]:4100"

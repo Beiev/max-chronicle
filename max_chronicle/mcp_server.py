@@ -30,7 +30,7 @@ from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from . import __version__, atlas, curation, embeddings, viewer
+from . import __version__, atlas, curation, embeddings, server_address, viewer
 
 from .automation import load_automation_config
 from .config import (
@@ -98,6 +98,7 @@ READ_MCP_PATH = "/mcp/read"
 PROFILE_ROLES = {CHRONICLER_PROFILE: "write", ADMIN_PROFILE: "admin", READ_ONLY_PROFILE: "read"}
 # Names of the threads a long-running server starts; /health counts them.
 BACKGROUND_THREAD_PREFIX = "chronicle-"
+ADDRESS_POLL_S = 0.05  # how often the server checks that it listens before writing its address
 WRITE_DESCRIPTION = (
     "No prior call is required. When you continue a task, read its checkpoint with "
     "`startup_bundle(project, task_id)` first."
@@ -1349,7 +1350,7 @@ def http_endpoints(profile: str) -> list[dict[str, str]]:
 
 
 def build_http_app(manifest_path: Path | None = None, *, profile: str = CHRONICLER_PROFILE,
-                   app_options: dict[str, Any] | None = None):
+                   app_options: dict[str, Any] | None = None, on_stop: Callable[[], Any] | None = None):
     """One Starlette app: *profile* at /mcp, the read-only profile at /mcp/read.
 
     Two server objects, because a server's tools are fixed when it is built.
@@ -1357,6 +1358,8 @@ def build_http_app(manifest_path: Path | None = None, *, profile: str = CHRONICL
     come from the main server. One lifespan runs both session managers (each
     may run once). Background jobs are not started here: ``_main`` starts them
     once per process. A read-only *profile* gets its own app unchanged.
+    *on_stop* runs when the app's lifespan ends: a clean stop, before uvicorn
+    hands a caught signal back to the process.
     """
     from contextlib import AsyncExitStack, asynccontextmanager
 
@@ -1379,10 +1382,14 @@ def build_http_app(manifest_path: Path | None = None, *, profile: str = CHRONICL
 
     @asynccontextmanager
     async def lifespan(_app):
-        async with AsyncExitStack() as stack:
-            await stack.enter_async_context(main.session_manager.run())
-            await stack.enter_async_context(reader.session_manager.run())
-            yield
+        try:
+            async with AsyncExitStack() as stack:
+                await stack.enter_async_context(main.session_manager.run())
+                await stack.enter_async_context(reader.session_manager.run())
+                yield
+        finally:
+            if on_stop is not None:
+                on_stop()
 
     routes = list(main_app.routes)
     routes.insert(next(index for index, route in enumerate(routes)
@@ -1470,8 +1477,12 @@ def _serve(server: MCPServer, transport: str, http_options: dict[str, Any] | Non
     anyio.run(serve)
 
 
-def _serve_app(app: Any, http_options: dict[str, Any]) -> None:
-    """Serve a composed HTTP app (see ``build_http_app``) with the loop monitor and its stall watcher."""
+def _serve_app(app: Any, http_options: dict[str, Any], *, workspace: Path | None = None) -> None:
+    """Serve a composed HTTP app (see ``build_http_app``) with the loop monitor and its stall watcher.
+
+    Once the server listens, its address goes to the workspace's address file
+    (``server_address``); the app's lifespan removes it on a clean stop.
+    """
     import uvicorn
 
     monitor = LoopMonitor(c_timer=True)
@@ -1480,11 +1491,37 @@ def _serve_app(app: Any, http_options: dict[str, Any]) -> None:
     server = uvicorn.Server(uvicorn.Config(app, host=http_options["host"], port=http_options["port"],
                                            log_level="info"))
 
+    async def announce() -> None:
+        while not server.started:
+            if server.should_exit:
+                return
+            await anyio.sleep(ADDRESS_POLL_S)
+        if workspace is None:
+            return
+        port = http_options["port"]
+        for listener in getattr(server, "servers", []) or []:
+            for sock in getattr(listener, "sockets", []) or []:
+                port = sock.getsockname()[1]  # the port bound, when 0 asked for any
+                break
+        url = server_address.base_url(http_options["host"], port)
+        try:
+            path = server_address.write_address(workspace, url, version=__version__,
+                                                started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        except OSError as exc:
+            _LOGGER.warning("address file not written: %s: %s", type(exc).__name__, exc)
+            return
+        _LOGGER.info("chronicle-mcp listening at %s; address written to %s", url, path)
+
     async def serve() -> None:
-        async with anyio.create_task_group() as group:
-            group.start_soon(monitor.run)
-            await server.serve()
-            group.cancel_scope.cancel()
+        try:
+            async with anyio.create_task_group() as group:
+                group.start_soon(monitor.run)
+                group.start_soon(announce)
+                await server.serve()
+                group.cancel_scope.cancel()
+        finally:
+            if workspace is not None:
+                server_address.remove_address(workspace)
 
     anyio.run(serve)
 
@@ -1641,9 +1678,11 @@ def _main(default_profile: str = CHRONICLER_PROFILE) -> int:
             _start_embedder(manifest_path)
         _start_scheduler(manifest_path)
     if composed:
+        workspace = Path(manifest_path).resolve().parent
         app = build_http_app(manifest_path, profile=args.profile, app_options={
-            "transport_security": http_options["transport_security"], "host": http_options["host"]})
-        _serve_app(app, http_options)
+            "transport_security": http_options["transport_security"], "host": http_options["host"]},
+            on_stop=lambda: server_address.remove_address(workspace))
+        _serve_app(app, http_options, workspace=workspace)
         return 0
     server = build_server(manifest_path, profile=args.profile)
     _serve(server, args.transport, http_options)
