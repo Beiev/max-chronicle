@@ -629,3 +629,94 @@ def test_disconnect_of_an_agent_never_connected_does_nothing(chronicle_sandbox, 
 
     assert outcome.exit_code == EXIT_OK and outcome.payload["status"] == "nothing_to_do"
     assert _shas(home, "opencode") == before
+
+
+# ---------------------------------------------------------------------------
+# The protocol block
+# ---------------------------------------------------------------------------
+
+
+def _block(home: Path, name: str) -> str:
+    text = (home / name).read_text()
+    start = text.index("<!-- chronicle:begin")
+    return text[start:text.index("<!-- chronicle:end -->", start) + len("<!-- chronicle:end -->")]
+
+
+def test_the_block_is_rendered_per_role(chronicle_sandbox, home, env) -> None:
+    _connect("claude", chronicle_sandbox, env)
+    write_block = _block(home, ".claude/CLAUDE.md")
+    _connect("claude", chronicle_sandbox, env, role="read")
+    read_block = _block(home, ".claude/CLAUDE.md")
+
+    assert write_block.startswith("<!-- chronicle:begin role=write") and f"{BASE}/mcp," in write_block
+    assert "Record decisions, milestones and findings with `record_event`" in write_block
+    assert read_block.startswith("<!-- chronicle:begin role=read") and f"{BASE}/mcp/read" in read_block
+    assert "connected read-only: it has no `record_event`" in read_block
+    assert "Record decisions" not in read_block
+
+
+def test_the_block_carries_the_absolute_command_that_connects_another_agent(chronicle_sandbox, home, env) -> None:
+    _connect("gemini", chronicle_sandbox, env)
+
+    line = next(line for line in _block(home, ".gemini/GEMINI.md").splitlines() if "To connect another agent" in line)
+    command = line.split("`")[1]
+    program = command.split()[0]
+    assert Path(program).is_absolute() or program == sys.executable
+    assert f"--manifest {chronicle_sandbox.manifest_path}" in command
+    assert command.endswith("connect <agent> --role <read|write> --by <your agent id> --yes --json")
+
+
+def test_an_agent_without_a_session_start_hook_is_told_to_call_startup_bundle(chronicle_sandbox, home, env) -> None:
+    _connect("opencode", chronicle_sandbox, env)
+    _connect("codex", chronicle_sandbox, env)
+
+    assert "Start each session with `startup_bundle(" in _block(home, ".config/opencode/AGENTS.md")
+    hooked = _block(home, ".codex/AGENTS.md")
+    assert "starts with a Chronicle memory brief from a session-start hook" in hooked
+    assert "Start each session" not in hooked
+
+
+def test_disconnect_removes_the_block_and_nothing_else(chronicle_sandbox, home, env) -> None:
+    path = home / ".zcode" / "AGENTS.md"
+    _connect("zcode", chronicle_sandbox, env)
+    path.write_text(path.read_text() + "\n## Added after connect\nKeep this.\n")
+
+    _disconnect("zcode", chronicle_sandbox, env)
+
+    assert path.read_text() == (FIXTURES / ".zcode" / "AGENTS.md").read_text() + "\n## Added after connect\nKeep this.\n"
+
+
+def test_a_block_edited_by_hand_is_removed_by_its_markers(chronicle_sandbox, home, env) -> None:
+    path = home / ".codex" / "AGENTS.md"
+    _connect("codex", chronicle_sandbox, env)
+    path.write_text(path.read_text().replace("- The brief and every record", "- (edited) The brief and every record"))
+
+    outcome = _disconnect("codex", chronicle_sandbox, env)
+
+    assert outcome.exit_code == EXIT_OK
+    assert path.read_text() == (FIXTURES / ".codex" / "AGENTS.md").read_text()
+
+
+def test_an_older_block_is_replaced_between_its_markers_and_put_back(chronicle_sandbox, home, env) -> None:
+    path = home / ".claude" / "CLAUDE.md"
+    old = ("<!-- chronicle:begin role=write (an older connect) -->\n## Chronicle memory\n- old text\n"
+           "<!-- chronicle:end -->\n")
+    path.write_text("# Engineering rules\n\n" + old + "\n## After\n")
+
+    outcome = _connect("claude", chronicle_sandbox, env)
+
+    assert outcome.payload["parts"]["block"]["status"] == "installed"
+    text = path.read_text()
+    assert text.count("<!-- chronicle:begin") == 1 and "old text" not in text and text.endswith("\n## After\n")
+    _disconnect("claude", chronicle_sandbox, env)
+    assert path.read_text() == "# Engineering rules\n\n" + old + "\n## After\n"
+
+
+def test_a_missing_instruction_file_is_created_with_the_block_and_removed_with_it(chronicle_sandbox, home, env) -> None:
+    (home / ".gemini" / "GEMINI.md").unlink()
+
+    _connect("gemini", chronicle_sandbox, env)
+    assert (home / ".gemini" / "GEMINI.md").read_text().startswith("<!-- chronicle:begin role=write")
+    _disconnect("gemini", chronicle_sandbox, env)
+
+    assert not (home / ".gemini" / "GEMINI.md").exists()

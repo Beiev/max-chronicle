@@ -1283,7 +1283,7 @@ class TextDoc:
             old = self.text[start:stop]
             return Edit(self.path, "restore", start, old, original, self.loaded,
                         _splice(self.text, start, old, original), logical)
-        separator = change.get("separator", "")
+        separator = logical.get("separator", change.get("separator", ""))
         if separator and self.text[start - len(separator):start] == separator:
             start -= len(separator)
         old = self.text[start:stop]

@@ -474,7 +474,7 @@ def render_block(ctx: Context, *, hook: bool) -> str:
             "- This agent is connected read-only: it has no `record_event`. What must be kept is recorded by an "
             "agent with write access or by the operator."
         ),
-        connect=f"{cli_command(ctx.manifest)} connect <agent> --role read|write --by <your agent id> --yes --json",
+        connect=f"{cli_command(ctx.manifest)} connect <agent> --role <read|write> --by <your agent id> --yes --json",
     )
     return lines if lines.endswith("\n") else lines + "\n"
 
