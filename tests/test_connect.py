@@ -720,3 +720,145 @@ def test_a_missing_instruction_file_is_created_with_the_block_and_removed_with_i
     _disconnect("gemini", chronicle_sandbox, env)
 
     assert not (home / ".gemini" / "GEMINI.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# --skip and a hook of the operator's own
+# ---------------------------------------------------------------------------
+
+FOREIGN_HOOK = "bash /home/dev/scripts/chronicle-brief-hook"
+
+
+def _foreign_hook(home: Path, agent: str) -> Path:
+    """Give the agent's session-start hook the command of a brief hook of the operator's own."""
+    path = {"claude": home / ".claude" / "settings.json", "codex": home / ".codex" / "hooks.json"}[agent]
+    data = json.loads(path.read_text())
+    data["hooks"]["SessionStart"][0]["hooks"][0]["command"] = FOREIGN_HOOK
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    return path
+
+
+def _package_hooks(path: Path) -> list[str]:
+    text = path.read_text()
+    return [line for line in text.splitlines() if "max_chronicle.brief_hook" in line]
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex", "zcode", "gemini"])
+def test_a_skipped_hook_is_not_installed_and_is_no_drift(agent, chronicle_sandbox, home, env) -> None:
+    outcome = _connect(agent, chronicle_sandbox, env, skip=["hook"])
+
+    parts = outcome.payload["parts"]
+    assert outcome.exit_code == EXIT_OK and parts["hook"]["status"] == "skipped (asked)"
+    assert {name: parts[name]["status"] for name in ("server", "permissions", "block")} == {
+        "server": "installed", "permissions": "installed", "block": "installed"}
+    assert all(not _package_hooks(home / name) for name in AGENT_FILES[agent])
+    assert doctor_agents(chronicle_sandbox.manifest_path, env, BASE)["agents"][0]["issues"] == []
+    connection = Ledger(chronicle_sandbox.status_root / "connect-ledger.json").connections[agent]
+    assert connection["parts"]["hook"] == "skipped (asked)" and connection["skip"] == ["hook"]
+    rows = {row["agent"]: row for row in agent_status(chronicle_sandbox.manifest_path, env)}
+    assert rows[agent]["hook"] == "skipped (asked)"
+
+
+def test_a_second_connect_with_the_same_skip_changes_nothing(chronicle_sandbox, home, env) -> None:
+    _connect("claude", chronicle_sandbox, env, skip=["hook", "block"])
+    before = _shas(home, "claude")
+
+    again = _connect("claude", chronicle_sandbox, env, skip=["block", "hook"])
+
+    assert again.payload["status"] == "nothing_to_do" and _shas(home, "claude") == before
+
+
+def test_a_connect_without_skip_installs_the_skipped_part(chronicle_sandbox, home, env) -> None:
+    _connect("codex", chronicle_sandbox, env, skip=["hook"])
+
+    outcome = _connect("codex", chronicle_sandbox, env)
+
+    assert outcome.payload["parts"]["hook"]["status"] == "installed"
+    assert _package_hooks(home / ".codex" / "hooks.json")
+    assert Ledger(chronicle_sandbox.status_root / "connect-ledger.json").connections["codex"]["skip"] == []
+
+
+def test_skip_on_an_installed_hook_takes_it_out_and_nothing_else(chronicle_sandbox, home, env) -> None:
+    _connect("claude", chronicle_sandbox, env)
+    with_hook = _shas(home, "claude")
+    settings = home / ".claude" / "settings.json"
+    connected = json.loads(settings.read_text())
+
+    outcome = _connect("claude", chronicle_sandbox, env, skip=["hook"])
+
+    assert outcome.exit_code == EXIT_OK and outcome.payload["parts"]["hook"]["status"] == "skipped (asked)"
+    assert not _package_hooks(settings)
+    after = json.loads(settings.read_text())
+    assert after["permissions"] == connected["permissions"]
+    assert after["hooks"]["SessionStart"] == connected["hooks"]["SessionStart"][:-1]
+    assert "UserPromptSubmit" not in after["hooks"]
+    now = _shas(home, "claude")
+    assert now[".claude.json"] == with_hook[".claude.json"] and now[".claude/CLAUDE.md"] == with_hook[".claude/CLAUDE.md"]
+
+
+def test_permissions_and_block_can_be_skipped_too(chronicle_sandbox, home, env) -> None:
+    before = _shas(home, "zcode")
+
+    outcome = _connect("zcode", chronicle_sandbox, env, skip=["permissions", "block"])
+
+    assert outcome.payload["parts"]["permissions"]["status"] == "skipped (asked)"
+    assert outcome.payload["parts"]["block"]["status"] == "skipped (asked)"
+    assert _sha(home / ".zcode" / "AGENTS.md") == before[".zcode/AGENTS.md"]
+    allowed = json.loads((home / ".zcode" / "cli" / "config.json").read_text())["permission"]["allowedTools"]
+    assert allowed == ["mcp__fetch__fetch"]
+
+
+def test_the_server_entry_cannot_be_skipped(chronicle_sandbox, env) -> None:
+    with pytest.raises(ValueError, match="--skip takes permissions, hook, block"):
+        _connect("claude", chronicle_sandbox, env, skip=["server"])
+
+
+def test_skip_then_disconnect_restores_every_file(chronicle_sandbox, home, env) -> None:
+    before = _shas(home, "gemini")
+    _connect("gemini", chronicle_sandbox, env, skip=["hook"])
+
+    _disconnect("gemini", chronicle_sandbox, env)
+
+    assert _shas(home, "gemini") == before
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_a_foreign_chronicle_hook_gets_a_notice_and_the_hook_is_still_installed(agent, chronicle_sandbox, home,
+                                                                                env) -> None:
+    path = _foreign_hook(home, agent)
+
+    dry = _connect(agent, chronicle_sandbox, env, dry_run=True)
+    done = _connect(agent, chronicle_sandbox, env)
+
+    for outcome in (dry, done):
+        notice = outcome.payload["parts"]["hook"]["notice"]
+        assert str(path) in notice and FOREIGN_HOOK in notice and "`--skip hook` keeps only that one" in notice
+    assert any("notice:" in line and "--skip hook" in line for line in dry.lines)
+    assert done.payload["parts"]["hook"]["status"] == "installed" and _package_hooks(path)
+
+
+def test_no_notice_without_a_foreign_chronicle_hook(chronicle_sandbox, home, env) -> None:
+    outcome = _connect("claude", chronicle_sandbox, env, dry_run=True)
+
+    assert "notice" not in outcome.payload["parts"]["hook"]
+
+
+def test_skip_hook_keeps_only_the_foreign_hook(chronicle_sandbox, home, env) -> None:
+    path = _foreign_hook(home, "claude")
+
+    outcome = _connect("claude", chronicle_sandbox, env, skip=["hook"])
+
+    assert "notice" not in outcome.payload["parts"]["hook"]
+    hooks = json.loads(path.read_text())["hooks"]
+    assert [hook["command"] for group in hooks["SessionStart"] for hook in group["hooks"]] == [FOREIGN_HOOK]
+    assert "A session starts with a Chronicle memory brief from a session-start hook" in _block(home, ".claude/CLAUDE.md")
+
+
+def test_the_skip_flag_on_the_command_line(stub, monkeypatch, capsys, chronicle_sandbox, home) -> None:
+    url = stub()
+
+    code, out = _cli(monkeypatch, capsys, chronicle_sandbox, home, "connect", "claude", "--url", url, "--yes",
+                     "--skip", "hook", "--skip", "block")
+
+    assert code == 0 and "skipped (asked)" in out
+    assert not (home / ".claude" / "CLAUDE.md").read_text().count("chronicle:begin")

@@ -514,9 +514,12 @@ def doctor_checks(smoke: Smoke) -> None:
 
     def drift():
         path = home / ".zcode/AGENTS.md"
-        path.write_text(path.read_text().replace("<!-- chronicle:end -->", ""), encoding="utf-8")
+        connected = path.read_text()
+        path.write_text(connected.replace("<!-- chronicle:end -->", ""), encoding="utf-8")
         result = smoke.cli("doctor", "--agents", home=home)
         issues = [issue["part"] for agent in json_out(result)["agents"] for issue in agent["issues"]]
+        path.write_text(connected, encoding="utf-8")  # back as connect left it, then taken out
+        smoke.cli("disconnect", "zcode", "--yes", home=home)
         return result.returncode != 0 and issues == ["block"], f"exit {result.returncode}, issues {issues}"
 
     smoke.check("doctor-clean", clean)
@@ -549,6 +552,81 @@ def report_checks(smoke: Smoke) -> None:
     smoke.check("json-report", json_report)
     smoke.check("print-cursor", print_cursor)
     smoke.check("cursor-no-edit", cursor_no_edit)
+
+
+FOREIGN_HOOK = "bash /home/dev/scripts/chronicle-brief-hook"
+
+
+def package_hooks(path: Path) -> int:
+    return path.read_text(encoding="utf-8").count("max_chronicle.brief_hook")
+
+
+def skip_checks(smoke: Smoke) -> None:
+    def skip_hook():
+        home = smoke.new_home()
+        result = smoke.cli("connect", "codex", "--yes", "--json", "--skip", "hook", home=home)
+        parts = {name: part["status"] for name, part in json_out(result)["parts"].items()}
+        doctor = smoke.cli("doctor", "--agents", home=home)
+        absent = package_hooks(home / ".codex/hooks.json") == 0
+        smoke.cli("disconnect", "codex", "--yes", home=home)
+        return (result.returncode == 0 and absent and doctor.returncode == 0
+                and parts == dict(CONFIRMED, hook="skipped (asked)")), f"{parts}, doctor exit {doctor.returncode}"
+
+    def skip_then_install():
+        home = smoke.new_home()
+        smoke.cli("connect", "gemini", "--yes", "--skip", "hook", home=home)
+        before = package_hooks(home / ".gemini/settings.json")
+        result = smoke.cli("connect", "gemini", "--yes", "--json", home=home)
+        after = package_hooks(home / ".gemini/settings.json")
+        status = json_out(result)["parts"]["hook"]["status"]
+        smoke.cli("disconnect", "gemini", "--yes", home=home)
+        return result.returncode == 0 and before == 0 and after == 1 and status == "installed", \
+            f"hooks {before} -> {after}, {status}"
+
+    def install_then_skip():
+        home = smoke.new_home()
+        smoke.cli("connect", "claude", "--yes", home=home)
+        settings = home / ".claude/settings.json"
+        connected = json.loads(settings.read_text())
+        others = {name: (home / name).read_bytes() for name in (".claude.json", ".claude/CLAUDE.md")}
+        result = smoke.cli("connect", "claude", "--yes", "--json", "--skip", "hook", home=home)
+        after = json.loads(settings.read_text())
+        expected = json.loads(json.dumps(connected))
+        expected["hooks"]["SessionStart"].pop()
+        del expected["hooks"]["UserPromptSubmit"]
+        same_others = all((home / name).read_bytes() == data for name, data in others.items())
+        smoke.cli("disconnect", "claude", "--yes", home=home)
+        return (result.returncode == 0 and package_hooks(settings) == 0 and after == expected and same_others), \
+            f"exit {result.returncode}, others unchanged {same_others}"
+
+    def foreign_hook_notice():
+        plain_home, foreign_home = smoke.new_home(), smoke.new_home()
+        path = foreign_home / ".claude/settings.json"
+        data = json.loads(path.read_text())
+        data["hooks"]["SessionStart"][0]["hooks"][0]["command"] = FOREIGN_HOOK
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        with_foreign = smoke.cli("connect", "claude", "--dry-run", home=foreign_home)
+        as_json = json_out(smoke.cli("connect", "claude", "--dry-run", "--json", home=foreign_home))
+        without = smoke.cli("connect", "claude", "--dry-run", home=plain_home)
+        line = [text for text in with_foreign.stdout.splitlines() if "notice:" in text]
+        notice = as_json["parts"]["hook"].get("notice", "")
+        return (len(line) == 1 and "settings.json" in line[0] and "--skip hook" in line[0]
+                and FOREIGN_HOOK in notice and "notice:" not in without.stdout), f"lines {line}"
+
+    def skip_disconnect():
+        home = smoke.new_home()
+        before = {agent: shas(home, agent) for agent in ("claude", "zcode")}
+        for agent in ("claude", "zcode"):
+            smoke.cli("connect", agent, "--yes", "--skip", "hook", home=home)
+        results = [smoke.cli("disconnect", agent, "--yes", home=home).returncode for agent in ("claude", "zcode")]
+        after = {agent: shas(home, agent) for agent in ("claude", "zcode")}
+        return results == [0, 0] and after == before, f"exits {results}"
+
+    smoke.check("skip-hook", skip_hook)
+    smoke.check("skip-then-install", skip_then_install)
+    smoke.check("install-then-skip", install_then_skip)
+    smoke.check("foreign-hook-notice", foreign_hook_notice)
+    smoke.check("skip-disconnect", skip_disconnect)
 
 
 def hook(smoke: Smoke, agent: str, budget: int, session: str) -> subprocess.CompletedProcess:
@@ -630,6 +708,7 @@ def main() -> int:
         existing_checks(smoke)
         doctor_checks(smoke)
         report_checks(smoke)
+        skip_checks(smoke)
         hook_up_checks(smoke)
         smoke.stop_server()
         down_checks(smoke)
