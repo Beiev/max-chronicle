@@ -794,6 +794,27 @@ class JsonDoc:
         raise EditRefused(self.path, "the entry Chronicle wrote is no longer there as written",
                           _manual_undo(logical))
 
+    def has_trace(self, logical: dict[str, Any]) -> bool:
+        """Whether anything of a recorded change is still in the file (when it cannot be taken back as written)."""
+        if self.root is None:
+            return False
+        action = logical.get("action")
+        if action == "member":
+            created = logical.get("created")
+            return self.node(created or [*logical["path"], logical["key"]]) is not None
+        if action == "items":
+            node = self.node(logical["path"])
+            if node is None or node.kind != "array":
+                return False
+            values = [self._value_of(item) for item in node.items]
+            return any(item in values for item in logical["items"])
+        if action == "replace":
+            node = self.node(logical["path"])
+            return node is not None and self._value_of(node) != logical.get("original_value")
+        if action == "rename":
+            return self.node([*logical["path"], logical["new"]]) is not None
+        return True
+
     def _value_of(self, node: Node) -> Any:
         return json.loads(self.masked[node.start:node.end])
 
@@ -1177,6 +1198,19 @@ class TomlDoc:
         self._verify(after, expected)
         return edit
 
+    def has_trace(self, logical: dict[str, Any]) -> bool:
+        """Whether anything of a recorded change is still in the file (when it cannot be taken back as written)."""
+        action = logical.get("action")
+        if action == "tables":
+            names = _table_names(tomllib.loads(logical["core"]))
+            leaves = [name for name in names if not any(other[:len(name)] == name and other != name for other in names)]
+            return any(_get(self.value, list(name)) is not None for name in leaves)
+        if action == "block":
+            return _get(self.value, logical["name"]) is not None
+        if action == "rename":
+            return _get(self.value, logical["new"]) is not None
+        return True
+
     def undo(self, change: dict[str, Any]) -> Edit:
         logical = change["logical"]
         piece, original = change["piece"], change.get("original", "")
@@ -1269,6 +1303,11 @@ class TextDoc:
         new = block if old.endswith("\n") else block.rstrip("\n")
         logical = {"format": "text", "action": "block", **(logical or {})}
         return Edit(self.path, "replace", start, old, new, self.loaded, _splice(self.text, start, old, new), logical)
+
+    def has_trace(self, logical: dict[str, Any]) -> bool:
+        """Whether a line of the block's markers is still in the file."""
+        markers = [marker for marker in (logical.get("begin"), logical.get("end")) if marker]
+        return any(line.startswith(marker) for line in self.text.split("\n") for marker in markers)
 
     def undo(self, change: dict[str, Any]) -> Edit:
         logical = change["logical"]

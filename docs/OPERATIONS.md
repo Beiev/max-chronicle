@@ -251,7 +251,12 @@ change before it is made: the file, the piece, the text it replaced, sha256
 before and after, the backup. `disconnect` walks it back, newest first; when the
 agent rewrote its file and kept the entry elsewhere (Claude Code saves
 `permissions.allow` before `deny`), the entry is removed where it is now, again as
-one piece. An entry that was there before `connect` stays. `doctor --agents`
+one piece. An entry that was there before `connect` stays. A piece that is
+still in the file but no longer as `connect` wrote it (an entry edited by hand)
+is never removed: `disconnect` reports it as `left: changed since connect` with
+its file and the steps to take it out by hand, keeps it in the ledger and exits
+1; once it is taken out by hand, `disconnect` finishes. A piece no longer in its
+file is reported as `gone`. `doctor --agents`
 checks every recorded piece and the server's address, names each part that is not
 as `connect` left it with the command that fixes it, and exits 5 on drift.
 One `connect` or `disconnect` runs at a time per workspace: a run holds
@@ -273,7 +278,8 @@ event in category `agent_connection` by `operator`, with the agent, the role, th
 parts and `--by` as a self-declared label.
 
 **Exit codes:** 0 done or nothing to do; 1 refused (an entry in the way, a file
-not edited, a file changed while connect ran, the answer was no); 2 the workspace
+not edited, a file changed while connect ran, the answer was no) or `disconnect`
+left a piece changed since connect; 2 the workspace
 is unclear; 4 preflight failed; 5 `doctor --agents` found drift; 6 not supported
 (unknown or uninstalled agent, Cursor without `--print`, Windows); 7 another run
 holds the ledger's lock.

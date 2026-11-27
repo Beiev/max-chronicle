@@ -916,3 +916,64 @@ def test_a_run_waits_a_bounded_time_for_the_lock_then_gives_up(monkeypatch, chro
         assert str(ledger_file.with_suffix(".lock")) in outcome.payload["error"]
     assert _shas(home, "gemini") == before and not ledger_file.exists()
     assert _connect("gemini", chronicle_sandbox, env).exit_code == EXIT_OK  # the lock went with its holder
+
+
+# ---------------------------------------------------------------------------
+# A piece changed since connect
+# ---------------------------------------------------------------------------
+
+
+def _change_server_entry(home: Path, agent: str) -> tuple[Path, str, str]:
+    """Edit Chronicle's own server entry by hand; returns the file, the edited text and the text to take out."""
+    if agent == "codex":
+        path = home / ".codex" / "config.toml"
+        text = path.read_text().replace("[mcp_servers.chronicle]\n", "[mcp_servers.chronicle] # mine\n")
+        entry = f'[mcp_servers.chronicle] # mine\nurl = "{BASE}/mcp"\n'
+    else:
+        path = home / ".claude.json"
+        text = path.read_text().replace(f'"url": "{BASE}/mcp"', f'"url": "{BASE}/mcp",\n      "timeout": 30')
+        entry = None
+    path.write_text(text)
+    return path, text, entry
+
+
+@pytest.mark.parametrize("agent", ["codex", "claude"])
+def test_disconnect_leaves_a_piece_changed_since_connect_and_says_so(agent, chronicle_sandbox, home, env) -> None:
+    _connect(agent, chronicle_sandbox, env)
+    path, edited, _ = _change_server_entry(home, agent)
+
+    outcome = _disconnect(agent, chronicle_sandbox, env)
+
+    assert outcome.exit_code == EXIT_REFUSED and outcome.payload["status"] == "left_changed"
+    assert "server" not in [item["part"] for item in outcome.payload["removed"]]
+    (left,) = outcome.payload["left"]
+    assert (left["part"], left["file"], left["reason"]) == ("server", str(path), "changed since connect")
+    assert left["manual"] and any("by hand:" in line and "changed since connect" in line for line in outcome.lines)
+    assert SERVER_ENTRY_PRESENT[agent](path)
+    ledger = Ledger(chronicle_sandbox.status_root / "connect-ledger.json")
+    assert agent in ledger.connections and [c["part"] for c in ledger.active(agent)] == ["server"]
+    report = doctor_agents(chronicle_sandbox.manifest_path, env, BASE)
+    issues = [issue for row in report["agents"] for issue in row["issues"]]
+    assert report["status"] == "drift" and issues == [
+        {"part": "server", "file": str(path), "problem": "changed since connect"}]
+
+
+def test_a_left_piece_taken_out_by_hand_lets_disconnect_finish(chronicle_sandbox, home, env) -> None:
+    before = _shas(home, "codex")
+    _connect("codex", chronicle_sandbox, env)
+    path, edited, entry = _change_server_entry(home, "codex")
+    assert _disconnect("codex", chronicle_sandbox, env).exit_code == EXIT_REFUSED
+
+    path.write_text(path.read_text().replace("\n" + entry, ""))  # the manual step
+    outcome = _disconnect("codex", chronicle_sandbox, env)
+
+    assert outcome.exit_code == EXIT_OK and outcome.payload["status"] == "done"
+    assert [item["part"] for item in outcome.payload["gone"]] == ["server"] and not outcome.payload["left"]
+    assert "codex" not in Ledger(chronicle_sandbox.status_root / "connect-ledger.json").connections
+    assert _shas(home, "codex") == before
+
+
+SERVER_ENTRY_PRESENT = {
+    "codex": lambda path: "chronicle" in tomllib.loads(path.read_text())["mcp_servers"],
+    "claude": lambda path: "chronicle" in json.loads(path.read_text())["mcpServers"],
+}

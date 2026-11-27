@@ -29,7 +29,7 @@ import shlex
 import sqlite3
 import string
 import sys
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -83,11 +83,13 @@ BLOCK_END = "<!-- chronicle:end -->"
 BLOCK_TEMPLATE = Path(__file__).resolve().parent / "docs" / "connect_block.md"
 EVENT_CATEGORY = "agent_connection"
 OPERATOR = "operator"
+LEFT_CHANGED = "changed since connect"  # still there, not as connect wrote it: never removed
+LEFT_GONE = "not in the file any more"  # nothing of it is there: nothing to remove
 MCP_PROTOCOL_VERSION = "2025-06-18"
 
 # Exit codes (documented in `chronicle connect --help`).
 EXIT_OK = 0  # done, or nothing to do
-EXIT_REFUSED = 1  # refused: an entry in the way, a file not edited, an answer of no
+EXIT_REFUSED = 1  # refused: an entry in the way, a file not edited, an answer of no; a piece left by disconnect
 EXIT_PREFLIGHT = 4  # the server is not answering, not Chronicle, too old, or has no read endpoint
 EXIT_DRIFT = 5  # doctor --agents: a part is not as connect left it
 EXIT_UNSUPPORTED = 6  # an unknown or uninstalled agent, Cursor without --print, Windows
@@ -97,7 +99,8 @@ EXIT_CODES_HELP = """exit codes:
   0  done, or nothing to do
   1  refused: an existing entry in the way, a file that is not edited (symbolic link,
      CRLF, byte-order mark, duplicate keys, JSON5, a dotted TOML key), a file that
-     changed while connect ran, or the answer was no
+     changed while connect ran, or the answer was no; disconnect: a piece changed
+     since connect is left in place (the steps by hand are printed)
   2  the workspace is unclear (as for every chronicle command)
   4  preflight failed: no server address, no answer, not Chronicle, older than 0.33.0,
      or /mcp/read does not answer; nothing was changed
@@ -923,31 +926,50 @@ def _doc_for(path: Path, logical: dict[str, Any], loaded: Loaded | None = None):
     return JsonDoc(loaded, comments=True)
 
 
-def walk_back(changes: list[dict[str, Any]], files: Files) -> list[tuple[dict[str, Any], bool, str, Edit | None]]:
+class Step(NamedTuple):
+    """One recorded change as walk_back found it."""
+
+    change: dict[str, Any]
+    present: bool
+    reason: str = ""  # when not present: LEFT_CHANGED or LEFT_GONE (an adopted entry: what changed)
+    edit: Edit | None = None  # the edit that takes it back
+    manual: str | None = None  # how to take it out by hand
+    detail: str = ""  # the technical cause
+
+
+def walk_back(changes: list[dict[str, Any]], files: Files) -> list[Step]:
     """Recorded changes, newest first, each tested by taking it back after the newer ones, as disconnect does.
 
     Each change that can be taken back is applied to *files* (planned, not
-    written). An adopted entry is checked against the state left by that.
+    written). An adopted entry is checked against the state left by that. A
+    change that cannot be taken back as written is ``LEFT_CHANGED`` while any
+    of it is still in the file, else ``LEFT_GONE``.
     """
-    results: list[tuple[dict[str, Any], bool, str, Edit | None]] = []
+    results: list[Step] = []
     for change in reversed(changes):
         path = Path(change["file"])
         try:
             loaded = files.load(path)
         except EditRefused as exc:
-            results.append((change, False, exc.reason, None))
+            results.append(Step(change, False, LEFT_CHANGED, None, exc.manual, f"{exc.path}: {exc.reason}"))
             continue
         if change["status"] == "adopted":
             present, reason = change_present(change, loaded)
-            results.append((change, present, "" if present else reason, None))
+            results.append(Step(change, present, "" if present else reason))
             continue
         try:
-            edit = _doc_for(path, change["logical"], loaded).undo(change)
+            doc = _doc_for(path, change["logical"], loaded)
         except EditRefused as exc:
-            results.append((change, False, exc.reason, None))
+            results.append(Step(change, False, LEFT_CHANGED, None, exc.manual, f"{exc.path}: {exc.reason}"))
+            continue
+        try:
+            edit = doc.undo(change)
+        except EditRefused as exc:
+            reason = LEFT_CHANGED if doc.has_trace(change["logical"]) else LEFT_GONE
+            results.append(Step(change, False, reason, None, exc.manual, f"{exc.path}: {exc.reason}"))
             continue
         files.apply(edit)
-        results.append((change, True, "", edit))
+        results.append(Step(change, True, "", edit))
     return results
 
 
@@ -1030,7 +1052,7 @@ def _plan_connection(adapter: Adapter, ctx: Context, ledger: Ledger, env: Mappin
     switching = bool(previous) and (previous.get("role"), previous.get("url")) != (ctx.role, ctx.mcp_url)
     # Another role or address: what connect wrote comes out first. The same: it stays, and is only checked.
     walked = walk_back(ledger.active(adapter.id), files if switching else Files())
-    for change, present, reason, edit in walked:
+    for change, present, reason, edit, _, _ in walked:
         if change["status"] == "adopted":
             if switching or not present:
                 released.append(change)
@@ -1290,7 +1312,11 @@ def run_disconnect(adapter: Adapter, *, manifest: Path, by: str | None, yes: boo
 
 def _disconnect_locked(adapter: Adapter, payload: dict[str, Any], *, manifest: Path, by: str | None, yes: bool,
                        dry_run: bool, env: Mapping[str, str], db: Path | None, ask: Ask | None) -> Outcome:
-    """A disconnect run under the ledger's lock."""
+    """A disconnect run under the ledger's lock.
+
+    A piece that is no longer as connect wrote it is left in place and kept in
+    the ledger: the run prints how to take it out by hand and exits 1.
+    """
     ledger = Ledger(ledger_path(manifest))
     for change in ledger.pending():
         _settle_pending(change, ledger)
@@ -1300,23 +1326,31 @@ def _disconnect_locked(adapter: Adapter, payload: dict[str, Any], *, manifest: P
         return Outcome(payload, EXIT_OK, [f"{adapter.label} is not connected by chronicle connect: nothing to do."])
     files = Files()
     undo: list[tuple[Edit, dict[str, Any]]] = []
-    left: list[dict[str, Any]] = []
-    for change, present, reason, edit in walk_back([c for c in active if c["status"] != "adopted"], files):
-        if present and edit is not None:
-            undo.append((edit, change))
+    left: list[Step] = []
+    gone: list[Step] = []
+    for step in walk_back([c for c in active if c["status"] != "adopted"], files):
+        if step.present and step.edit is not None:
+            undo.append((step.edit, step.change))
+        elif step.reason == LEFT_GONE:
+            gone.append(step)
         else:
-            left.append({"part": change["part"], "file": change["file"], "reason": reason})
+            left.append(step)
     diff = "".join(edit.diff() for edit, _ in undo)
     payload["diff"] = diff
     payload["removed"] = [{"part": change["part"], "file": change["file"]} for _, change in undo]
-    payload["left"] = left
+    payload["left"] = [{"part": step.change["part"], "file": step.change["file"], "reason": LEFT_CHANGED,
+                        "detail": step.detail, "manual": step.manual or "Undo the change by hand."} for step in left]
+    payload["gone"] = [{"part": step.change["part"], "file": step.change["file"], "reason": LEFT_GONE}
+                       for step in gone]
     payload["kept"] = [{"part": change["part"], "file": change["file"]} for change in active
                        if change["status"] == "adopted"]
     lines = [f"{adapter.label}: remove {len(undo)} piece(s) that connect wrote."]
     lines += [f"  {item['part']:<12} remove   {_display(item['file'], env)}" for item in payload["removed"]]
     lines += [f"  {item['part']:<12} kept     {_display(item['file'], env)} (it was there before connect)"
               for item in payload["kept"]]
-    lines += [f"  {item['part']:<12} left     {_display(item['file'], env)}: {item['reason']}" for item in left]
+    lines += [f"  {item['part']:<12} gone     {_display(item['file'], env)}: {LEFT_GONE}" for item in payload["gone"]]
+    lines += [f"  {item['part']:<12} left     {_display(item['file'], env)}: {LEFT_CHANGED}\n"
+              f"  {'':<12} {'':<8} by hand: {item['manual']}" for item in payload["left"]]
     if dry_run:
         payload["status"] = "dry_run"
         return Outcome(payload, EXIT_OK, lines, diff, ["Dry run: nothing was changed."])
@@ -1336,29 +1370,43 @@ def _disconnect_locked(adapter: Adapter, payload: dict[str, Any], *, manifest: P
     for change in active:
         if change["status"] == "adopted":
             _mark(ledger, change["id"], "released", None)
-    for item in left:
-        for change in active:
-            if change["file"] == item["file"] and change["part"] == item["part"] and change["status"] == "applied":
-                _mark(ledger, change["id"], "lost", item["reason"])
-    previous = ledger.connections.pop(adapter.id, None) or {}
+    for step in gone:
+        _mark(ledger, step.change["id"], "lost", LEFT_GONE)
+    if left:  # the connection stays, with the parts still in place, for `agents` and `doctor --agents`
+        first = left[0].change
+        previous = ledger.connections.setdefault(adapter.id, {"role": first.get("role"), "url": first.get("url"),
+                                                               "by": by, "skip": []})
+        previous["parts"] = {item["part"]: f"left: {LEFT_CHANGED}" for item in payload["left"]}
+        previous["left_at"] = _now()
+    else:
+        previous = ledger.connections.pop(adapter.id, None) or {}
     ledger.save()
     earliest: dict[str, str | None] = {}
     for _, change in undo:  # newest first: the last one seen for a file is its first change
         earliest[change["file"]] = change["sha256_before"]
     payload["restored"] = {path: sha256_file(Path(path)) == digest for path, digest in earliest.items()}
+    left_parts = sorted({item["part"] for item in payload["left"]})
     connection = {"action": "disconnect", "target": adapter.id, "role": previous.get("role"),
-                  "parts": sorted({change["part"] for _, change in undo}), "by": by, "by_self_declared": True}
-    text = (f"Disconnected {adapter.label} from Chronicle: removed "
-            + (", ".join(connection["parts"]) or "nothing") + (f". Run by {by} (self-declared)." if by else "."))
+                  "parts": sorted({change["part"] for _, change in undo}), "left": left_parts,
+                  "by": by, "by_self_declared": True}
+    text = (f"Disconnected {adapter.label} from Chronicle: removed " + (", ".join(connection["parts"]) or "nothing")
+            + (f"; left {', '.join(left_parts)} ({LEFT_CHANGED})" if left_parts else "")
+            + (f". Run by {by} (self-declared)." if by else "."))
     try:
         payload["event_id"] = _record_event(manifest, db, text, connection)
     except Exception as exc:  # noqa: BLE001 - the files are restored; the report says the event is missing
         payload["event_error"] = f"{type(exc).__name__}: {exc}"
-    payload["status"] = "done"
-    summary = ["Disconnected."]
+    if left:
+        payload["status"] = "left_changed"
+        summary = [f"Left in place: {len(left)} piece(s) {LEFT_CHANGED}; the ledger keeps them and "
+                   "`doctor --agents` reports them. Take them out by hand as shown above, then run "
+                   f"`chronicle disconnect {adapter.id}` again."]
+    else:
+        payload["status"] = "done"
+        summary = ["Disconnected."]
     if payload.get("event_id"):
         summary.append(f"Event {payload['event_id']} recorded ({EVENT_CATEGORY}).")
-    return Outcome(payload, EXIT_OK, lines, diff, summary, shown)
+    return Outcome(payload, EXIT_REFUSED if left else EXIT_OK, lines, diff, summary, shown)
 
 
 # ---------------------------------------------------------------------------
@@ -1425,10 +1473,10 @@ def doctor_agents(manifest: Path, env: Mapping[str, str], url_arg: str | None) -
     for agent, connection in sorted(ledger.connections.items()):
         adapter = ADAPTERS.get(agent)
         issues: list[dict[str, str]] = []
-        for change, present, reason, _ in walk_back(ledger.active(agent), Files()):
-            if not present:
-                issues.append({"part": change["part"], "file": change["file"],
-                               "problem": reason or "not as connect left it"})
+        for step in walk_back(ledger.active(agent), Files()):
+            if not step.present:
+                issues.append({"part": step.change["part"], "file": step.change["file"],
+                               "problem": step.reason or "not as connect left it"})
         for change in ledger.changes:
             if change["agent"] == agent and change["status"] in ("pending", "lost"):
                 issues.append({"part": change["part"], "file": change["file"], "problem": change["status"]})

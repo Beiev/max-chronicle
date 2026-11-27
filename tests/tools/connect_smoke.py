@@ -653,6 +653,31 @@ def ledger_checks(smoke: Smoke) -> None:
 
     smoke.check("ledger-concurrent", concurrent)
 
+    def drifted():
+        home = smoke.new_home()
+        before = shas(home, "codex")
+        smoke.cli("connect", "codex", "--yes", home=home)
+        path = home / ".codex/config.toml"
+        path.write_text(path.read_text().replace("[mcp_servers.chronicle]\n", "[mcp_servers.chronicle] # mine\n"),
+                        encoding="utf-8")
+        result = smoke.cli("disconnect", "codex", "--yes", home=home)
+        still = "chronicle" in tomllib.loads(path.read_text())["mcp_servers"]
+        doctor = smoke.cli("doctor", "--agents", home=home)
+        problems = [(issue["part"], issue["problem"]) for agent in json_out(doctor)["agents"]
+                    for issue in agent["issues"]]
+        kept = "codex" in smoke.ledger()["connections"]
+        entry = f'\n[mcp_servers.chronicle] # mine\nurl = "{smoke.base_url}/mcp"\n'
+        path.write_text(path.read_text().replace(entry, ""), encoding="utf-8")  # the manual step
+        again = smoke.cli("disconnect", "codex", "--yes", home=home)
+        return (result.returncode == 1 and "left" in result.stdout and "changed since connect" in result.stdout
+                and "by hand:" in result.stdout and still and kept and doctor.returncode == 5
+                and problems == [("server", "changed since connect")] and again.returncode == 0
+                and shas(home, "codex") == before and "codex" not in smoke.ledger()["connections"]), \
+            (f"disconnect exit {result.returncode}, still {still}, kept {kept}, doctor exit {doctor.returncode} "
+             f"{problems}, again exit {again.returncode}")
+
+    smoke.check("disconnect-drifted", drifted)
+
 
 def hook(smoke: Smoke, agent: str, budget: int, session: str) -> subprocess.CompletedProcess:
     payload = json.dumps({"session_id": session, "hook_event_name": "SessionStart", "cwd": str(smoke.workspace)})
