@@ -32,7 +32,19 @@ restart does not interrupt it; an older client gets the `initialize` handshake
 and a session, which a restart ends (the client starts a new one) and which
 closes after 30 minutes without traffic.
 Over HTTP, `/health` also reports the process: event-loop lag (`loop`), the write
-queue (`writes`), the last committed write and the background embedder.
+queue (`writes`), the last committed write, the background embedder, the MCP
+endpoints with their roles (`mcp_endpoints`) and the named background threads
+(`threads`).
+
+A server with a writing profile over streamable HTTP serves two MCP endpoints in
+one process: `/mcp` with its own profile and `/mcp/read` with the `readonly`
+profile (five tools, no `record_event`). They are two server objects; the read
+one contributes only its MCP route, `/health`, `/brief` and `/ui` come from the
+main one, and the background jobs start once. `/mcp/read` is a read surface
+inside a process that can write, unlike a separate `chronicle-mcp-readonly`
+process. Once it listens, the server writes its address (`url`, `pid`,
+`version`) to `chronicle-server.json` next to the manifest and removes it on a
+clean stop.
 `GET /health/live` answers from the event loop alone, without the database: a slow
 disk makes `/health` degraded (503), only a stuck loop silences `/health/live`.
 When the loop stops for 10 s the server writes every thread's stack to its log by
@@ -124,12 +136,14 @@ id = "atlas"
 roots = ["~/code/atlas", "~/code/atlas-worktrees"]
 ```
 
-A session-start hook prints the brief. When the server does not answer, it says
-so and reads the same brief straight from the database, which needs no server:
+A session-start hook prints the brief. `chronicle connect` installs the one in the
+package (see [Connecting agents](#connecting-agents)); a hook of your own does the
+same in a few lines. When the server does not answer, it says so and reads the
+same brief straight from the database, which needs no server:
 
 ```sh
 dir=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-curl -fsS -m 2 --get --data-urlencode "cwd=$dir" http://127.0.0.1:8093/brief 2>/dev/null || {
+curl -fsS -m 2 --get --data-urlencode "cwd=$dir" http://127.0.0.1:8000/brief 2>/dev/null || {
   echo "Chronicle's server is not answering: tell the user. Its tools will fail;"
   echo "record with \`chronicle record\`, which writes to the database directly."
   chronicle brief --cwd "$dir" 2>/dev/null
@@ -150,10 +164,107 @@ resource `chronicle://brief/{project}`. A project's brief shows its own decision
 only, and its own facts before at most four facts recorded without a project.
 
 
+## Connecting agents
+
+`chronicle connect <agent>` connects a coding agent to the HTTP server with a
+role. It edits only the agent's user-level files and takes the agent's home
+variables into account.
+
+```bash
+chronicle connect claude --role write --yes --by codex --json
+chronicle connect zcode --role read
+chronicle connect cursor --print
+chronicle agents
+chronicle doctor --agents
+chronicle disconnect zcode --yes
+```
+
+| Role | Address | Tools |
+| --- | --- | --- |
+| `write` (default) | `/mcp` | `startup_bundle`, `query_memory`, `get_memory`, `recent_events`, `state_at`, `record_event` |
+| `read` | `/mcp/read` | the same without `record_event` |
+
+A role is a guard-rail against mistakes, not a security boundary. Nothing checks
+who calls the CLI: an agent with a shell on this machine can read the database
+and other agents' files directly, and `--by` is a label the caller gives itself.
+Without `--by` the event names only the operator.
+
+**Parts.** Each agent gets up to four parts. What each agent supports, with the
+evidence, is in `tests/fixtures/connect/FACTS.md`; a part without evidence is
+skipped and reported.
+
+| Agent | Server | Permissions | Brief hook | Block |
+| --- | --- | --- | --- | --- |
+| Claude Code (`claude`) | `~/.claude.json` `mcpServers` | `~/.claude/settings.json` `permissions.allow` | `SessionStart` and `UserPromptSubmit` | `~/.claude/CLAUDE.md` |
+| Codex (`codex`) | `$CODEX_HOME/config.toml` `[mcp_servers.chronicle]` | `[mcp_servers.chronicle.tools.<tool>] approval_mode = "approve"` | `$CODEX_HOME/hooks.json` `SessionStart`, 4,500 characters | `AGENTS.md` (`AGENTS.override.md` when it is in use) |
+| ZCode (`zcode`) | `~/.zcode/cli/config.json` `mcp.servers` | `permission.allowedTools` | `hooks` (enabled) `events.SessionStart` | `~/.zcode/AGENTS.md` |
+| opencode (`opencode`) | `$XDG_CONFIG_HOME/opencode/opencode.jsonc` `mcp.servers` | `permissions` rules | none: the block says to start with `startup_bundle` | `AGENTS.md` there, only when it exists |
+| Gemini CLI (`gemini`) | `$GEMINI_CLI_HOME/.gemini/settings.json` `mcpServers` | `trust: true` on the entry | `hooks.SessionStart` | `GEMINI.md` |
+| Cursor (`cursor`) and others | `--print` only | | | |
+
+Claude Code follows `CLAUDE_CONFIG_DIR`. Codex runs a new or changed hook only
+after it is trusted in its `/hooks` view; `connect` does not write that trust.
+
+**Before any change** `connect` takes the server's address from `--url`, else
+`CHRONICLE_SERVER_URL`, else `chronicle-server.json` in the workspace (there is no
+default port), asks `/health`, requires Chronicle 0.33.0 or newer with `/mcp` and
+`/mcp/read` listed, and sends an `initialize` to `/mcp/read`. If any of that
+fails it changes nothing and prints how to start the server.
+
+**An existing entry.** A `chronicle` entry that points at this server is taken as
+it is and recorded (`present`); one of the other role gets its address changed. A
+`chronicle` entry that points elsewhere is refused unless `--force` replaces it.
+An entry of another name that points at this server is reported, and renamed to
+`chronicle` only with `--adopt`. A second `connect` with the same role changes
+nothing; another role takes out the pieces of the old one and puts in the new.
+
+**How files are changed.** Each change is one contiguous piece of text: a JSON
+member or array entries, a TOML table appended at the end (or a table's own
+block), a block between `<!-- chronicle:begin` and `<!-- chronicle:end -->`.
+Every other byte stays. The new text is parsed and compared in memory with the
+old document plus the change before it is written. A write goes to a temporary
+file in the same directory with `fsync` and the old mode, then `os.replace`, and
+is refused when the file changed since it was read. Before each change the old
+file is kept as `<file>.bak-YYYYMMDD-HHMMSS`. Refused, with nothing written and
+the manual step printed: a symbolic link, text that is not UTF-8, a byte-order
+mark, CRLF line ends, duplicate keys on the path, a TOML target written as a
+dotted key or an inline table, JSON5 syntax.
+
+**The ledger.** `connect-ledger.json` in the workspace (mode 0600) records each
+change before it is made: the file, the piece, the text it replaced, sha256
+before and after, the backup. `disconnect` walks it back, newest first; when the
+agent rewrote its file and kept the entry elsewhere (Claude Code saves
+`permissions.allow` before `deny`), the entry is removed where it is now, again as
+one piece. An entry that was there before `connect` stays. `doctor --agents`
+checks every recorded piece and the server's address, names each part that is not
+as `connect` left it with the command that fixes it, and exits 5 on drift.
+
+**The brief hook** is `<absolute python> -m max_chronicle.brief_hook --manifest
+<path> --agent <id> --budget <n>` (`--format zcode|gemini` for JSON output). It
+reads the hook's JSON from stdin, asks `/brief` for the session's repository
+top, and when the server is silent prints one line saying so and the brief built
+from the database in the same process. It always exits 0 and imports only the
+standard library before the request. On `UserPromptSubmit` it gives the brief
+only to a session that has none yet. Cold start measured with
+`python tests/tools/hook_timing.py`.
+
+**Events.** Each `connect` and `disconnect` that changes something records an
+event in category `agent_connection` by `operator`, with the agent, the role, the
+parts and `--by` as a self-declared label.
+
+**Exit codes:** 0 done or nothing to do; 1 refused (an entry in the way, a file
+not edited, a file changed while connect ran, the answer was no); 2 the workspace
+is unclear; 4 preflight failed; 5 `doctor --agents` found drift; 6 not supported
+(unknown or uninstalled agent, Cursor without `--print`, Windows).
+
+**Platforms:** macOS and Linux. On Windows `connect` and `disconnect` refuse with
+a message.
+
+
 ## Web view
 
 The HTTP server also serves a read-only view of the memory for people, at
-`http://127.0.0.1:8093/ui`:
+`http://127.0.0.1:<port>/ui`:
 - `/ui`: process health (event-loop lag, last write, unindexed events, last
   scheduled runs), the last good backup, warnings, open tasks, projects active in
   the last 30 days, the latest events;
@@ -477,6 +588,10 @@ chronicle timeline --at "2026-09-15T12:00:00Z" --as-of   # what was known then
 chronicle backup --force
 chronicle backup-prune            # what retention would remove; --apply removes it
 chronicle doctor --summary        # server, jobs, last good backup, disks on one screen
+chronicle connect claude --role write   # see Connecting agents
+chronicle agents
+chronicle doctor --agents         # connected agents' parts; exit 5 on drift
+chronicle disconnect claude
 ```
 
 `chronicle doctor` asks the HTTP server at `CHRONICLE_SERVER_URL`, or else at the
