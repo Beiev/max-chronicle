@@ -59,6 +59,15 @@ ROLES = {"write": ("/mcp", WRITE_TOOLS), "read": ("/mcp/read", READ_TOOLS)}
 PARTS = ("server", "permissions", "hook", "block")
 SKIPPABLE = ("permissions", "hook", "block")  # the server entry is what a connection is
 SKIPPED_ASKED = "skipped (asked)"
+# Where each agent keeps its session-start hooks (Claude Code's brief hooks also run on a prompt).
+HOOK_ARRAYS = {
+    "claude": (["hooks", "SessionStart"], ["hooks", "UserPromptSubmit"]),
+    "codex": (["hooks", "SessionStart"],),
+    "zcode": (["hooks", "events", "SessionStart"],),
+    "gemini": (["hooks", "SessionStart"],),
+}
+FOREIGN_HOOK_WORD = "chronicle"
+NOTICE_COMMAND_CHARS = 80
 MIN_SERVER_VERSION = (0, 33, 0)
 HTTP_TIMEOUT_S = 2.0
 HOOK_MODULE = "max_chronicle.brief_hook"
@@ -618,11 +627,40 @@ class Adapter:
             if name in skip:
                 part.skip_asked()
                 continue
+            if name == "hook":
+                foreign = self.foreign_hooks(files, paths)
+                if foreign:
+                    path, command = foreign[0]
+                    shown = command if len(command) <= NOTICE_COMMAND_CHARS else command[:NOTICE_COMMAND_CHARS] + "…"
+                    part.notice = (f"{path} already runs a session-start hook that mentions chronicle ({shown}); "
+                                   "`--skip hook` keeps only that one.")
             try:
                 planner(part)
             except EditRefused as exc:
                 part.refuse(f"{exc.path}: {exc.reason}", exc.manual)
         return parts
+
+    def foreign_hooks(self, files: Files, paths: dict[str, Path]) -> list[tuple[Path, str]]:
+        """Hook commands in the agent's session-start hooks that mention chronicle and are not this package's."""
+        arrays = HOOK_ARRAYS.get(self.id)
+        if not arrays or "hook" not in paths:
+            return []
+        path = paths["hook"]
+        try:
+            doc = JsonDoc(files.load(path), comments=True)
+        except EditRefused:
+            return []
+        found: list[tuple[Path, str]] = []
+        for array_path in arrays:
+            groups = doc.get(array_path)
+            for group in groups if isinstance(groups, list) else []:
+                hooks = group.get("hooks") if isinstance(group, dict) else None
+                for hook in hooks if isinstance(hooks, list) else []:
+                    command = hook.get("command") if isinstance(hook, dict) else None
+                    if (isinstance(command, str) and FOREIGN_HOOK_WORD in command.lower()
+                            and HOOK_MODULE not in command):
+                        found.append((path, command))
+        return found
 
     def _plan_server(self, part: Part, files: Files, ctx: Context, paths: dict[str, Path]) -> None:
         path = paths["server"]
@@ -1212,7 +1250,8 @@ def _part_line(name: str, part: Part, env: Mapping[str, str], *, done: bool = Fa
     if part.manual and part.status in ("refused", "skipped"):
         line += f"\n  {'':<12} {'':<9} by hand: {part.manual}"
     if part.notice:
-        line += f"\n  {'':<12} {'':<9} notice: {part.notice}"
+        notice = part.notice.replace(str(_home(env)) + os.sep, "~" + os.sep)
+        line += f"\n  {'':<12} {'':<9} notice: {notice}"
     return line
 
 
