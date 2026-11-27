@@ -51,6 +51,7 @@ Then, from another shell:
 ```bash
 chronicle connect claude                # Claude Code; also codex, zcode, opencode, gemini
 chronicle connect codex --role read     # read-only: /mcp/read, no record_event
+chronicle connect claude --skip hook    # leave a part out: permissions, hook or block
 chronicle connect cursor --print        # Cursor or any other agent: snippets to add by hand
 chronicle agents                        # who is installed, connected, with which role
 chronicle doctor --agents               # each part as connect left it; exit 5 on drift
@@ -61,7 +62,9 @@ chronicle disconnect claude             # takes back exactly what connect wrote
 server `chronicle`, its tools allowed without a prompt, a session-start hook that
 hands each session its memory brief, and a short protocol block in the agent's
 instruction file. It shows the change and asks first (`--yes` for scripts and
-agents, `--dry-run` to only look). Each change is one piece of text, recorded in
+agents, `--dry-run` to only look). When the agent already runs a session-start hook
+of its own that mentions chronicle, `connect` says so in one notice line:
+`--skip hook` keeps only that hook. Each change is one piece of text, recorded in
 the workspace with hashes, so `disconnect` restores the files' bytes. The role is
 chosen per agent: `write` (`/mcp`, six tools) or `read` (`/mcp/read`, five). A
 role is a guard-rail against mistakes, not a security boundary: an agent with a

@@ -1437,7 +1437,9 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
             "Connect a coding agent to the Chronicle HTTP server with a role: write (/mcp, six tools) or read "
             "(/mcp/read, five tools, no record_event). Edits only the agent's user-level files, one piece of text "
             "per change, recorded in the workspace's ledger; disconnect takes them back. Without an agent, lists "
-            "the agents. A role is a guard-rail, not a security boundary.\n\n"
+            "the agents. --skip leaves a part out (reported as 'skipped (asked)'). When the agent already runs a "
+            "session-start hook of its own that mentions chronicle, connect prints a notice: --skip hook keeps "
+            "only that one. A role is a guard-rail, not a security boundary.\n\n"
             "agents: " + ", ".join(f"{a.id} ({a.label})" for a in ADAPTERS.values()) + "; cursor only with --print."),
         epilog=EXIT_CODES_HELP)
     connect.add_argument("agent", nargs="?", help="claude, codex, zcode, opencode, gemini, cursor")

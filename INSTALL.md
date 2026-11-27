@@ -57,6 +57,7 @@ they take `--url`, else `CHRONICLE_SERVER_URL`, else that file.
 chronicle connect claude --dry-run      # what would change, nothing written
 chronicle connect claude                # shows the change and asks; --yes applies without asking
 chronicle connect codex --role read     # roles: write (default) and read
+chronicle connect claude --skip hook    # leave out a part: permissions, hook or block (repeatable)
 chronicle connect gemini --print        # snippets and the block for adding by hand
 chronicle agents
 chronicle doctor --agents
@@ -82,7 +83,11 @@ The session-start hook is part of the package: `connect` writes
 the agent's hook settings. It prints the brief from the server, or from the database
 with one line saying the server is silent, and always exits 0. Codex runs a new hook
 only after it is trusted in `/hooks`; opencode has no session-start hook, so its
-block tells the agent to start with `startup_bundle`.
+block tells the agent to start with `startup_bundle`. If the agent already runs a
+session-start hook of its own that mentions chronicle, `connect` prints a notice
+naming the file; `--skip hook` keeps only that hook, so a session gets one brief.
+A skipped part is reported as `skipped (asked)`, `doctor --agents` takes it as
+intended, and a later `connect` without `--skip` installs it.
 
 `chronicle connect` runs on macOS and Linux; on Windows it refuses with a message.
 

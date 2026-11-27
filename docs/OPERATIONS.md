@@ -174,6 +174,7 @@ variables into account.
 chronicle connect claude --role write --yes --by codex --json
 chronicle connect zcode --role read
 chronicle connect cursor --print
+chronicle connect claude --skip hook --skip block
 chronicle agents
 chronicle doctor --agents
 chronicle disconnect zcode --yes
@@ -204,6 +205,21 @@ skipped and reported.
 
 Claude Code follows `CLAUDE_CONFIG_DIR`. Codex runs a new or changed hook only
 after it is trusted in its `/hooks` view; `connect` does not write that trust.
+
+**Skipping a part.** `--skip <part>` (repeatable: `permissions`, `hook`, `block`;
+the server entry is always installed) leaves a part out. It is reported as
+`skipped (asked)` in the text and in `--json`, kept with the connection in the
+ledger and shown by `chronicle agents`; `doctor --agents` takes it as intended,
+not as drift. A later `connect` without `--skip` installs the part, and `--skip`
+on a part that `connect` installed takes its pieces out and nothing else. A hook
+skipped on request leaves the block's hook line as it is.
+
+**A hook of the operator's own.** When the agent's session-start hooks (for
+Claude Code also `UserPromptSubmit`) already hold a command that is not this
+package's and mentions `chronicle`, `connect` and `--dry-run` print one notice
+line naming the file: `--skip hook` keeps only that hook, so each session gets
+the brief once. Without `--skip hook` the package hook is installed beside it. In
+`--json` the notice is the `notice` field of the hook part.
 
 **Before any change** `connect` takes the server's address from `--url`, else
 `CHRONICLE_SERVER_URL`, else `chronicle-server.json` in the workspace (there is no
