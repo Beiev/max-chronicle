@@ -977,3 +977,57 @@ SERVER_ENTRY_PRESENT = {
     "codex": lambda path: "chronicle" in tomllib.loads(path.read_text())["mcp_servers"],
     "claude": lambda path: "chronicle" in json.loads(path.read_text())["mcpServers"],
 }
+
+
+# ---------------------------------------------------------------------------
+# A role switch on an entry written by hand
+# ---------------------------------------------------------------------------
+
+CODEX_HAND_TABLE = (f'[mcp_servers.chronicle]  # written by hand\nurl = "{BASE}/mcp"\n'
+                    'startup_timeout_sec = 30 # a slow disk\nbearer_token_env_var = "CHRONICLE_TOKEN"\n')
+
+
+def _hand_made_entry(home: Path, agent: str) -> Path:
+    if agent == "codex":
+        path = home / ".codex" / "config.toml"
+        path.write_text(path.read_text() + "\n" + CODEX_HAND_TABLE)
+    elif agent == "claude":
+        path = home / ".claude.json"
+        path.write_text(path.read_text().replace(
+            '    "remote-docs": {',
+            f'    "chronicle": {{\n      "type": "http",\n      "url": "{BASE}/mcp",\n'
+            '      "headers": {"X-Client": "workstation"},\n      "timeout": 30\n    },\n    "remote-docs": {'))
+    else:
+        path = home / ".gemini" / "settings.json"
+        path.write_text(path.read_text().replace(
+            '  "general": {',
+            f'  "mcpServers": {{\n    "chronicle": {{\n      // written by hand\n      "httpUrl": "{BASE}/mcp",\n'
+            '      "timeout": 30000\n    }\n  },\n  "general": {'))
+    return path
+
+
+@pytest.mark.parametrize("agent", ["codex", "claude", "gemini"])
+@pytest.mark.parametrize("first_role", [None, "write"])
+def test_a_role_switch_on_a_hand_made_entry_changes_only_its_address(agent, first_role, chronicle_sandbox, home,
+                                                                    env) -> None:
+    path = _hand_made_entry(home, agent)
+    before = path.read_bytes()
+    if first_role:  # taken as it is first, then switched
+        assert _connect(agent, chronicle_sandbox, env, role=first_role).payload["parts"]["server"]["status"] == "present"
+
+    outcome = _connect(agent, chronicle_sandbox, env, role="read")
+
+    assert outcome.exit_code == EXIT_OK, outcome.payload
+    text = path.read_text()
+    address = f"{BASE}/mcp/read"
+    if agent == "codex":
+        assert CODEX_HAND_TABLE.replace(f'"{BASE}/mcp"', f'"{address}"') in text
+    else:
+        server = before.decode().replace(f'"{BASE}/mcp"', f'"{address}"')
+        assert text == server or agent == "gemini"  # Gemini also gets trust on the entry
+        entry = json.loads(mask_comments(text)[0])["mcpServers"]["chronicle"]
+        assert entry.get("url", entry.get("httpUrl")) == address and "timeout" in entry
+        if agent == "gemini":
+            assert "// written by hand" in text
+    assert _disconnect(agent, chronicle_sandbox, env).exit_code == EXIT_OK
+    assert path.read_bytes() == before

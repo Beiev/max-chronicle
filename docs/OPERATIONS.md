@@ -228,7 +228,9 @@ default port), asks `/health`, requires Chronicle 0.33.0 or newer with `/mcp` an
 fails it changes nothing and prints how to start the server.
 
 **An existing entry.** A `chronicle` entry that points at this server is taken as
-it is and recorded (`present`); one of the other role gets its address changed. A
+it is and recorded (`present`); one of the other role gets its address changed:
+only the value of its address key, every other key and comment of the entry
+stays as it is, and `disconnect` puts the old address back. A
 `chronicle` entry that points elsewhere is refused unless `--force` replaces it.
 An entry of another name that points at this server is reported, and renamed to
 `chronicle` only with `--adopt`. A second `connect` with the same role changes

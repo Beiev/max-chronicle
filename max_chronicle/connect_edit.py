@@ -948,6 +948,11 @@ def _manual_undo(logical: dict[str, Any]) -> str:
         if action == "replace":
             return f"Set '{where}' back by hand to: {json.dumps(logical.get('original_value'))}"
     if fmt == "toml":
+        if action == "value":
+            return (f"Set {logical['key']} in [{toml_key(logical['name'])}] back by hand to "
+                    f"{toml_string(logical['original_value'])}.")
+        if action == "rename":
+            return f"Rename [{toml_key(logical['new'])}] back to [{toml_key(logical['name'])}] by hand."
         return "Remove these tables by hand:\n" + str(logical.get("core", ""))
     if fmt == "text":
         return (f"Remove the lines from {logical.get('begin')!r} to {logical.get('end')!r} by hand.")
@@ -959,6 +964,9 @@ def _manual_undo(logical: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 _HEADER = re.compile(r"^[ \t]*\[(?!\[)(?P<name>[^\]\n]*)\][ \t]*(?:#[^\n]*)?$", re.MULTILINE)
+# A key line whose value is one single-line string: `key = "..."` or `key = '...'`.
+_STRING_LINE = re.compile(r"""^[ \t]*(?P<key>[A-Za-z0-9_-]+|"[^"\\\n]*")[ \t]*=[ \t]*"""
+                          r"""(?P<value>"(?:[^"\\\n]|\\.)*"|'[^'\n]*')(?P<rest>[^\n]*)$""", re.MULTILINE)
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -1175,6 +1183,32 @@ class TomlDoc:
         self._verify(after, expected)
         return edit
 
+    def replace_string(self, name: tuple[str, ...], key: str, value: str, *,
+                       logical: dict[str, Any] | None = None) -> Edit:
+        """Replace the string value of *key* in table *name*'s own block; every other byte stays."""
+        self.check_table(name, own_header=True)
+        span = self.block(name)
+        if span is None:
+            raise EditRefused(self.path, f"[{toml_key(name)}] has no header", "Edit it by hand.")
+        start, stop = span
+        found = [match for match in _STRING_LINE.finditer(self.text, start, stop)
+                 if _split_key(match.group("key")) == (key,)
+                 and (not match.group("rest").strip() or match.group("rest").strip().startswith("#"))]
+        where = f"{key} in [{toml_key(name)}]"
+        original = (_get(self.value, list(name)) or {}).get(key)
+        if len(found) != 1 or not isinstance(original, str):
+            raise EditRefused(self.path, f"{where} is not one single-line string", f"Set {where} by hand.")
+        match = found[0]
+        old, new = match.group("value"), toml_string(value)
+        after = _splice(self.text, match.start("value"), old, new)
+        expected = copy.deepcopy(self.value)
+        _get(expected, list(name))[key] = value
+        logical = {"format": "toml", "action": "value", "name": list(name), "key": key, "value": value,
+                   "original_value": original, **(logical or {})}
+        edit = Edit(self.path, "replace", match.start("value"), old, new, self.loaded, after, logical)
+        self._verify(after, expected)
+        return edit
+
     def rename_table(self, name: tuple[str, ...], new: tuple[str, ...], *,
                      logical: dict[str, Any] | None = None) -> Edit:
         """Rename table *name* to *new* by its header line; a table with sub-tables is renamed by hand."""
@@ -1209,6 +1243,10 @@ class TomlDoc:
             return _get(self.value, logical["name"]) is not None
         if action == "rename":
             return _get(self.value, logical["new"]) is not None
+        if action == "value":
+            table = _get(self.value, logical["name"])
+            return (isinstance(table, dict) and logical["key"] in table
+                    and table[logical["key"]] != logical["original_value"])
         return True
 
     def undo(self, change: dict[str, Any]) -> Edit:
@@ -1224,6 +1262,12 @@ class TomlDoc:
                 continue
             if logical["action"] == "tables":
                 expected = _subtract(self.value, tomllib.loads(logical["core"]))
+            elif logical["action"] == "value":
+                expected = copy.deepcopy(self.value)
+                table = _get(expected, logical["name"])
+                if not isinstance(table, dict) or logical["key"] not in table:
+                    continue
+                table[logical["key"]] = logical["original_value"]
             elif logical["action"] == "rename":
                 expected = copy.deepcopy(self.value)
                 new, old = logical["new"], logical["name"]

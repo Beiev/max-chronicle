@@ -678,6 +678,32 @@ def ledger_checks(smoke: Smoke) -> None:
 
     smoke.check("disconnect-drifted", drifted)
 
+    def keeps_keys(agent: str):
+        def test():
+            home = smoke.new_home()
+            write, read = f'"{smoke.base_url}/mcp"', f'"{smoke.base_url}/mcp/read"'
+            if agent == "codex":
+                path = home / ".codex/config.toml"
+                entry = (f"[mcp_servers.chronicle]  # written by hand\nurl = {write}\n"
+                         'startup_timeout_sec = 30 # a slow disk\nbearer_token_env_var = "CHRONICLE_TOKEN"\n')
+                path.write_text(path.read_text() + "\n" + entry, encoding="utf-8")
+            else:
+                path = home / ".claude.json"
+                entry = (f'    "chronicle": {{\n      "type": "http",\n      "url": {write},\n'
+                         '      "headers": {"X-Client": "workstation"},\n      "timeout": 30\n    },\n')
+                path.write_text(path.read_text().replace('    "remote-docs": {', entry + '    "remote-docs": {'),
+                                encoding="utf-8")
+            before = path.read_bytes()
+            result = smoke.cli("connect", agent, "--role", "read", "--yes", home=home)
+            kept = entry.replace(write, read) in path.read_text()
+            back = smoke.cli("disconnect", agent, "--yes", home=home)
+            return (result.returncode == 0 and kept and back.returncode == 0 and path.read_bytes() == before), \
+                f"connect exit {result.returncode}, entry kept {kept}, disconnect exit {back.returncode}"
+        return test
+
+    smoke.check("role-switch-keeps-keys-codex", keeps_keys("codex"))
+    smoke.check("role-switch-keeps-keys-claude", keeps_keys("claude"))
+
 
 def hook(smoke: Smoke, agent: str, budget: int, session: str) -> subprocess.CompletedProcess:
     payload = json.dumps({"session_id": session, "hook_event_name": "SessionStart", "cwd": str(smoke.workspace)})

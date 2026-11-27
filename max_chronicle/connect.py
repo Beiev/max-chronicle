@@ -696,7 +696,8 @@ class Adapter:
                                  {"text": core, "logical": {"format": "toml", "action": "adopt",
                                                             "name": list(name), "url": url}})
                     return
-                _edit_into(part, files, doc.replace_block(name, core), f"{where}: address set to the {ctx.role} endpoint")
+                _edit_into(part, files, doc.replace_string(name, "url", ctx.mcp_url),
+                           f"{where}: address set to the {ctx.role} endpoint")
                 return
             if not ctx.force:
                 part.refuse(f"{where} points at {url or 'something else'}",
@@ -717,7 +718,8 @@ class Adapter:
                        f"{path}: [mcp_servers.{toml_key((other,))}] renamed (--adopt)")
             if role_of_url(servers[other].get("url")) != ctx.role:
                 doc = TomlDoc(files.load(path))
-                _edit_into(part, files, doc.replace_block(name, core), f"address set to the {ctx.role} endpoint")
+                _edit_into(part, files, doc.replace_string(name, "url", ctx.mcp_url),
+                           f"address set to the {ctx.role} endpoint")
             return
         _edit_into(part, files, doc.append(core), f"{where} added")
 
