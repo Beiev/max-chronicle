@@ -588,7 +588,8 @@ class JsonDoc:
                     return inner[len(outer):]
         return _document_indent(self.text)
 
-    def _insertion(self, container: Node, rendered: list[str], inline: list[str]) -> tuple[int, str]:
+    def _insertion(self, container: Node, rendered: list[str], inline: list[str], *,
+                   first: bool = False) -> tuple[int, str]:
         """Where and what to insert so that *rendered* entries end the container (or start it)."""
         entries_end = [value.end for _, _, value in container.members] or [item.end for item in container.items]
         outer = _indent_at(self.text, container.start)
@@ -599,10 +600,13 @@ class JsonDoc:
             body = ("," + "\n" + inner).join(rendered)
             piece = "\n" + inner + body + ("" if "\n" in between else "\n" + outer)
             return container.start + 1, piece
+        place_first = first
         first = container.members[0][1] if container.members else container.items[0].start
         if "\n" not in self.masked[container.start:first]:  # entries written on the bracket's line
             return entries_end[-1], "".join(", " + item for item in inline)
         inner = _indent_at(self.text, first)
+        if place_first:
+            return container.start + 1, "".join("\n" + inner + item + "," for item in rendered)
         last = entries_end[-1]
         line_end = self.text.find("\n", last)
         line_end = len(self.text) if line_end < 0 else line_end
@@ -628,8 +632,12 @@ class JsonDoc:
             raise EditRefused(self.path, "the change would alter more than the entry",
                               "Add the entry by hand.")
 
-    def insert_member(self, path: list[str], key: str, value: Any, *, logical: dict[str, Any] | None = None) -> Edit:
-        """Add *key* = *value* to the object at *path*, creating the missing objects of the path."""
+    def insert_member(self, path: list[str], key: str, value: Any, *, logical: dict[str, Any] | None = None,
+                      first: bool = False) -> Edit:
+        """Add *key* = *value* to the object at *path*, creating the missing objects of the path.
+
+        *first* puts it before the object's other members, where its owner writes it.
+        """
         logical = {"format": "json", "action": "member", "path": list(path), "key": key, "value": value,
                    **(logical or {})}
         if self.root is None:
@@ -654,7 +662,7 @@ class JsonDoc:
             inner = _indent_at(self.text, node.members[0][1])
         rendered = _render_member(new_key, new_value, inner, unit)
         inline = json.dumps({new_key: new_value}, ensure_ascii=False, separators=(", ", ": "))[1:-1]
-        start, piece = self._insertion(node, [rendered], [inline])
+        start, piece = self._insertion(node, [rendered], [inline], first=first)
         logical["created"] = list(path[:depth + 1]) if depth < len(path) else None
         edit = Edit(self.path, "insert", start, "", piece, self.loaded,
                     self.text[:start] + piece + self.text[start:], logical)
@@ -664,13 +672,15 @@ class JsonDoc:
         self._verify(edit, expected)
         return edit
 
-    def append_items(self, path: list[str], items: list[Any], *, logical: dict[str, Any] | None = None) -> Edit:
-        """Append *items* to the array at *path*; a missing array is created with them."""
+    def append_items(self, path: list[str], items: list[Any], *, logical: dict[str, Any] | None = None,
+                     first: bool = False) -> Edit:
+        """Append *items* to the array at *path*; a missing array is created with them (*first*: as the first member)."""
         if not items:
             raise ValueError("nothing to append")
         node = self.node(path) if self.root is not None else None
         if node is None:  # the array is new: the change is its member, undone by removing it
-            return self.insert_member(path[:-1], path[-1], list(items), logical={"array": list(path), **(logical or {})})
+            return self.insert_member(path[:-1], path[-1], list(items), logical={"array": list(path), **(logical or {})},
+                                      first=first)
         logical = {"format": "json", "action": "items", "path": list(path), "items": list(items), **(logical or {})}
         self.check_path(path)
         if node.kind != "array":
@@ -762,8 +772,91 @@ class JsonDoc:
             if value == self._undone(logical):
                 op = "restore" if original else "remove"
                 return Edit(self.path, op, start, piece, original, self.loaded, after, logical)
+        # The owner rewrote the file (another key order, other members) and kept the
+        # entry: remove it where it is now, as one contiguous piece, verified alike.
+        found = self._structural(logical, original)
+        if found is not None:
+            start, old, new = found
+            after = _splice(self.text, start, old, new)
+            try:
+                masked, _ = mask_comments(after)
+                value = json.loads(masked) if masked.strip() else None
+            except (JsonSyntaxError, ValueError):
+                value = object()
+            if value == self._undone(logical):
+                return Edit(self.path, "restore" if new else "remove", start, old, new, self.loaded, after,
+                            {**logical, "structural": True})
         raise EditRefused(self.path, "the entry Chronicle wrote is no longer there as written",
                           _manual_undo(logical))
+
+    def _value_of(self, node: Node) -> Any:
+        return json.loads(self.masked[node.start:node.end])
+
+    def _removal(self, container: Node, first: int, last: int) -> tuple[int, int] | None:
+        """The span that removes entries *first*..*last* of *container* with one comma; None across a comment."""
+        starts = [key_start for _, key_start, _ in container.members] or [item.start for item in container.items]
+        ends = [value.end for _, _, value in container.members] or [item.end for item in container.items]
+        count = len(starts)
+        if first == 0 and last == count - 1:
+            span = (container.start + 1, container.end - 1)
+        elif last < count - 1:
+            span = (starts[first], starts[last + 1])
+        else:
+            span = (ends[first - 1], ends[last])
+        if self.masked[span[0]:span[1]] != self.text[span[0]:span[1]]:
+            return None
+        return span
+
+    def _structural(self, logical: dict[str, Any], original: str) -> tuple[int, str, str] | None:
+        """Where a recorded entry is in the current text, found by its path and value: (start, old, new)."""
+        action = logical.get("action")
+        if self.root is None:
+            return None
+        if action == "member":
+            created = logical.get("created")
+            if created:
+                path, key = created[:-1], created[-1]
+                value = _nest(logical["path"][len(created):], {logical["key"]: logical["value"]})
+            else:
+                path, key, value = logical["path"], logical["key"], logical["value"]
+            container = self.node(path) if path else self.root
+            if container is None or container.kind != "object":
+                return None
+            indices = [index for index, (name, _, node) in enumerate(container.members)
+                       if name == key and self._value_of(node) == value]
+            if len(indices) != 1:
+                return None
+            span = self._removal(container, indices[0], indices[0])
+        elif action == "items":
+            container = self.node(logical["path"])
+            items = logical["items"]
+            if container is None or container.kind != "array":
+                return None
+            values = [self._value_of(node) for node in container.items]
+            matches = [start for start in range(len(values) - len(items), -1, -1)
+                       if values[start:start + len(items)] == items]
+            if not matches:
+                return None
+            span = self._removal(container, matches[0], matches[0] + len(items) - 1)
+        elif action == "replace":
+            node = self.node(logical["path"])
+            if node is None or self._value_of(node) != logical["value"]:
+                return None
+            return node.start, self.text[node.start:node.end], original
+        elif action == "rename":
+            container = self.node(logical["path"]) if logical["path"] else self.root
+            if container is None or container.kind != "object":
+                return None
+            starts = [key_start for name, key_start, _ in container.members if name == logical["new"]]
+            if len(starts) != 1:
+                return None
+            _, end = scanstring(self.masked, starts[0] + 1, True)
+            return starts[0], self.text[starts[0]:end], original
+        else:
+            return None
+        if span is None:
+            return None
+        return span[0], self.text[span[0]:span[1]], ""
 
     def _undone(self, logical: dict[str, Any]) -> Any:
         expected = copy.deepcopy(self.value)

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "example/model-flash",
+  "update": "disable",
+  // Compaction fires when the request reaches limit.input; no extra reserve.
+  "compaction": { "buffer": 0 },
+  "provider": {
+    "example": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Example",
+      "options": {
+        "baseURL": "https://api.example.com/v1",
+        // Keeps a session on a warm cache replica.
+        "promptCacheKey": true
+      },
+      "models": {
+        // The flash model is the default for workers.
+        "model-flash": {
+          "name": "model-flash",
+          "tool_call": true,
+          "limit": { "context": 232768, "input": 200000, "output": 32768 },
+          "cost": { "input": 0.15, "output": 0.5, "cache_read": 0.06 }
+        }
+      }
+    }
+  },
+  // Long outputs keep their last lines; the full text goes to a file.
+  "tool_output": { "max_lines": 1000, "max_bytes": 32768 },
+  "permission": {
+    "bash": {
+      "*": "allow",
+      "git push*": "deny",
+      "rm -rf*": "deny"
+    },
+    "edit": {
+      "*": "allow"
+    },
+    // Pictures are not read by text-only models.
+    "read": {
+      "*": "allow",
+      "*.png": "deny", "*.jpg": "deny", "*.mp4": "deny"
+    },
+    "skill": { "*": "deny" },
+    "doom_loop": "allow"
+  },
+  "instructions": [
+    "~/.config/opencode/AGENTS.md"
+  ]
+}

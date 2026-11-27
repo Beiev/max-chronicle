@@ -1,0 +1,52 @@
+{
+  "provider": {
+    "zai": {
+      "kind": "anthropic",
+      "name": "Example Coding Plan",
+      "options": {
+        "apiKeyRequired": true,
+        "baseURL": "https://api.example.com/api/anthropic",
+        "apiKey": "example-placeholder"
+      },
+      "models": {
+        "glm-5.4": {
+          "name": "GLM-5.4"
+        },
+        "glm-4.7": {
+          "name": "GLM-4.7"
+        }
+      }
+    }
+  },
+  "model": {
+    "main": "zai/glm-5.4",
+    "lite": "zai/glm-4.7"
+  },
+  "mcp": {
+    "servers": {
+      "fetch": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": [
+          "mcp-server-fetch"
+        ]
+      },
+      "searxng": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "mcp-searxng"
+        ],
+        "env": {
+          "SEARXNG_URL": "http://localhost:8888"
+        }
+      }
+    }
+  },
+  "permission": {
+    "allowedTools": [
+      "mcp__fetch__fetch"
+    ]
+  }
+}

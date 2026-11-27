@@ -17,6 +17,7 @@ from .bootstrap import bootstrap_legacy
 from .brief import BRIEF_DEFAULT_CHARS, build_brief
 from .notes import notes_status, read_note, sync_notes
 from .browse import render_browse_help, render_daybook, render_entity_timeline, render_recent_events, render_search_results
+from .connect import add_parsers as add_connect_parsers
 from .config import (
     ENV_CHRONICLE_AUTO_MIGRATE,
     EXIT_CONFIG_ERROR,
@@ -669,6 +670,10 @@ def cmd_launchd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    if getattr(args, "agents", False):
+        from .connect import cmd_doctor_agents
+
+        return cmd_doctor_agents(args)
     manifest = load_manifest(args.manifest)
     automation = load_native_automation(args.automation_config)
     audit = run_audit(
@@ -1139,9 +1144,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument("--runtime-dir", default=None, help="Override wrapper scripts directory")
     p_doctor.add_argument("--trigger-source", default="manual", help="Trigger source label")
     p_doctor.add_argument("--summary", action="store_true", help="Print a one-screen summary instead of JSON")
-    p_doctor.add_argument("--server-url", default=None,
-                          help="HTTP server to ask for its health (default: CHRONICLE_SERVER_URL, else MCP_HOST/MCP_PORT)")
+    p_doctor.add_argument("--server-url", "--url", dest="server_url", default=None,
+                          help="HTTP server to ask for its health (default: CHRONICLE_SERVER_URL, else MCP_HOST/MCP_PORT; "
+                               "with --agents: CHRONICLE_SERVER_URL, else the address file in the workspace)")
+    p_doctor.add_argument("--agents", action="store_true",
+                          help="Check the agents connected by `chronicle connect` instead: each part as connect left "
+                               "it, and the server they point at; exits 5 on drift")
     p_doctor.set_defaults(handler=cmd_doctor)
+
+    add_connect_parsers(sub)
 
     p_backup = sub.add_parser("backup", help="Run Chronicle backup to the configured target")
     p_backup.add_argument("--force", action="store_true", help="Ignore the backup interval guard")

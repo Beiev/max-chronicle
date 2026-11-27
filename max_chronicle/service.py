@@ -125,6 +125,7 @@ CANONICAL_EVENT_CATEGORIES = frozenset(
         "insight",
         "constraint",
         "curation",
+        "agent_connection",  # chronicle connect / disconnect, written as the operator
     }
 )
 CATEGORY_ALIASES = {
