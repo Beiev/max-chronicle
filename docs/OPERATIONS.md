@@ -258,7 +258,9 @@ still in the file but no longer as `connect` wrote it (an entry edited by hand)
 is never removed: `disconnect` reports it as `left: changed since connect` with
 its file and the steps to take it out by hand, keeps it in the ledger and exits
 1; once it is taken out by hand, `disconnect` finishes. A piece no longer in its
-file is reported as `gone`. `doctor --agents`
+file is reported as `gone`. A file that held only whitespace (or nothing) gets
+its exact bytes back, and a file `connect` created is removed again when nothing
+else was added to it. `doctor --agents`
 checks every recorded piece and the server's address, names each part that is not
 as `connect` left it with the command that fixes it, and exits 5 on drift.
 One `connect` or `disconnect` runs at a time per workspace: a run holds

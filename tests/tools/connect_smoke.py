@@ -704,6 +704,24 @@ def ledger_checks(smoke: Smoke) -> None:
     smoke.check("role-switch-keeps-keys-codex", keeps_keys("codex"))
     smoke.check("role-switch-keeps-keys-claude", keeps_keys("claude"))
 
+    def blank_file():
+        home = smoke.new_home()
+        blank = {".claude/settings.json": b"\n", ".gemini/settings.json": b"  \n\n", ".codex/hooks.json": b"\n"}
+        for name, data in blank.items():
+            (home / name).write_bytes(data)
+        missing = home / ".zcode/cli/config.json"
+        missing.unlink()
+        agents = ("claude", "gemini", "codex", "zcode")
+        connected = [smoke.cli("connect", agent, "--yes", home=home).returncode for agent in agents]
+        filled = all((home / name).read_bytes() != data for name, data in blank.items()) and missing.exists()
+        disconnected = [smoke.cli("disconnect", agent, "--yes", home=home).returncode for agent in agents]
+        same = [name for name, data in blank.items() if (home / name).read_bytes() == data]
+        return (connected == [0] * 4 and filled and disconnected == [0] * 4 and len(same) == len(blank)
+                and not missing.exists()), \
+            f"connect {connected}, disconnect {disconnected}, restored {same}, created file left {missing.exists()}"
+
+    smoke.check("restore-blank-file", blank_file)
+
 
 def hook(smoke: Smoke, agent: str, budget: int, session: str) -> subprocess.CompletedProcess:
     payload = json.dumps({"session_id": session, "hook_event_name": "SessionStart", "cwd": str(smoke.workspace)})

@@ -575,10 +575,15 @@ class JsonDoc:
     # -- planning ---------------------------------------------------------
 
     def _new_file(self, value: dict[str, Any], logical: dict[str, Any]) -> Edit:
-        """The whole text of a file that is missing or empty: Chronicle's entry alone."""
+        """The whole text of a file that is missing or holds no JSON value: Chronicle's entry after what it held.
+
+        The ledger keeps that text (``before_text``): `disconnect` puts the file
+        back to it, or removes a file this created.
+        """
         content = json.dumps(value, indent=DEFAULT_INDENT, ensure_ascii=False) + "\n"
         op = "create" if not self.loaded.exists else "insert"
         logical["new_file"] = True
+        logical["before_text"] = self.text
         edit = Edit(self.path, op, len(self.text), "", content, self.loaded, self.text + content, logical)
         self._verify(edit, value)
         return edit
@@ -759,13 +764,61 @@ class JsonDoc:
         return edit
 
     def undo(self, change: dict[str, Any]) -> Edit:
-        """The edit that takes a recorded change back out of the current text."""
+        """The edit that takes a recorded change back out of the current text.
+
+        A file the change created, or one that held no JSON value before it, goes
+        back to its exact first bytes (a created file is removed) when nothing
+        else was added to it.
+        """
         logical = change["logical"]
+        if logical.get("new_file"):
+            before = logical.get("before_text", "")
+            if self.text == before + change["piece"]:  # the file holds only Chronicle's entry
+                return self._first_state(change, before)
+            edit = self._take_out_new(change)
+            if self._holds_nothing_else(edit.after_text, logical):
+                return self._first_state(change, before)
+            return edit
+        return self._take_out(change)
+
+    def _take_out_new(self, change: dict[str, Any]) -> Edit:
+        """A new file's entry taken out with the outermost of its objects that holds nothing else."""
+        logical = change["logical"]
+        path = list(logical.get("path") or [])
+        for depth in range(1, len(path) + 1):
+            try:
+                return self._take_out(change, {**logical, "created": path[:depth]})
+            except EditRefused:
+                continue
+        return self._take_out(change)
+
+    def _first_state(self, change: dict[str, Any], before: str) -> Edit:
+        if change["op"] == "create":
+            return Edit(self.path, "delete", 0, self.text, "", self.loaded, None, change["logical"])
+        return Edit(self.path, "restore", 0, self.text, before, self.loaded, before, change["logical"])
+
+    def _holds_nothing_else(self, text: str | None, logical: dict[str, Any]) -> bool:
+        """Whether *text* (a new file with the change taken out) holds only the empty objects of its path."""
+        if text is None:
+            return True
+        masked, comments = mask_comments(text)
+        if comments:
+            return False
+        try:
+            value = json.loads(masked) if masked.strip() else {}
+        except ValueError:
+            return False
+        path = list(logical.get("path") or [])
+        for depth in range(len(path), 0, -1):
+            parent = _get(value, path[:depth - 1]) if depth > 1 else value
+            if isinstance(parent, dict) and parent.get(path[depth - 1]) == {}:
+                del parent[path[depth - 1]]
+        return value == {}
+
+    def _take_out(self, change: dict[str, Any], logical: dict[str, Any] | None = None) -> Edit:
+        """The piece taken out where it was written, else where the owner moved it."""
+        logical = logical or change["logical"]
         piece, original = change["piece"], change.get("original", "")
-        if logical.get("new_file") and self.text == piece:  # the file holds only Chronicle's entry
-            if change["op"] == "create":
-                return Edit(self.path, "delete", 0, piece, "", self.loaded, None, logical)
-            return Edit(self.path, "remove", 0, piece, "", self.loaded, "", logical)
         candidates = _occurrences(self.text, piece, change.get("offset"))
         for start in candidates:
             after = _splice(self.text, start, piece, original)

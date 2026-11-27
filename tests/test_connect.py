@@ -1031,3 +1031,54 @@ def test_a_role_switch_on_a_hand_made_entry_changes_only_its_address(agent, firs
             assert "// written by hand" in text
     assert _disconnect(agent, chronicle_sandbox, env).exit_code == EXIT_OK
     assert path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# A file that held nothing, or did not exist
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("agent", "name", "content"), [
+    ("claude", ".claude/settings.json", "\n"),
+    ("gemini", ".gemini/settings.json", "  \n\n"),
+    ("codex", ".codex/hooks.json", "\n"),
+    ("opencode", ".config/opencode/opencode.jsonc", "\n"),
+    ("zcode", ".zcode/cli/config.json", ""),
+    ("claude", ".claude/settings.json", None),
+    ("codex", ".codex/config.toml", "\n"),
+    ("claude", ".claude/CLAUDE.md", " \n"),
+])
+def test_a_blank_or_missing_file_gets_its_exact_bytes_back(agent, name, content, chronicle_sandbox, home, env) -> None:
+    path = home / name
+    if content is None:
+        path.unlink()
+    else:
+        path.write_text(content)
+
+    assert _connect(agent, chronicle_sandbox, env).exit_code == EXIT_OK
+    assert path.exists()
+    assert _disconnect(agent, chronicle_sandbox, env).exit_code == EXIT_OK
+
+    assert (path.read_bytes() if path.exists() else None) == (None if content is None else content.encode())
+
+
+def test_a_created_file_rewritten_by_its_owner_with_nothing_added_is_removed(chronicle_sandbox, home, env) -> None:
+    path = home / ".claude" / "settings.json"
+    path.unlink()
+    _connect("claude", chronicle_sandbox, env)
+    path.write_text(json.dumps(json.loads(path.read_text()), indent=4, sort_keys=True) + "\n")  # the owner saves it
+
+    assert _disconnect("claude", chronicle_sandbox, env).exit_code == EXIT_OK
+    assert not path.exists()
+
+
+def test_a_created_file_the_owner_added_to_keeps_the_addition(chronicle_sandbox, home, env) -> None:
+    path = home / ".claude" / "settings.json"
+    path.unlink()
+    _connect("claude", chronicle_sandbox, env)
+    data = json.loads(path.read_text())
+    data["env"] = {"EXAMPLE": "1"}
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+    assert _disconnect("claude", chronicle_sandbox, env).exit_code == EXIT_OK
+    assert json.loads(path.read_text()) == {"env": {"EXAMPLE": "1"}}
