@@ -817,7 +817,7 @@ class Adapter:
             out.append((f"{paths['hook']} (hooks)", js({"SessionStart": [{"matcher": "*", "hooks": [
                 {"name": "chronicle-brief", **hook, "timeout": HOOK_TIMEOUT_S * 1000}]}]})))
         elif self.id == "cursor":
-            out.append((f"{paths['server']} (mcpServers)", js({SERVER_NAME: self.server_value(ctx)})))
+            out.append((str(paths["server"]), js({"mcpServers": {SERVER_NAME: self.server_value(ctx)}})))
         else:
             out.append(("the agent's MCP configuration (a streamable HTTP server)",
                         js({"mcpServers": {SERVER_NAME: self.server_value(ctx)}})))
