@@ -225,7 +225,10 @@ the brief once. Without `--skip hook` the package hook is installed beside it. I
 `CHRONICLE_SERVER_URL`, else `chronicle-server.json` in the workspace (there is no
 default port), asks `/health`, requires Chronicle 0.33.0 or newer with `/mcp` and
 `/mcp/read` listed, and sends an `initialize` to `/mcp/read`. If any of that
-fails it changes nothing and prints how to start the server.
+fails it changes nothing and prints how to start the server. Requests to a
+server on this machine (`localhost` or a loopback address) never go through a
+proxy from `http_proxy` or the system settings: in `connect`, `doctor` and the
+brief hook alike.
 
 **An existing entry.** A `chronicle` entry that points at this server is taken as
 it is and recorded (`present`); one of the other role gets its address changed:

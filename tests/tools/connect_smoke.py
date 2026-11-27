@@ -34,9 +34,12 @@ import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+
+from max_chronicle.server_address import open_server  # noqa: E402 - the checkout's package, not an installed one
 FIXTURES = REPO / "tests" / "fixtures" / "connect" / "home"
 AGENTS = ("claude", "codex", "zcode", "opencode", "gemini")
 AGENT_FILES = {
@@ -55,6 +58,7 @@ COMMAND_TIMEOUT_S = 120.0
 MCP_VERSION = "2025-06-18"
 CODEX_BUDGET = 4500
 STRIPPED_ENV = ("CHRONICLE_", "MCP_", "OLLAMA_", "CLAUDE_", "CODEX_", "GEMINI_", "XDG_", "ZCODE_")
+PROXIES = {name: "http://127.0.0.1:9" for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY")}
 
 
 class Smoke:
@@ -86,10 +90,16 @@ class Smoke:
         shutil.copytree(FIXTURES, home)
         return home
 
-    def cli(self, *args: str, home: Path | None = None, stdin: str | None = None) -> subprocess.CompletedProcess:
+    def cli(self, *args: str, home: Path | None = None, stdin: str | None = None,
+            env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, "-m", "max_chronicle.cli", "--manifest", str(self.manifest), *args],
-                              input=stdin, capture_output=True, text=True, env=self.env(home),
+                              input=stdin, capture_output=True, text=True, env=env or self.env(home),
                               timeout=COMMAND_TIMEOUT_S)
+
+    def proxied_env(self, home: Path | None = None) -> dict[str, str]:
+        """The environment with a proxy that answers nothing and no exceptions to it."""
+        env = {key: value for key, value in self.env(home).items() if key.lower() != "no_proxy"}
+        return {**env, **PROXIES}
 
     def check(self, label: str, test: Callable[[], tuple[bool, str] | bool]) -> bool:
         try:
@@ -153,7 +163,7 @@ class Smoke:
     # -- helpers ---------------------------------------------------------------
 
     def health(self) -> dict[str, Any]:
-        with urlopen(f"{self.base_url}/health", timeout=5) as response:  # noqa: S310 - local
+        with open_server(f"{self.base_url}/health", timeout=5) as response:
             return json.loads(response.read())
 
     def mcp(self, path: str) -> "Mcp":
@@ -188,7 +198,7 @@ class Mcp:
         request = Request(self.url, data=json.dumps(message).encode(), method="POST", headers={
             "content-type": "application/json", "accept": "application/json, text/event-stream", **(headers or {})})
         try:
-            with urlopen(request, timeout=30) as response:  # noqa: S310 - local
+            with open_server(request, timeout=30) as response:
                 return response.read().decode(), {key.lower(): value for key, value in response.headers.items()}
         except HTTPError as exc:
             return exc.read().decode(), {}
@@ -730,6 +740,26 @@ def hook(smoke: Smoke, agent: str, budget: int, session: str) -> subprocess.Comp
                           text=True, env=smoke.env(), timeout=COMMAND_TIMEOUT_S)
 
 
+def proxy_checks(smoke: Smoke) -> None:
+    def ignored():
+        home = smoke.new_home()
+        env = smoke.proxied_env(home)
+        connect = smoke.cli("connect", "claude", "--dry-run", "--json", env=env)
+        doctor = smoke.cli("doctor", "--agents", env=env)
+        payload = json.dumps({"session_id": "smoke-proxy", "hook_event_name": "SessionStart"})
+        brief = subprocess.run([sys.executable, "-m", "max_chronicle.brief_hook", "--manifest", str(smoke.manifest),
+                                "--agent", "claude", "--budget", "6000"], input=payload, capture_output=True,
+                               text=True, env=env, timeout=COMMAND_TIMEOUT_S)
+        server = json_out(doctor)["server"]
+        return (connect.returncode == 0 and json_out(connect)["status"] == "dry_run" and doctor.returncode == 0
+                and server["answering"] is True and brief.returncode == 0
+                and brief.stdout.startswith("Chronicle memory brief.")), \
+            (f"connect exit {connect.returncode}, doctor exit {doctor.returncode} answering {server.get('answering')}, "
+             f"hook {brief.stdout[:60]!r}")
+
+    smoke.check("loopback-ignores-proxy", ignored)
+
+
 def hook_up_checks(smoke: Smoke) -> None:
     def up():
         result = hook(smoke, "claude", 6000, "smoke-up")
@@ -804,6 +834,7 @@ def main() -> int:
         report_checks(smoke)
         skip_checks(smoke)
         ledger_checks(smoke)
+        proxy_checks(smoke)
         hook_up_checks(smoke)
         smoke.stop_server()
         down_checks(smoke)

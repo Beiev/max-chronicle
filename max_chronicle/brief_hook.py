@@ -28,10 +28,9 @@ import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
 from http.client import HTTPException
 
-from .server_address import resolve_server_url
+from .server_address import open_server, resolve_server_url
 
 SERVER_TIMEOUT_S = 2.0  # the server answers /brief within this, or the hook stops waiting
 STDIN_WAIT_S = 0.5  # an agent that leaves stdin open is not waited on longer
@@ -130,7 +129,7 @@ def _server_brief(url: str, budget: int, project_dir: str | None) -> tuple[str |
     if project_dir:
         query["cwd"] = project_dir
     try:
-        with urlopen(f"{url}/brief?{urlencode(query)}", timeout=SERVER_TIMEOUT_S) as response:  # noqa: S310
+        with open_server(f"{url}/brief?{urlencode(query)}", timeout=SERVER_TIMEOUT_S) as response:
             text = response.read().decode("utf-8", errors="replace")
     except HTTPError as exc:
         return None, f"HTTP {exc.code}", True

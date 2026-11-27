@@ -32,7 +32,7 @@ import sys
 from typing import Any, Callable, Iterable, Mapping, NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from http.client import HTTPException
 
 from . import __version__
@@ -52,7 +52,7 @@ from .connect_edit import (
     toml_string,
     write,
 )
-from .server_address import resolve_server_url
+from .server_address import open_server, resolve_server_url
 
 SERVER_NAME = "chronicle"
 WRITE_TOOLS = ("startup_bundle", "query_memory", "get_memory", "recent_events", "state_at", "record_event")
@@ -179,7 +179,7 @@ def _http_json(url: str, *, data: bytes | None = None, headers: dict[str, str] |
                method: str | None = None) -> tuple[int, Any, dict[str, str]]:
     request = Request(url, data=data, headers=headers or {}, method=method)
     try:
-        with urlopen(request, timeout=HTTP_TIMEOUT_S) as response:  # noqa: S310 - a local URL
+        with open_server(request, timeout=HTTP_TIMEOUT_S) as response:
             status, raw, reply_headers = response.status, response.read(), dict(response.headers)
     except HTTPError as exc:
         status, raw, reply_headers = exc.code, exc.read(), dict(exc.headers or {})

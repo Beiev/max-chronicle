@@ -5,15 +5,23 @@ listens, and removes it on a clean stop. A client takes the address from, in
 this order: an explicit URL, ``CHRONICLE_SERVER_URL``, that file. There is no
 default port. Standard library only: the brief hook imports this before its
 HTTP request, when nothing heavy may load yet.
+
+``open_server`` is the one way the package's clients (connect, doctor, the
+brief hook) send HTTP to a Chronicle server: a loopback host is reached
+directly, never through a proxy from ``http_proxy`` or the system settings.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
+import ipaddress
 import json
 import os
 from pathlib import Path
 import tempfile
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import OpenerDirector, ProxyHandler, Request, build_opener, urlopen
 
 ADDRESS_FILE_NAME = "chronicle-server.json"
 ENV_SERVER_URL = "CHRONICLE_SERVER_URL"
@@ -88,3 +96,27 @@ def resolve_server_url(explicit: str | None, workspace: Path | None) -> tuple[st
         if recorded:
             return recorded["url"].rstrip("/"), str(address_path(workspace))
     return None, "none"
+
+
+def is_loopback_url(url: str) -> bool:
+    """Whether *url* names this machine: ``localhost`` or a loopback address."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _direct_opener() -> OpenerDirector:
+    return build_opener(ProxyHandler({}))
+
+
+def open_server(target: str | Request, timeout: float):
+    """Send an HTTP request to a Chronicle server; a loopback host never goes through a proxy."""
+    url = target.full_url if isinstance(target, Request) else target
+    if is_loopback_url(url):
+        return _direct_opener().open(target, timeout=timeout)
+    return urlopen(target, timeout=timeout)  # noqa: S310 - a server address the operator gave

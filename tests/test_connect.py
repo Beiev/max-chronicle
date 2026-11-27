@@ -1082,3 +1082,27 @@ def test_a_created_file_the_owner_added_to_keeps_the_addition(chronicle_sandbox,
 
     assert _disconnect("claude", chronicle_sandbox, env).exit_code == EXIT_OK
     assert json.loads(path.read_text()) == {"env": {"EXAMPLE": "1"}}
+
+
+# ---------------------------------------------------------------------------
+# A proxy in the environment and a server on this machine
+# ---------------------------------------------------------------------------
+
+PROXY_VARIABLES = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+
+
+def test_requests_to_a_loopback_server_never_go_through_a_proxy(monkeypatch, stub, chronicle_sandbox, env) -> None:
+    from max_chronicle import doctor
+    from max_chronicle.server_address import is_loopback_url
+
+    for name in PROXY_VARIABLES:
+        monkeypatch.setenv(name, "http://127.0.0.1:9")  # nothing listens there
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    url = stub()
+
+    assert preflight(url, chronicle_sandbox.status_root, chronicle_sandbox.manifest_path)["version"] == "0.33.0"
+    assert doctor_agents(chronicle_sandbox.manifest_path, env, url)["server"]["answering"] is True
+    assert doctor.server_status(url)["answering"] is True
+    assert all(is_loopback_url(address) for address in (url, "http://localhost:1", "http://[::1]:1", "http://127.8.0.1"))
+    assert not any(is_loopback_url(address) for address in ("http://10.0.0.2:1", "http://chronicle.example.com"))

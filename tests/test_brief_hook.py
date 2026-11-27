@@ -202,3 +202,20 @@ def test_nothing_heavy_is_imported_before_the_request(tmp_path) -> None:
 
     assert json.loads(result.stdout.replace("'", '"')) == [
         "max_chronicle", "max_chronicle.brief_hook", "max_chronicle.server_address"]
+
+
+def test_a_proxy_in_the_environment_is_not_used_for_a_loopback_server(chronicle_sandbox, tmp_path,
+                                                                      brief_server) -> None:
+    url = brief_server()
+    server_address.write_address(chronicle_sandbox.status_root, url, version="0.33.0", pid=1)
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("CHRONICLE_") and key.lower() not in ("pythonpath", "no_proxy")}
+    environment.update({"TMPDIR": str(tmp_path), "OLLAMA_URL": "http://127.0.0.1:1", "PYTHONPATH": str(REPO)})
+    environment.update({name: "http://127.0.0.1:9" for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY")})
+
+    result = subprocess.run([sys.executable, "-m", "max_chronicle.brief_hook", "--manifest",
+                             str(chronicle_sandbox.manifest_path), "--agent", "claude"],
+                            input=json.dumps({"session_id": "p", "hook_event_name": "SessionStart"}),
+                            capture_output=True, text=True, env=environment, timeout=30)
+
+    assert result.returncode == 0 and result.stdout == "Chronicle memory brief from the server.\n- one\n"
