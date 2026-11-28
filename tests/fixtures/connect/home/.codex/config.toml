@@ -1,0 +1,50 @@
+model = "example-model"
+model_reasoning_effort = "high"
+
+notify = ["bash", "-lc", "afplay /System/Library/Sounds/Glass.aiff"]
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[mcp_servers.node_repl]
+args = ["--stdio"]
+command = "/opt/example/node_repl"
+env_vars = ["HOME"]
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+NODE_REPL_EXAMPLE = "1"
+CODEX_HOME = "/home/dev/.codex"
+
+# The worker server runs from its own checkout; see its README.
+[mcp_servers.workers]
+command = "uv"
+args = ["run", "--directory", "/home/dev/tools/workers", "workers-mcp"]
+startup_timeout_sec = 60
+
+[mcp_servers.computer-use]
+command = "./Example.app/Contents/MacOS/Client"
+args = ["mcp"]
+cwd = "/Applications/Example.app/Contents"
+enabled = false
+
+[projects."/home/dev/projects"]
+trust_level = "trusted"
+
+[projects."/home/dev/projects/demo"]
+trust_level = "trusted"
+
+[features]
+multi_agent = true
+js_repl = false
+
+[plugins."github@openai-curated"]
+enabled = true
+
+[marketplaces.openai-bundled]
+source_type = "local"
+source = "/opt/example/marketplace"
+
+[hooks.state]
+
+[hooks.state."/home/dev/.codex/hooks.json:session_start:0:0"]
+trusted_hash = "0000000000000000000000000000000000000000000000000000000000000000"

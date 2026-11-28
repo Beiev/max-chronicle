@@ -37,6 +37,40 @@ Keep the workspace separate from the source checkout. Initialization creates
 neutral configuration and starter documents, with no personal data or invented
 projects. See [installation](INSTALL.md).
 
+## Connect an agent
+
+Agents connect to the HTTP server. Start it once (it writes its address to the
+workspace, so the commands below find it):
+
+```bash
+MCP_PORT=8000 chronicle-mcp --transport streamable-http --migrate
+```
+
+Then, from another shell:
+
+```bash
+chronicle connect claude                # Claude Code; also codex, zcode, opencode, gemini
+chronicle connect codex --role read     # read-only: /mcp/read, no record_event
+chronicle connect claude --skip hook    # leave a part out: permissions, hook or block
+chronicle connect cursor --print        # Cursor or any other agent: snippets to add by hand
+chronicle agents                        # who is installed, connected, with which role
+chronicle doctor --agents               # each part as connect left it; exit 5 on drift
+chronicle disconnect claude             # takes back exactly what connect wrote
+```
+
+`chronicle connect` adds four parts to the agent's own user-level files: the MCP
+server `chronicle`, its tools allowed without a prompt, a session-start hook that
+hands each session its memory brief, and a short protocol block in the agent's
+instruction file. It shows the change and asks first (`--yes` for scripts and
+agents, `--dry-run` to only look). When the agent already runs a session-start hook
+of its own that mentions chronicle, `connect` says so in one notice line:
+`--skip hook` keeps only that hook. Each change is one piece of text, recorded in
+the workspace with hashes, so `disconnect` restores the files' bytes. The role is
+chosen per agent: `write` (`/mcp`, six tools) or `read` (`/mcp/read`, five). A
+role is a guard-rail against mistakes, not a security boundary: an agent with a
+shell on the same machine can read the database directly. macOS and Linux;
+details in [Operations](docs/OPERATIONS.md#connecting-agents).
+
 ## How agents use it
 
 Agents talk to Chronicle over MCP (or the CLI). The default profile has six tools:
@@ -66,11 +100,11 @@ anything is stored.
 - **Session brief:** `GET /brief?cwd=...` (or `chronicle brief`) prints the open
   tasks, current facts, recent decisions and warnings in a few kilobytes; a
   session-start hook gives it to every new agent session.
-- **Web view:** `http://127.0.0.1:8093/ui` shows health, open tasks with their
+- **Web view:** `http://127.0.0.1:<port>/ui` shows health, open tasks with their
   checkpoint history, facts with every value a slot had, search that says why each
   hit matched, and single records with their evidence. Read-only, no script,
   answered only on this machine.
-- **Atlas:** `http://127.0.0.1:8093/ui/atlas` draws the whole memory as a sky to
+- **Atlas:** `http://127.0.0.1:<port>/ui/atlas` draws the whole memory as a sky to
   turn around in three dimensions, or as a flat map: every project a galaxy of
   its own form (a spiral while it is being written, a great ball once it has
   gone quiet), its tasks, events, notes and fact slots the lights in it, joined
@@ -90,9 +124,9 @@ anything is stored.
 
 ## Running it
 
-`chronicle-mcp --transport streamable-http --migrate` serves MCP, `/health`, the
-brief and the web view on one port (`MCP_HOST`/`MCP_PORT`); a client can also start
-`chronicle-mcp-chronicler` over stdio. The HTTP server keeps itself answerable
+`chronicle-mcp --transport streamable-http --migrate` serves MCP (`/mcp` to write,
+`/mcp/read` to read), `/health`, the brief and the web view on one port
+(`MCP_HOST`/`MCP_PORT`); a client can also start `chronicle-mcp-chronicler` over stdio. The HTTP server keeps itself answerable
 (event-loop monitor, stack dumps on a stall or `SIGUSR1`, embeddings off the write
 path) and, with `[scheduler] enabled = true`, runs daily capture, daybook, weekly
 audit and backups itself. Details: [Operations](docs/OPERATIONS.md).

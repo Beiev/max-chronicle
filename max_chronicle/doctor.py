@@ -21,11 +21,11 @@ import sqlite3
 import subprocess
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
 
 from . import __version__, embeddings
 from .brief import _read_only
 from .automation import JOB_NAMES
+from .server_address import open_server as urlopen  # a loopback server never through a proxy
 from .store import config_from_manifest, target_schema_version
 
 SERVER_TIMEOUT_S = 2.0
@@ -65,7 +65,7 @@ def default_server_url() -> str:
 def server_status(url: str) -> dict[str, Any]:
     """The server's own /health, or why it did not answer."""
     try:
-        with urlopen(f"{url}/health", timeout=SERVER_TIMEOUT_S) as response:  # noqa: S310 - a local URL
+        with urlopen(f"{url}/health", timeout=SERVER_TIMEOUT_S) as response:
             raw = response.read()
     except HTTPError as exc:  # 503 is a degraded Chronicle; its body still says why
         raw = exc.read()

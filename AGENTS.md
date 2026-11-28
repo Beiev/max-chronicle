@@ -31,6 +31,13 @@ any operator's personal workspace.
   events, and the marks they leave, read by the brief, recall and the map.
 - `agent_doc.py`: writes `docs/AGENT_PROTOCOL.md` from the registered tools.
 - `doctor.py`: what `chronicle doctor` reports about the running installation, and its summary.
+- `connect.py`: `chronicle connect`, `disconnect`, `agents`, `doctor --agents`: the agent adapters,
+  preflight, roles; facts per agent in `tests/fixtures/connect/FACTS.md`.
+- `connect_edit.py`: changes to other programs' JSON, JSONC, TOML and text files, one piece at a
+  time, verified in memory, written atomically, recorded in the ledger.
+- `brief_hook.py`: the session-start hook `connect` installs; `server_address.py`: the address
+  file the HTTP server writes, how clients resolve the address, and `open_server`, the one HTTP
+  opener for a Chronicle server (a loopback host never through a proxy).
 - `scaffold.py`: neutral new-workspace templates.
 
 ## Invariants

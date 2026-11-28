@@ -1,0 +1,75 @@
+{
+  "numStartups": 42,
+  "installMethod": "native",
+  "autoUpdates": false,
+  "theme": "dark",
+  "hasSeenTasksHint": true,
+  "tipsHistory": {
+    "new-user-warmup": 7,
+    "plan-mode-for-complex-tasks": 12,
+    "memory-command": 3
+  },
+  "promptQueueUseCount": 5,
+  "cachedFeatureFlags": {},
+  "firstStartTime": "2026-01-02T10:00:00.000Z",
+  "userID": "0000000000000000000000000000000000000000000000000000000000000000",
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "2.1.0",
+  "projects": {
+    "/home/dev/projects/demo": {
+      "allowedTools": [],
+      "mcpContextUris": [],
+      "mcpServers": {},
+      "enabledMcpjsonServers": [],
+      "disabledMcpjsonServers": [],
+      "hasTrustDialogAccepted": true,
+      "history": [
+        {
+          "display": "add \"mcpServers\": { \"chronicle\": {...} } to the config // not a comment",
+          "pastedContents": {}
+        },
+        {
+          "display": "why does /* this */ look like a comment?",
+          "pastedContents": {}
+        }
+      ],
+      "lastCost": 0.42,
+      "lastSessionId": "00000000-0000-0000-0000-000000000000"
+    }
+  },
+  "lastReleaseNotesSeen": "2.1.0",
+  "githubRepoPaths": {
+    "example/demo": [
+      "/home/dev/projects/demo"
+    ]
+  },
+  "skillUsage": {
+    "review": {
+      "usageCount": 2,
+      "lastUsedAt": 1790000000000
+    }
+  },
+  "toolUsage": {
+    "Bash": {
+      "usageCount": 10,
+      "lastUsedAt": 1790000000000
+    }
+  },
+  "mcpServers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest"
+      ],
+      "env": {}
+    },
+    "remote-docs": {
+      "type": "http",
+      "url": "https://docs.example.com/mcp"
+    }
+  },
+  "remoteDialogSeen": true,
+  "migrationVersion": 3,
+  "anonymousId": "00000000-0000-0000-0000-000000000001"
+}

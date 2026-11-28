@@ -40,6 +40,57 @@ chronicle activate --domain global
 chronicle-mcp --profile chronicler
 ```
 
+## Start the HTTP server and connect an agent
+
+Agents reach Chronicle through its HTTP server. Start it with the workspace set:
+
+```bash
+export CHRONICLE_ROOT=~/chronicle-workspace
+MCP_PORT=8000 chronicle-mcp --transport streamable-http --migrate
+```
+
+The server writes its address to `chronicle-server.json` in the workspace and
+removes it on a clean stop. There is no default port for the commands below:
+they take `--url`, else `CHRONICLE_SERVER_URL`, else that file.
+
+```bash
+chronicle connect claude --dry-run      # what would change, nothing written
+chronicle connect claude                # shows the change and asks; --yes applies without asking
+chronicle connect codex --role read     # roles: write (default) and read
+chronicle connect claude --skip hook    # leave out a part: permissions, hook or block (repeatable)
+chronicle connect gemini --print        # snippets and the block for adding by hand
+chronicle agents
+chronicle doctor --agents
+chronicle disconnect claude
+```
+
+Agents with an adapter: Claude Code (`claude`), Codex (`codex`), ZCode (`zcode`),
+opencode (`opencode`), Gemini CLI (`gemini`). Cursor and other agents get the
+snippets with `chronicle connect <agent> --print`. Before any change, `connect`
+checks that the server answers, is Chronicle 0.33.0 or newer and serves
+`/mcp/read`; if not, it changes nothing and prints how to start the server.
+
+| Role | Address | Tools |
+| --- | --- | --- |
+| `write` (default) | `/mcp` | all six |
+| `read` | `/mcp/read` | five, without `record_event` |
+
+A role is a guard-rail against mistakes, not a security boundary: an agent with a
+shell on the same machine can read the database and other agents' files directly.
+
+The session-start hook is part of the package: `connect` writes
+`<absolute python> -m max_chronicle.brief_hook --manifest <workspace manifest>` into
+the agent's hook settings. It prints the brief from the server, or from the database
+with one line saying the server is silent, and always exits 0. Codex runs a new hook
+only after it is trusted in `/hooks`; opencode has no session-start hook, so its
+block tells the agent to start with `startup_bundle`. If the agent already runs a
+session-start hook of its own that mentions chronicle, `connect` prints a notice
+naming the file; `--skip hook` keeps only that hook, so a session gets one brief.
+A skipped part is reported as `skipped (asked)`, `doctor --agents` takes it as
+intended, and a later `connect` without `--skip` installs it.
+
+`chronicle connect` runs on macOS and Linux; on Windows it refuses with a message.
+
 ## What `chronicle init` Creates
 
 - `chronicle.db`
