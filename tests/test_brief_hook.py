@@ -108,6 +108,22 @@ def test_the_session_directory_is_sent_as_its_repository_top(chronicle_sandbox, 
     assert handler.seen[0]["query"]["cwd"] == [str(repo)]
 
 
+def test_a_declared_project_root_inside_a_larger_repository_is_sent_as_itself(
+        chronicle_sandbox, tmp_path, brief_server) -> None:
+    url = brief_server()
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "inner" / "src").mkdir(parents=True)
+    manifest = Path(chronicle_sandbox.manifest_path)
+    manifest.write_text(manifest.read_text() + f'\n[[projects]]\nid = "inner"\nroots = ["{repo / "inner"}"]\n')
+
+    _hook(chronicle_sandbox, tmp_path, {"cwd": str(repo / "inner" / "src")}, "--agent", "zcode",
+          env={"CHRONICLE_SERVER_URL": url})
+
+    (handler,) = brief_server.handlers()
+    assert handler.seen[0]["query"]["cwd"] == [str(repo / "inner")]
+
+
 def test_without_a_running_server_the_brief_comes_from_the_database(chronicle_sandbox, tmp_path, recorded) -> None:
     result = _hook(chronicle_sandbox, tmp_path, {"session_id": "b"}, "--agent", "claude")
 
