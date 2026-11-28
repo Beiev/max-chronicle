@@ -93,13 +93,31 @@ def _stdin_payload() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _project_dir(cwd: str | None) -> str | None:
-    """The repository top level holding *cwd* (a ``.git`` entry found upward), else *cwd*."""
+def _project_roots(manifest: str | None) -> set[Path]:
+    """The ``roots`` the manifest's ``[[projects]]`` declare, expanded; empty when unreadable."""
+    if not manifest:
+        return set()
+    import tomllib
+
+    try:
+        with open(manifest, "rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, ValueError):
+        return set()
+    return {Path(os.path.normpath(os.path.expanduser(str(root))))
+            for entry in raw.get("projects") or [] if isinstance(entry, dict)
+            for root in entry.get("roots") or []}
+
+
+def _project_dir(cwd: str | None, roots: set[Path] | None = None) -> str | None:
+    """The first directory upward from *cwd* that is a project root of the manifest or holds
+    ``.git``, else *cwd*. A declared root wins over an enclosing repository: a folder of
+    its own inside a larger repository keeps its project."""
     if not cwd:
         return None
-    path = Path(cwd)
+    path = Path(os.path.normpath(cwd))
     for candidate in (path, *path.parents):
-        if (candidate / ".git").exists():
+        if candidate in (roots or ()) or (candidate / ".git").exists():
             return str(candidate)
     return cwd
 
@@ -188,7 +206,7 @@ def run(argv: list[str]) -> int:
         text = NO_BRIEF
     else:
         cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
-        text = brief_text(Path(manifest), budget, _project_dir(cwd or os.getcwd()))
+        text = brief_text(Path(manifest), budget, _project_dir(cwd or os.getcwd(), _project_roots(manifest)))
     if output in ("zcode", "gemini", "json"):
         sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}},
                                     ensure_ascii=False) + "\n")

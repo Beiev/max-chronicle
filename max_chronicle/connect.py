@@ -597,7 +597,9 @@ class Adapter:
         return bool(paths) and paths["home"].is_dir()
 
     def hook_command(self, manifest: Path) -> str:
-        command = [sys.executable, "-m", HOOK_MODULE, "--manifest", str(manifest), "--agent", self.id,
+        # -P: the session may start inside a source checkout of Chronicle, whose
+        # max_chronicle would shadow the installed package.
+        command = [sys.executable, "-P", "-m", HOOK_MODULE, "--manifest", str(manifest), "--agent", self.id,
                    "--budget", str(self.hook_budget)]
         if self.hook_format != "text":
             command += ["--format", self.hook_format]
@@ -1418,14 +1420,14 @@ def _disconnect_locked(adapter: Adapter, payload: dict[str, Any], *, manifest: P
 
 def _last_writes(manifest: Path, db: Path | None) -> Callable[[str], str | None]:
     try:
-        from .config import read_toml
         from .identity import Registry
+        from .runtime_context import read_toml
 
         raw = read_toml(manifest)
         registry = Registry.from_manifest(raw)
         db_path = db or Path(os.path.expanduser(str((raw.get("paths") or {}).get("chronicle_db")
                                                     or workspace_of(manifest) / "chronicle.db")))
-    except Exception:  # noqa: BLE001 - a status table without this column is still a status table
+    except (OSError, ValueError):  # a status table without this column is still a status table
         return lambda agent: None
     if not db_path.is_file():
         return lambda agent: None

@@ -325,7 +325,7 @@ def test_the_hook_command_has_an_absolute_python_and_the_manifest(chronicle_sand
     _connect("codex", chronicle_sandbox, env)
 
     hook = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]["SessionStart"][-1]["hooks"][0]
-    assert hook["command"].startswith(sys.executable) and " -m max_chronicle.brief_hook " in hook["command"]
+    assert hook["command"].startswith(sys.executable) and " -P -m max_chronicle.brief_hook " in hook["command"]
     assert str(chronicle_sandbox.manifest_path) in hook["command"] and "--budget 4500" in hook["command"]
 
 
@@ -419,6 +419,15 @@ def test_doctor_is_clean_after_connect_and_names_a_part_edited_by_hand(chronicle
     issues = report["agents"][0]["issues"]
     assert report["status"] == "drift" and [issue["part"] for issue in issues] == ["server"]
     assert report["agents"][0]["fix"].endswith("connect zcode --role write --yes")
+
+
+def test_the_agents_table_shows_the_last_write_of_an_agent(chronicle_sandbox, env) -> None:
+    _connect("gemini", chronicle_sandbox, env)
+
+    last = connect_module._last_writes(chronicle_sandbox.manifest_path, None)
+
+    assert last("operator"), "connect recorded an event by the operator"
+    assert last("nobody-wrote-this") is None
 
 
 def test_the_agents_table(chronicle_sandbox, env) -> None:
